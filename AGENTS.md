@@ -1,0 +1,1078 @@
+# AGENTS.md
+
+## Project: AI-LifeOS
+
+AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、後から検索・要約・活用できる「個人用AI記憶システム」を作るプロジェクトです。
+
+目的は、単なる会話ログ保存ではなく、以下をローカルに蓄積して、将来的に自分専用の第二の脳・AI秘書として使えるようにすることです。
+
+* 会話ログ全文
+* 会話ごとの要約
+* 日付別の日記
+* 長期メモリ
+* プロジェクト進捗
+* 将来的なベクトル検索
+* 将来的なMCP連携
+* 将来的な生活改善エージェント
+
+---
+
+## Current Status
+
+現在は Phase2.5 まで完了済みです。
+
+次は Phase3 の検索機能へ進む前に、Phase2.6 として Codex SDK または Codex app-server を利用した会話専用MVPを検討・実装します。
+
+その次に Phase2.7 として、Phase2.6 の会話エンジンをGUIから利用できる Chat GUI MVP を検討・実装します。
+
+Phase1 は完了済みです。
+
+できていること:
+
+* AI-LifeOS フォルダ作成
+* Git管理開始
+* conversations / inbox / journal / memory / scripts などの基本構成作成
+* inbox/chat.txt に会話を貼る運用
+* process_chat.py で raw.md を conversations 配下に保存
+* process_chat.py で raw.md と Codex 用タスクを生成する運用
+* codex.cmd exec で summary / journal / memory 更新を非対話実行する運用
+* 保存から Codex 実行、Git commit までを save_chat.ps1 で実行する運用
+* Phase2.6 の会話専用MVPを計画中
+* Phase2.7 のChat GUI MVPを計画中
+
+現在の方針:
+
+* OpenAI API は直接使わない
+* .env は使わない
+* ChatGPT Plus / Codex CLI 側を使う
+* Phase2.5 では自動実行を進めるが、必要に応じて SourceTree や git diff で確認できる状態を保つ
+* save_chat.ps1 は保存、Codex実行、Git commit まで自動で行う
+* Phase2.6 では会話中に自由なファイル操作をさせず、整理処理は既存スクリプトまたは明示コマンドで行う
+* Phase2.7 ではPhase2.6の会話エンジンを薄く包むGUIを作り、検索機能や多機能化はPhase3以降に分ける
+
+---
+
+## Phase Overview
+
+```text
+Phase1   : Local Archive
+Phase2.0 : Semi-Automatic Memory Processing
+Phase2.5 : Safer Automation
+Phase2.6 : Codex Conversation MVP
+Phase2.7 : Chat GUI MVP
+Phase3   : Searchable Memory
+Phase4   : MCP Integration
+Phase5   : Life Improvement Agent
+Phase6   : Daily Automation
+```
+
+---
+
+## Repository Layout
+
+想定構成:
+
+```text
+AI-LifeOS/
+├─ conversations/
+│  └─ YYYY/
+│     └─ MM/
+│        └─ YYYY-MM-DD_HHMMSS/
+│           ├─ raw.md
+│           └─ summary.md
+│
+├─ inbox/
+│  ├─ chat.txt
+│  └─ live/
+│     └─ YYYY-MM-DD_HHMMSS.jsonl
+│
+├─ journal/
+│  └─ YYYY/
+│     └─ MM/
+│        └─ YYYY-MM-DD.md
+│
+├─ memory/
+│  ├─ long_term.md
+│  ├─ preferences.md
+│  └─ projects.md
+│
+├─ prompts/
+│  └─ codex_phase2_prompt.md
+│
+├─ tasks/
+│  └─ latest_codex_task.md
+│
+├─ scripts/
+│  ├─ process_chat.py
+│  ├─ save_chat.ps1
+│  ├─ codex_conversation.py
+│  ├─ chat_gui.py
+│  ├─ finalize_live_chat.py
+│  └─ live_session.py
+│
+├─ docs/
+│  ├─ codex_conversation_mvp.md
+│  └─ chat_gui_mvp.md
+│
+├─ desktop/
+│  ├─ README.md
+│  ├─ app/
+│  └─ backend/
+│
+├─ logs/
+├─ config/
+├─ README.md
+└─ AGENTS.md
+```
+
+---
+
+## Core Workflow
+
+Phase2.5 までの基本フロー:
+
+```text
+1. ChatGPTの会話をコピーする
+2. inbox/chat.txt に貼る
+3. .\scripts\save_chat.ps1 を実行する
+4. conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md が作成される
+5. tasks/latest_codex_task.md が作成される
+6. codex.cmd exec が latest_codex_task.md の内容を非対話で処理する
+7. Codex が summary.md / journal / memory を更新する
+8. conversations / journal / memory / inbox / tasks を git add する
+9. 変更があれば git commit する
+```
+
+Phase2.6 で追加予定の会話専用MVPフロー:
+
+```text
+1. python scripts\codex_conversation.py を実行する
+2. PowerShell上で継続会話する
+3. 会話を inbox/live/YYYY-MM-DD_HHMMSS.jsonl に逐次保存する
+4. /exit または Ctrl+C で会話を終了する
+5. python scripts\finalize_live_chat.py を実行する
+6. JSONL を conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md に変換する
+7. 既存Phase2.5処理で summary.md / journal / memory を更新する
+8. 必要に応じて Git commit する
+```
+
+Phase2.7 で追加予定のChat GUI MVPフロー:
+
+```text
+1. GUIを起動する
+2. ユーザーが入力する
+3. Phase2.6の会話処理へ送信する
+4. assistant返答をGUIに表示する
+5. user/assistant発言を inbox/live/YYYY-MM-DD_HHMMSS.jsonl に逐次保存する
+6. ユーザーが「会話を整理して保存」ボタンを押す
+7. finalize_live_chat.py を実行する
+8. raw.md を生成する
+9. 既存Phase2.5処理で summary / journal / memory を生成する
+10. 必要に応じて Git commit する
+```
+
+---
+
+## Phase2.0: Semi-Automatic Memory Processing
+
+Phase2.0 の目的は、raw.md 保存後に Codex が以下を作ることです。
+
+### 1. summary.md
+
+保存場所:
+
+```text
+conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/summary.md
+```
+
+内容:
+
+* 話題
+* 決まったこと
+* 次にやること
+* 重要ポイント
+* タグ
+* 長期メモリ候補
+
+summary.md は AI が後で読むための要約です。人間の日記より詳しくてよいです。
+
+---
+
+### 2. journal/YYYY/MM/YYYY-MM-DD.md
+
+保存場所:
+
+```text
+journal/YYYY/MM/YYYY-MM-DD.md
+```
+
+内容:
+
+* 150文字程度
+* 日付とやったことが分かればよい
+* 事実ベース
+* 推測や創作は禁止
+* 感情を勝手に盛らない
+
+例:
+
+```md
+# 2026-06-28
+
+AI-LifeOSのPhase2.0を進めた。Codex CLIでsummary、journal、memoryを半自動更新する方針を整理し、AGENTS.mdで全体方針を管理することにした。
+```
+
+---
+
+### 3. memory/long_term.md
+
+保存場所:
+
+```text
+memory/long_term.md
+```
+
+内容:
+
+* 長期的に役立つ情報だけ追記する
+* 一時的な作業ログは入れすぎない
+* 重複を避ける
+* 既存情報を勝手に削除しない
+* 不確かな情報は「候補」として書く
+
+記録対象の例:
+
+* ユーザーは AI-LifeOS を作っている
+* ユーザーは Codex CLI を生活改善にも使いたい
+* ユーザーはローカル保存、Git管理、SourceTree確認を重視している
+* ユーザーは日記を150文字程度の簡潔な形式にしたい
+* ユーザーはOpenAI API直叩きより、ChatGPT Plus / Codex CLIを使う運用を好む
+
+---
+
+## Phase2.5: Safer Automation
+
+Phase2.5 では、Phase2.0 の半自動運用をより安全に自動化します。
+
+目的:
+
+* process_chat.py から Codex 用タスクをより正確に生成する
+* 最新 raw.md を自動判定する
+* Codex が作業しやすいプロンプトを自動出力する
+* codex.cmd exec で Codex を非対話実行する
+* 対象ファイルを限定して Git commit する
+
+やること:
+
+* tasks/latest_codex_task.md の品質改善
+* prompts/codex_phase2_prompt.md の改善
+* summary.md のテンプレート統一
+* journal の追記ルール統一
+* memory 更新ルールの厳格化
+* SourceTree確認もできるが、通常運用では save_chat.ps1 で最後まで実行する
+
+自動化時の注意:
+
+* memory/long_term.md は重要な記憶なので、AIの誤追記を防ぐ必要がある
+* 会話ログにないことを書かないプロンプトを維持する
+* Git commit 対象は conversations / journal / memory / inbox / tasks に限定する
+* 不安な場合は python scripts\process_chat.py だけを実行して手動確認に戻せるようにする
+
+---
+
+## Phase2.6: Codex Conversation MVP
+
+Phase2.6 の目的は、OpenAI APIを直接使わず、ChatGPTログイン済みのCodex環境を活用して、AI-LifeOS上で継続会話できる最小構成を作ることです。
+
+codex exec は1回ごとの非対話実行に近く、ChatGPTのような自然な継続会話には向きにくいです。
+
+そのため、Phase2.6 では Codex SDK または Codex app-server を調査し、1つの会話スレッドを維持しながら複数ターン会話できる構成を検討実装します。
+
+Phase2.6 は Phase3 の検索機能へ進む前の実験フェーズとして扱います。
+
+### 基本方針
+
+* ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない
+* OpenAI APIを直接叩く構成を前提にしない
+* Codex CLI / Codex SDK / Codex app-server の利用を優先する
+* まずはデスクトップGUIではなく、PowerShellで動くCLIチャットMVPから始める
+* 会話は逐次ローカル保存する
+* 普段の会話ではファイル操作をさせない
+* ファイル操作、要約、日記、メモリ更新、Git commit は既存スクリプトまたは明示コマンドで行う
+* 既存の inbox/chat.txt 運用は壊さない
+
+### 作りたいもの
+
+#### 1. 会話専用CLI
+
+追加候補:
+
+```text
+scripts/codex_conversation.py
+```
+
+起動コマンド:
+
+```powershell
+python scripts\codex_conversation.py
+```
+
+想定動作:
+
+```text
+You > こんにちは
+Assistant > 返答
+
+You > さっきの続きだけど、Phase3は何からやる？
+Assistant > 直前の会話を踏まえて返答
+```
+
+#### 2. 会話の逐次保存
+
+保存先:
+
+```text
+inbox/live/YYYY-MM-DD_HHMMSS.jsonl
+```
+
+保存形式:
+
+```json
+{"role":"user","timestamp":"2026-06-28T21:30:00+09:00","content":"こんにちは"}
+{"role":"assistant","timestamp":"2026-06-28T21:30:05+09:00","content":"返答"}
+```
+
+ルール:
+
+* ユーザー発言はCodexへ送る前に保存する
+* assistant返答は受信後に保存する
+* 1メッセージ1行のJSONL形式にする
+* Ctrl+C または /exit で終了できるようにする
+* セッション開始時刻でファイル名を決める
+* 既存の inbox/chat.txt 運用は壊さない
+
+#### 3. JSONLからraw.mdへの変換
+
+追加候補:
+
+```text
+scripts/finalize_live_chat.py
+```
+
+目的:
+
+```text
+inbox/live/YYYY-MM-DD_HHMMSS.jsonl
+↓
+conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md
+↓
+既存Phase2.5処理
+↓
+summary.md / journal / memory / git commit
+```
+
+要件:
+
+* JSONLをUser/Assistant形式のraw.mdに変換する
+* 既存のprocess_chat.pyまたはPhase2.5処理に接続できるようにする
+* まずは既存処理を壊さず、別スクリプトとして作る
+* 正常処理後も元のJSONLは残す
+* 変換後のraw.mdの保存場所は既存conversations構成に合わせる
+
+### ファイル操作方針
+
+Phase2.6の会話中、Codexには原則として自由なファイル操作をさせない。
+
+基本:
+
+* 会話中は読み取り専用に近い扱い
+* AGENTS.md / memory/long_term.md / 直近summary.md は必要に応じてコンテキストとして読む
+* ファイル更新はユーザーが明示的に実行する既存スクリプトに任せる
+* Git commit も自動会話中には行わない
+
+許可する処理:
+
+* 会話ログJSONLへの追記
+* 会話終了後の明示的な finalize 処理
+* 既存Phase2.5のsummary/journal/memory生成スクリプト呼び出し
+* ユーザーが明示した場合のみGit commit
+
+禁止:
+
+* 会話中にmemory/long_term.mdを勝手に編集する
+* 会話中に過去ログを勝手に削除・移動する
+* 会話中にGit commitを勝手に実行する
+* APIキーや秘密情報を保存する
+* .env前提に戻す
+* OpenAI API直叩き前提に戻す
+
+### Codex SDK / app-server 調査タスク
+
+実装前に以下を確認します。
+
+* 現在の環境でCodex SDKが利用できるか
+* Python SDKで継続会話スレッドを作れるか
+* ChatGPTログイン済みのCodex認証を利用できるか
+* sandboxをread_only相当にできるか
+* app-serverのほうがCLIチャットMVPに向いているか
+* Windows PowerShellで安定動作するか
+* 依存関係を増やしすぎないか
+
+調査結果は以下にまとめます。
+
+```text
+docs/codex_conversation_mvp.md
+```
+
+### 実装順
+
+#### Step 1: 調査ドキュメント作成
+
+作成:
+
+```text
+docs/codex_conversation_mvp.md
+```
+
+内容:
+
+* Codex SDKを使う案
+* Codex app-serverを使う案
+* codex execを使わない理由
+* 採用方針
+* 未確定事項
+* 実装上の注意
+
+#### Step 2: JSONL保存の土台を作る
+
+作成候補:
+
+```text
+scripts/live_session.py
+```
+
+役割:
+
+* セッションファイル作成
+* user/assistantメッセージ追記
+* timestamp付与
+* JSONLとして保存
+
+#### Step 3: CLIチャットMVPを作る
+
+作成候補:
+
+```text
+scripts/codex_conversation.py
+```
+
+要件:
+
+* PowerShellで起動できる
+* 1起動 = 1会話セッション
+* ユーザー入力を受け付ける
+* Codex SDKまたはapp-serverへ送る
+* 同じ会話スレッドを維持する
+* 返答を表示する
+* 逐次JSONL保存する
+* /exitで終了する
+* ファイル更新やGit commitはしない
+
+#### Step 4: live JSONLをraw.md化する
+
+作成候補:
+
+```text
+scripts/finalize_live_chat.py
+```
+
+要件:
+
+* inbox/live/*.jsonl を選んでraw.md化する
+* 最新ファイルを対象にできる
+* conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md を作る
+* 既存Phase2.5処理に渡せる形にする
+* 変換後にsummary/journal/memory生成を行うかは、最初は別ステップでもよい
+
+#### Step 5: 既存Phase2.5処理と接続
+
+最終的には以下の流れにする。
+
+```text
+python scripts\codex_conversation.py
+↓
+会話する
+↓
+inbox/live/YYYY-MM-DD_HHMMSS.jsonl に逐次保存
+↓
+python scripts\finalize_live_chat.py
+↓
+raw.md生成
+↓
+既存Phase2.5処理
+↓
+summary.md / journal / memory 更新
+↓
+Git commit
+```
+
+### Phase3との関係
+
+Phase2.6 はPhase3の前段階です。
+
+Phase3では検索機能を作る予定だが、その前に「今後の会話を最初から構造化して保存できる入口」を作ります。
+
+Phase2.6によって、将来的に以下がやりやすくなります。
+
+* 会話ログの逐次保存
+* セッション単位の管理
+* JSONLからMarkdownへの変換
+* raw.md / summary.md / journal / memory への統合
+* 検索インデックス作成
+* 将来的なデスクトップGUI化
+* AI-LifeOS専用ChatGPT風アプリ化
+
+---
+
+## Phase2.7: Chat GUI MVP
+
+Phase2.7 の目的は、Phase2.6 で作成する Codex Conversation MVP を GUI から利用できるようにすることです。
+
+Phase2.6 では、PowerShell上で継続会話できるCLIチャットを作り、会話を inbox/live/*.jsonl に逐次保存し、finalize_live_chat.py で raw.md 化する想定です。
+
+Phase2.7 では、その会話エンジンと保存処理を流用し、ChatGPT風の最小GUIを作ります。
+
+Phase2.7 は Phase3 の検索機能とは分離し、今後の会話をGUIから自然に保存できる入口を作る段階です。
+
+### 基本方針
+
+* Phase2.6 の会話エンジンを再利用する
+* GUIは既存処理の薄いラッパーにする
+* いきなり多機能化しない
+* ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない
+* OpenAI API直叩き前提にしない
+* Codex SDK または app-server を使った会話処理を前提にする
+* 会話ログは引き続き inbox/live/*.jsonl に逐次保存する
+* 会話終了後に finalize_live_chat.py で raw.md 化できるようにする
+* summary / journal / memory / Git commit は既存Phase2.5処理に接続する
+* memory/long_term.md を会話中に勝手に編集しない
+* Git commit はユーザー明示操作または既存スクリプト経由にする
+* Phase3の検索機能とは分離する
+
+### 作りたいもの
+
+#### 1. ChatGPT風の最小GUI
+
+候補ディレクトリ:
+
+```text
+desktop/
+├─ README.md
+├─ app/
+└─ backend/
+```
+
+最初は軽量に以下でもよいです。
+
+```text
+scripts/chat_gui.py
+```
+
+GUIに必要な最小要素:
+
+* チャット表示欄
+* 入力欄
+* 送信ボタン
+* 会話終了ボタン
+* 会話を整理して保存ボタン
+* 現在のセッションファイル表示
+* エラー表示欄
+
+### 想定フロー
+
+```text
+GUIを起動
+↓
+ユーザーが入力
+↓
+Phase2.6の会話処理へ送信
+↓
+assistant返答をGUIに表示
+↓
+user/assistant発言を inbox/live/YYYY-MM-DD_HHMMSS.jsonl に逐次保存
+↓
+ユーザーが「会話を整理して保存」ボタンを押す
+↓
+finalize_live_chat.py を実行
+↓
+raw.md生成
+↓
+既存Phase2.5処理で summary / journal / memory 生成
+↓
+Git commit
+```
+
+### 技術スタック候補
+
+最初の候補:
+
+* Python + Textual
+* Python + PySide6
+* FastAPI + ローカルWeb UI
+
+将来的な候補:
+
+* Tauri + React
+* Electron
+
+最初から本格的なデスクトップアプリにしなくてよいです。まずはローカルで動く最小GUI、またはブラウザで開けるローカルWeb UIで十分です。
+
+### 推奨実装順
+
+#### Step 1: GUI方式の調査
+
+作成候補:
+
+```text
+docs/chat_gui_mvp.md
+```
+
+内容:
+
+* Textual案
+* PySide6案
+* FastAPI + Web UI案
+* Tauri案
+* Electron案
+* 採用候補
+* 初期MVPの範囲
+* 未確定事項
+
+#### Step 2: GUIなしでも使える会話エンジンを確認
+
+Phase2.7は、Phase2.6の以下が動いていることを前提にする。
+
+```text
+scripts/codex_conversation.py
+scripts/live_session.py
+scripts/finalize_live_chat.py
+```
+
+未実装の場合はPhase2.7で直接実装せず、Phase2.6の依存として明記する。
+
+#### Step 3: 最小GUIを作る
+
+候補:
+
+```text
+scripts/chat_gui.py
+```
+
+または
+
+```text
+desktop/
+└─ README.md
+```
+
+最初のGUIは以下だけでよい。
+
+* 入力する
+* 送信する
+* 返答を表示する
+* JSONLに保存される
+* 終了できる
+* finalize処理を呼び出せる
+
+#### Step 4: 既存処理と接続する
+
+GUIの「会話を整理して保存」ボタンは、最終的に以下の処理に接続する。
+
+```text
+inbox/live/*.jsonl
+↓
+scripts/finalize_live_chat.py
+↓
+raw.md
+↓
+既存Phase2.5処理
+↓
+summary.md / journal / memory
+↓
+Git commit
+```
+
+初期MVPでは、ボタン押下時にコマンドを表示するだけでもよいです。いきなり破壊的な自動実行をしないでください。
+
+### GUIでやらないこと
+
+Phase2.7では以下をやらない。
+
+* 過去ログ検索UI
+* ベクトルDB検索
+* MCP連携
+* Gmail / Discord / Calendar連携
+* 本格的な設定画面
+* 複数会話管理
+* ユーザー認証
+* クラウド同期
+* ChatGPT公式WebのDOM取得
+* memory/long_term.md の会話中自動編集
+* 勝手なGit commit連発
+
+これらはPhase3以降または別フェーズで扱う。
+
+### Phase3との関係
+
+Phase2.7 は Phase3 の前段階です。
+
+Phase3では保存済み会話の検索機能を作る予定です。その前に、今後の会話をGUIから自然に保存できる入口を作るのがPhase2.7です。
+
+Phase2.7によって、将来的に以下がやりやすくなります。
+
+* 自作ChatGPT風アプリ化
+* 会話の逐次保存
+* セッション単位の管理
+* JSONLからraw.mdへの変換
+* summary / journal / memory への統合
+* Phase3の検索インデックス作成
+* 将来的なデスクトップアプリ化
+
+---
+
+## Phase3: Searchable Memory
+
+Phase3 の目的は、保存済みの会話ログを検索できるようにすることです。
+
+候補:
+
+* SQLite全文検索
+* ripgrep検索
+* LanceDB
+* Chroma
+* Qdrant
+* SQLiteVec
+
+最初はベクトルDBに飛びつかず、以下の順番で進めます。
+
+```text
+1. Markdownファイル検索
+2. タグ検索
+3. SQLite管理
+4. ベクトル検索
+```
+
+Phase3で作るもの:
+
+```text
+scripts/
+├─ index_conversations.py
+├─ search_memory.py
+└─ rebuild_index.py
+```
+
+検索したい例:
+
+* 「前にCodexの許可設定について話した内容」
+* 「AI-LifeOSのPhase2を決めた会話」
+* 「Unityのリアル映像について話した内容」
+* 「投資方針について話した過去ログ」
+
+---
+
+## Phase4: MCP Integration
+
+Phase4 の目的は、AI-LifeOSを外部ツールと連携させることです。
+
+候補:
+
+* GitHub MCP
+* Filesystem MCP
+* Google Calendar MCP
+* Gmail MCP
+* Discord MCP
+* Obsidian MCP
+* Playwright MCP
+* Firecrawl MCP
+* Context7 MCP
+
+やりたいこと:
+
+* GitHub IssueやPRの進捗を記憶
+* カレンダー予定を日記に反映
+* GmailやDiscordから重要情報を抽出
+* Obsidianと連携
+* Web調査結果をプロジェクト記憶に保存
+
+注意:
+
+* いきなり全部つなげない
+* まずはFilesystemとGitHubから始める
+* 個人情報が多いものは慎重に扱う
+* 自動保存前に確認ステップを入れる
+
+---
+
+## Phase5: Life Improvement Agent
+
+Phase5 の目的は、AI-LifeOSを生活改善に使うことです。
+
+やりたいこと:
+
+* 朝のブリーフィング
+* 夜の振り返り
+* ゲーム練習ログ
+* 投資メモ
+* お出かけ候補
+* 学習ログ
+* 開発進捗整理
+* 体調や睡眠の軽い記録
+* TODO抽出
+* 次にやること提案
+
+ただし、最初は過剰に自動化しないこと。
+
+AI-LifeOSの基本思想:
+
+```text
+保存する
+↓
+整理する
+↓
+検索する
+↓
+思い出す
+↓
+提案する
+↓
+生活を改善する
+```
+
+---
+
+## Phase6: Daily Automation
+
+Phase6 の目的は、毎日自動で記憶整理を走らせることです。
+
+候補:
+
+* Windows タスクスケジューラ
+* PowerShellスクリプト
+* Codex CLI
+* Git自動コミット
+* 定期レポート生成
+
+想定フロー:
+
+```text
+毎日夜
+↓
+その日の会話・ログを収集
+↓
+summary生成
+↓
+journal更新
+↓
+memory更新候補作成
+↓
+差分確認
+↓
+commit
+```
+
+完全自動にする前に、必ず確認用モードを作ること。
+
+---
+
+## Important Rules for Codex
+
+Codexは以下のルールを守ること。
+
+### Do
+
+* 既存ファイルを壊さない
+* 変更前に構成を確認する
+* raw.md の内容に基づいて書く
+* 会話ログにないことは書かない
+* memory は長期的に重要な情報だけ扱う
+* journal は150文字程度にする
+* summary は後でAIが読んで分かるように書く
+* 変更後はどのファイルを変更したか報告する
+* 可能なら差分確認しやすい粒度で変更する
+* Phase2.6 の会話専用MVPでは、会話ログJSONLへの追記以外のファイル操作をユーザー明示操作に限定する
+* Phase2.6 の調査結果は docs/codex_conversation_mvp.md に整理する
+* Phase2.7 のChat GUI MVPはPhase2.6の会話エンジンを再利用する薄いラッパーとして設計する
+* Phase2.7 の調査結果は docs/chat_gui_mvp.md に整理する
+* Phase2.7 のGUIは会話ログを inbox/live/*.jsonl に逐次保存する方針を維持する
+
+### Do Not
+
+* 会話ログにない設定を勝手に作らない
+* APIキーや秘密情報をファイルに書かない
+* .env を前提にしない
+* OpenAI API直叩きを前提にしない
+* memory/long_term.md を勝手に大幅改変しない
+* 過去ログを勝手に削除しない
+* journal に感情や体調を勝手に推測して書かない
+* Git commit を勝手に連発しない
+* 破壊的変更をしない
+* Phase2.6 の会話中に memory/long_term.md を勝手に編集しない
+* Phase2.6 の会話中に過去ログを勝手に削除・移動しない
+* ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない
+* Phase2.7 のGUI中に memory/long_term.md や journal を勝手に編集しない
+* Phase2.7 で過去ログ検索UI、ベクトルDB検索、MCP連携を先取りしない
+* Phase2.7 で勝手なGit commitを連発しない
+
+---
+
+## Preferred Development Style
+
+このプロジェクトでは、いきなり大きな機能を作らず、小さく動く単位で進めます。
+
+優先順位:
+
+```text
+1. データを壊さない
+2. 手動で確認できる
+3. Git差分が読みやすい
+4. 後から拡張できる
+5. 自動化する
+```
+
+コードを書くときは、Windows PowerShellで動くことを優先します。
+
+---
+
+## Common Commands
+
+保存、Codex実行、Git commit:
+
+```powershell
+.\scripts\save_chat.ps1
+```
+
+raw.md と Codex 用タスクだけ保存:
+
+```powershell
+python scripts\process_chat.py
+```
+
+Pythonだけで最後まで実行:
+
+```powershell
+python scripts\process_chat.py --run-codex --commit
+```
+
+Phase2.6 調査ドキュメント作成後の想定CLIチャット:
+
+```powershell
+python scripts\codex_conversation.py
+```
+
+Phase2.6 live JSONLをraw.md化:
+
+```powershell
+python scripts\finalize_live_chat.py
+```
+
+Phase2.7 調査ドキュメント作成後の想定GUI:
+
+```powershell
+python scripts\chat_gui.py
+```
+
+Git状態確認:
+
+```powershell
+git status
+```
+
+差分確認:
+
+```powershell
+git diff
+```
+
+ステージング:
+
+```powershell
+git add .
+```
+
+コミット:
+
+```powershell
+git commit -m "Process chat session YYYY-MM-DD"
+```
+
+ブランチ名を main に変更する場合:
+
+```powershell
+git branch -m main
+```
+
+---
+
+## Definition of Done
+
+Phase2.0 の完了条件:
+
+* inbox/chat.txt から raw.md を保存できる
+* tasks/latest_codex_task.md が作られる
+* Codex が summary.md を作成できる
+* Codex が journal/YYYY/MM/YYYY-MM-DD.md を150文字程度で更新できる
+* Codex が memory/long_term.md に長期メモリ候補を追記できる
+* SourceTreeで差分確認できる
+* 問題なければGit commitできる
+
+Phase2.5 の完了条件:
+
+* save_chat.ps1 で raw.md 保存、Codex実行、summary/journal/memory更新、Git commit まで実行できる
+* process_chat.py が --run-codex と --commit を扱える
+* Codex失敗時にGit commitしない
+* Git commit対象が conversations / journal / memory / inbox / tasks に限定されている
+* python -m unittest が通る
+
+Phase2.6 の完了条件:
+
+* Codex SDKまたはapp-serverを使う方針が docs/codex_conversation_mvp.md に整理されている
+* python scripts\codex_conversation.py で継続会話できる
+* 会話が inbox/live/*.jsonl に逐次保存される
+* ユーザー発言とassistant返答が role / timestamp / content 付きで保存される
+* 会話中にmemoryやjournalを勝手に編集しない
+* /exit または Ctrl+C で安全に終了できる
+* finalize_live_chat.py でJSONLをraw.mdへ変換できる
+* 既存Phase2.5処理と接続できる
+* SourceTreeで差分確認できる
+* Git commitできる
+
+Phase2.7 の完了条件:
+
+* AGENTS.mdにPhase2.7が追加されている
+* docs/chat_gui_mvp.md にGUI方針が整理されている
+* GUI候補技術が比較されている
+* 最小GUIの実装方針が決まっている
+* Phase2.6の会話処理との接続方針が明記されている
+* inbox/live/*.jsonl への逐次保存方針が維持されている
+* finalize_live_chat.py との接続方針が明記されている
+* GUI中にmemoryやjournalを勝手に編集しないルールが明記されている
+* Phase3の検索機能とは分離されている
+* SourceTreeで差分確認できる粒度で変更されている
+
+Phase3 の完了条件:
+
+* 過去の raw.md / summary.md を検索できる
+* キーワード検索できる
+* タグまたはメタデータで探せる
+* 必要に応じてベクトル検索できる
+
+最終形の完了条件:
+
+* 会話を保存できる
+* 要約できる
+* 日記化できる
+* 長期メモリ化できる
+* 検索できる
+* 必要な過去情報をAIに渡せる
+* 生活改善の提案に使える
+* ローカルPC上で安全に管理できる

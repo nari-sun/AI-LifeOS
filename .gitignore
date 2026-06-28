@@ -1,0 +1,44 @@
+# Python
+.venv/
+.venv.venv/
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Environment files
+.env
+.env.*
+
+# Logs
+logs/*
+!logs/.gitkeep
+
+# AI-LifeOS generated data
+conversations/**
+!conversations/
+!conversations/.gitkeep
+
+journal/**
+!journal/
+!journal/.gitkeep
+
+memory/**
+!memory/
+!memory/.gitkeep
+
+tasks/latest_codex_task.md
+inbox/chat.txt
+inbox/live/**
+
+imports/**
+!imports/
+!imports/.gitkeep
+
+# OS/editor
+.DS_Store
+Thumbs.db
+
+# Others
+public-safe/
+imports/chatgpt_export/
+*.zip
