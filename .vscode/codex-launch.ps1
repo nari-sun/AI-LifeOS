@@ -5,6 +5,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$PSDefaultParameterValues["Get-Content:Encoding"] = "UTF8"
+$PSDefaultParameterValues["Select-String:Encoding"] = "UTF8"
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 
 function Get-NpmGlobalPrefix {
     try {

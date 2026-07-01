@@ -4,6 +4,13 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 
 現在は Phase2.5 付近です。OpenAI API、`.env`、外部ベクトルDBは使わず、ローカルMarkdown、Codex CLI、Gitで運用します。
 
+Windows PowerShellでMarkdownの日本語が文字化けして見える場合は、ファイル自体ではなく表示時の文字コードが原因のことがあります。確認するときは次のようにUTF-8を指定してください。
+
+```powershell
+Get-Content -Encoding UTF8 README.md
+Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
+```
+
 ## できること
 
 - `inbox/chat.txt` に貼った会話を `raw.md` として保存する
