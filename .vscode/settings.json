@@ -1,0 +1,19 @@
+{
+  "terminal.integrated.profiles.windows": {
+    "Codex": {
+      "path": "powershell.exe",
+      "args": [
+        "-NoExit",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\.vscode\\codex-launch.ps1",
+        "--dangerously-bypass-approvals-and-sandbox"
+      ],
+      "overrideName": true,
+      "icon": "line-height"
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "Codex",
+  "terminal.integrated.tabs.title": "${profileName}"
+}
