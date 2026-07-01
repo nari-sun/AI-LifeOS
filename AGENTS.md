@@ -23,7 +23,9 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 
 次は Phase3 の検索機能へ進む前に、Phase2.6 として Codex SDK または Codex app-server を利用した会話専用MVPを検討・実装します。
 
-その次に Phase2.7 として、Phase2.6 の会話エンジンをGUIから利用できる Chat GUI MVP を検討・実装します。
+その次に Phase2.65 として、会話セッションを保存・再開できる Session Save / Resume MVP を検討・実装します。
+
+その次に Phase2.7 として、Phase2.6 と Phase2.65 の会話エンジン・セッション保存処理をGUIから利用できる Chat GUI MVP を検討・実装します。
 
 Phase1 は完了済みです。
 
@@ -38,6 +40,7 @@ Phase1 は完了済みです。
 * codex.cmd exec で summary / journal / memory 更新を非対話実行する運用
 * 保存から Codex 実行、Git commit までを save_chat.ps1 で実行する運用
 * Phase2.6 の会話専用MVPを計画中
+* Phase2.65 のSession Save / Resume MVPを計画中
 * Phase2.7 のChat GUI MVPを計画中
 
 現在の方針:
@@ -48,7 +51,8 @@ Phase1 は完了済みです。
 * Phase2.5 では自動実行を進めるが、必要に応じて SourceTree や git diff で確認できる状態を保つ
 * save_chat.ps1 は保存、Codex実行、Git commit まで自動で行う
 * Phase2.6 では会話中に自由なファイル操作をさせず、整理処理は既存スクリプトまたは明示コマンドで行う
-* Phase2.7 ではPhase2.6の会話エンジンを薄く包むGUIを作り、検索機能や多機能化はPhase3以降に分ける
+* Phase2.65 では /resume で過去10日以内の会話セッションを再開できるようにし、10日超の削除は明示コマンドに限定する
+* Phase2.7 ではPhase2.6の会話エンジンとPhase2.65のセッション保存処理を薄く包むGUIを作り、検索機能や多機能化はPhase3以降に分ける
 
 ---
 
@@ -59,6 +63,7 @@ Phase1   : Local Archive
 Phase2.0 : Semi-Automatic Memory Processing
 Phase2.5 : Safer Automation
 Phase2.6 : Codex Conversation MVP
+Phase2.65: Session Save / Resume MVP
 Phase2.7 : Chat GUI MVP
 Phase3   : Searchable Memory
 Phase4   : MCP Integration
@@ -84,7 +89,8 @@ AI-LifeOS/
 ├─ inbox/
 │  ├─ chat.txt
 │  └─ live/
-│     └─ YYYY-MM-DD_HHMMSS.jsonl
+│     ├─ YYYY-MM-DD_HHMMSS.jsonl
+│     └─ YYYY-MM-DD_HHMMSS.session.json
 │
 ├─ journal/
 │  └─ YYYY/
@@ -108,10 +114,12 @@ AI-LifeOS/
 │  ├─ codex_conversation.py
 │  ├─ chat_gui.py
 │  ├─ finalize_live_chat.py
+│  ├─ session_store.py
 │  └─ live_session.py
 │
 ├─ docs/
 │  ├─ codex_conversation_mvp.md
+│  ├─ session_save_mvp.md
 │  └─ chat_gui_mvp.md
 │
 ├─ desktop/
@@ -156,6 +164,18 @@ Phase2.6 で追加予定の会話専用MVPフロー:
 8. 必要に応じて Git commit する
 ```
 
+Phase2.65 で追加予定のSession Save / Resume MVPフロー:
+
+```text
+1. python scripts\session_store.py save を実行する
+2. 最新の inbox/live/YYYY-MM-DD_HHMMSS.jsonl に対して .session.json を作る
+3. python scripts\session_store.py resume-list で再開可能なセッションを確認する
+4. python scripts\codex_conversation.py --resume または /resume <session_id> で過去セッションをロードする
+5. 再開対象は最後のuser入力が10日以内のセッションに限定する
+6. python scripts\session_store.py prune で10日超の削除候補を確認する
+7. 実削除は python scripts\session_store.py prune --delete を明示した場合だけ行う
+```
+
 Phase2.7 で追加予定のChat GUI MVPフロー:
 
 ```text
@@ -164,11 +184,12 @@ Phase2.7 で追加予定のChat GUI MVPフロー:
 3. Phase2.6の会話処理へ送信する
 4. assistant返答をGUIに表示する
 5. user/assistant発言を inbox/live/YYYY-MM-DD_HHMMSS.jsonl に逐次保存する
-6. ユーザーが「会話を整理して保存」ボタンを押す
-7. finalize_live_chat.py を実行する
-8. raw.md を生成する
-9. 既存Phase2.5処理で summary / journal / memory を生成する
-10. 必要に応じて Git commit する
+6. 必要に応じて Phase2.65 の保存済みセッションを /resume 相当でロードする
+7. ユーザーが「会話を整理して保存」ボタンを押す
+8. finalize_live_chat.py を実行する
+9. raw.md を生成する
+10. 既存Phase2.5処理で summary / journal / memory を生成する
+11. 必要に応じて Git commit する
 ```
 
 ---
@@ -534,25 +555,136 @@ Phase2.6によって、将来的に以下がやりやすくなります。
 
 ---
 
+## Phase2.65: Session Save / Resume MVP
+
+Phase2.65 の目的は、Phase2.6 で作成した live JSONL 会話を、Codex の `/resume` のように後からロードして再開できるようにすることです。
+
+Phase2.7 のGUIに進む前に、CLIでもGUIでも使えるセッション保存・再開の最小層を作ります。
+
+### 基本方針
+
+* 元の `inbox/live/*.jsonl` は削除・移動せず、横にメタデータを置く
+* 保存済みセッションは `.session.json` で管理する
+* `/resume` で再開できるセッションは、最後のuser入力が10日以内のものに限定する
+* 10日を超えたセッションは削除候補にできるが、自動削除はしない
+* 実削除は `prune --delete` のような明示コマンドに限定する
+* memory / journal / summary は会話再開中に勝手に編集しない
+* Git commit はユーザー明示操作または既存スクリプト経由にする
+
+### 作りたいもの
+
+#### 1. セッション保存メタデータ
+
+保存先:
+
+```text
+inbox/live/YYYY-MM-DD_HHMMSS.session.json
+```
+
+内容:
+
+* session_id
+* status
+* title
+* jsonl_file
+* message_count
+* started_at
+* updated_at
+* saved_at
+
+#### 2. セッション保存・一覧スクリプト
+
+追加候補:
+
+```text
+scripts/session_store.py
+```
+
+想定コマンド:
+
+```powershell
+python scripts\session_store.py save
+python scripts\session_store.py save --file inbox\live\YYYY-MM-DD_HHMMSS.jsonl --title "タイトル"
+python scripts\session_store.py list
+python scripts\session_store.py resume-list
+python scripts\session_store.py prune
+python scripts\session_store.py prune --delete
+```
+
+#### 3. CLI会話の /resume
+
+想定コマンド:
+
+```powershell
+python scripts\codex_conversation.py --resume
+```
+
+会話中コマンド:
+
+```text
+/resume
+/cancel
+/resume latest
+/resume YYYY-MM-DD_HHMMSS
+```
+
+`/resume` だけの場合は、PowerShellの対話端末では再開可能なセッション一覧をカーソル選択UIで表示します。`Up/Down` で移動し、`Enter` でロードします。パイプ入力などカーソル選択できない環境では番号入力に戻します。
+
+`/resume latest` または `--resume` は、最後のuser入力が10日以内の最新セッションをロードします。
+
+### 保持ルール
+
+* 判断基準は「最後のassistant返答」ではなく「最後のuser入力」にする
+* デフォルト保持期間は10日
+* 10日以内のセッションだけを再開候補に表示する
+* 10日を超えたセッションは `prune` で削除候補として表示する
+* `prune` はデフォルトでdry-runにし、実削除しない
+* 実削除する場合は `prune --delete` を明示する
+* 削除対象は `inbox/live/*.jsonl` と同名の `.session.json` のみに限定する
+
+### Phase2.7との関係
+
+Phase2.7 のGUIは、Phase2.65 のセッション保存・再開処理を薄く呼び出します。
+
+GUIで最初からやること:
+
+* 現在のセッションファイル表示
+* セッション保存
+* 10日以内のセッション一覧
+* セッション再開
+
+GUIでまだやらないこと:
+
+* 過去ログ全文検索
+* ベクトル検索
+* 複雑な履歴管理
+* 自動削除
+* 自動Git commit
+
+---
+
 ## Phase2.7: Chat GUI MVP
 
-Phase2.7 の目的は、Phase2.6 で作成する Codex Conversation MVP を GUI から利用できるようにすることです。
+Phase2.7 の目的は、Phase2.6 で作成する Codex Conversation MVP と Phase2.65 の Session Save / Resume MVP を GUI から利用できるようにすることです。
 
 Phase2.6 では、PowerShell上で継続会話できるCLIチャットを作り、会話を inbox/live/*.jsonl に逐次保存し、finalize_live_chat.py で raw.md 化する想定です。
 
-Phase2.7 では、その会話エンジンと保存処理を流用し、ChatGPT風の最小GUIを作ります。
+Phase2.7 では、その会話エンジン、保存処理、再開処理を流用し、ChatGPT風の最小GUIを作ります。
 
 Phase2.7 は Phase3 の検索機能とは分離し、今後の会話をGUIから自然に保存できる入口を作る段階です。
 
 ### 基本方針
 
 * Phase2.6 の会話エンジンを再利用する
+* Phase2.65 のセッション保存・再開処理を再利用する
 * GUIは既存処理の薄いラッパーにする
 * いきなり多機能化しない
 * ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない
 * OpenAI API直叩き前提にしない
 * Codex SDK または app-server を使った会話処理を前提にする
 * 会話ログは引き続き inbox/live/*.jsonl に逐次保存する
+* 保存済みセッションは Phase2.65 の `.session.json` で扱う
+* 10日以内のセッションをGUIから再開できるようにする
 * 会話終了後に finalize_live_chat.py で raw.md 化できるようにする
 * summary / journal / memory / Git commit は既存Phase2.5処理に接続する
 * memory/long_term.md を会話中に勝手に編集しない
@@ -583,6 +715,7 @@ GUIに必要な最小要素:
 * チャット表示欄
 * 入力欄
 * 送信ボタン
+* セッション再開ボタン
 * 会話終了ボタン
 * 会話を整理して保存ボタン
 * 現在のセッションファイル表示
@@ -600,6 +733,8 @@ Phase2.6の会話処理へ送信
 assistant返答をGUIに表示
 ↓
 user/assistant発言を inbox/live/YYYY-MM-DD_HHMMSS.jsonl に逐次保存
+↓
+必要に応じて Phase2.65 の /resume 相当で過去10日以内のセッションをロード
 ↓
 ユーザーが「会話を整理して保存」ボタンを押す
 ↓
@@ -656,9 +791,10 @@ Phase2.7は、Phase2.6の以下が動いていることを前提にする。
 scripts/codex_conversation.py
 scripts/live_session.py
 scripts/finalize_live_chat.py
+scripts/session_store.py
 ```
 
-未実装の場合はPhase2.7で直接実装せず、Phase2.6の依存として明記する。
+未実装の場合はPhase2.7で直接実装せず、Phase2.6またはPhase2.65の依存として明記する。
 
 #### Step 3: 最小GUIを作る
 
@@ -681,6 +817,7 @@ desktop/
 * 送信する
 * 返答を表示する
 * JSONLに保存される
+* 10日以内のセッションを再開できる
 * 終了できる
 * finalize処理を呼び出せる
 
@@ -714,6 +851,7 @@ Phase2.7では以下をやらない。
 * Gmail / Discord / Calendar連携
 * 本格的な設定画面
 * 複数会話管理
+* 10日超セッションの自動削除
 * ユーザー認証
 * クラウド同期
 * ChatGPT公式WebのDOM取得
@@ -901,6 +1039,9 @@ Codexは以下のルールを守ること。
 * 可能なら差分確認しやすい粒度で変更する
 * Phase2.6 の会話専用MVPでは、会話ログJSONLへの追記以外のファイル操作をユーザー明示操作に限定する
 * Phase2.6 の調査結果は docs/codex_conversation_mvp.md に整理する
+* Phase2.65 のSession Save / Resume MVPでは、/resume対象を最後のuser入力から10日以内に限定する
+* Phase2.65 の調査・設計結果は docs/session_save_mvp.md に整理する
+* Phase2.65 の10日超セッション削除は、dry-run確認後の明示コマンドに限定する
 * Phase2.7 のChat GUI MVPはPhase2.6の会話エンジンを再利用する薄いラッパーとして設計する
 * Phase2.7 の調査結果は docs/chat_gui_mvp.md に整理する
 * Phase2.7 のGUIは会話ログを inbox/live/*.jsonl に逐次保存する方針を維持する
@@ -919,6 +1060,8 @@ Codexは以下のルールを守ること。
 * Phase2.6 の会話中に memory/long_term.md を勝手に編集しない
 * Phase2.6 の会話中に過去ログを勝手に削除・移動しない
 * ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない
+* Phase2.65 で10日超セッションを自動削除しない
+* Phase2.65 の /resume で memory/long_term.md や journal を勝手に編集しない
 * Phase2.7 のGUI中に memory/long_term.md や journal を勝手に編集しない
 * Phase2.7 で過去ログ検索UI、ベクトルDB検索、MCP連携を先取りしない
 * Phase2.7 で勝手なGit commitを連発しない
@@ -973,6 +1116,30 @@ Phase2.6 live JSONLをraw.md化:
 
 ```powershell
 python scripts\finalize_live_chat.py
+```
+
+Phase2.65 最新live JSONLを保存済みセッション化:
+
+```powershell
+python scripts\session_store.py save
+```
+
+Phase2.65 再開できるセッション一覧:
+
+```powershell
+python scripts\session_store.py resume-list
+```
+
+Phase2.65 最新セッションを再開:
+
+```powershell
+python scripts\codex_conversation.py --resume
+```
+
+Phase2.65 10日超セッションの削除候補確認:
+
+```powershell
+python scripts\session_store.py prune
 ```
 
 Phase2.7 調査ドキュメント作成後の想定GUI:
@@ -1046,6 +1213,22 @@ Phase2.6 の完了条件:
 * SourceTreeで差分確認できる
 * Git commitできる
 
+Phase2.65 の完了条件:
+
+* AGENTS.mdにPhase2.65が追加されている
+* docs/session_save_mvp.md にセッション保存・再開方針が整理されている
+* python scripts\session_store.py save で最新live JSONLの `.session.json` を作れる
+* python scripts\session_store.py list で保存済みセッションを確認できる
+* python scripts\session_store.py resume-list で最後のuser入力が10日以内のセッションを確認できる
+* python scripts\codex_conversation.py --resume で最新の再開可能セッションをロードできる
+* 会話中に /resume でカーソル選択式の候補一覧を表示できる
+* カーソル選択できない環境では /resume 後の番号入力でセッションをロードできる
+* 会話中に /resume <session_id> で特定セッションをロードできる
+* python scripts\session_store.py prune で10日超セッションの削除候補を確認できる
+* 10日超セッションの実削除は prune --delete を明示した場合だけ行う
+* 通常の保存や再開では memory / journal / summary / Git commit を勝手に実行しない
+* python -m unittest が通る
+
 Phase2.7 の完了条件:
 
 * AGENTS.mdにPhase2.7が追加されている
@@ -1053,7 +1236,9 @@ Phase2.7 の完了条件:
 * GUI候補技術が比較されている
 * 最小GUIの実装方針が決まっている
 * Phase2.6の会話処理との接続方針が明記されている
+* Phase2.65のセッション保存・再開処理との接続方針が明記されている
 * inbox/live/*.jsonl への逐次保存方針が維持されている
+* 10日以内セッションの再開方針が明記されている
 * finalize_live_chat.py との接続方針が明記されている
 * GUI中にmemoryやjournalを勝手に編集しないルールが明記されている
 * Phase3の検索機能とは分離されている

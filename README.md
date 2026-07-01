@@ -17,6 +17,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - 保存した会話ごとに Codex 用タスク `tasks/latest_codex_task.md` を生成する
 - `codex.cmd exec` で `summary.md`、`journal`、`memory/long_term.md` を自動更新する
 - PowerShellスクリプトで保存、Codex実行、Git commitまで自動実行する
+- live会話セッションを保存済みメタデータ化し、10日以内のセッションを再開候補として扱う
 - `python -m unittest` で保存処理をテストする
 
 ## Directory Layout
@@ -32,7 +33,10 @@ AI-LifeOS/
 │           ├─ raw.md
 │           └─ summary.md
 ├─ inbox/
-│  └─ chat.txt
+│  ├─ chat.txt
+│  └─ live/
+│     ├─ YYYY-MM-DD_HHMMSS.jsonl
+│     └─ YYYY-MM-DD_HHMMSS.session.json
 ├─ journal/
 │  └─ YYYY/
 │     └─ MM/
@@ -43,7 +47,10 @@ AI-LifeOS/
 │  └─ codex_phase2_prompt.md
 ├─ scripts/
 │  ├─ process_chat.py
-│  └─ save_chat.ps1
+│  ├─ save_chat.ps1
+│  ├─ codex_conversation.py
+│  ├─ live_session.py
+│  └─ session_store.py
 ├─ tasks/
 │  └─ latest_codex_task.md
 └─ tests/
@@ -168,6 +175,66 @@ python scripts\process_chat.py --run-codex --commit
 - `raw.md` と `latest_codex_task.md` を作る
 - Codexは実行しない
 - 保存結果だけGit commitする
+
+### liveセッションを保存済みにする
+
+```powershell
+python scripts\session_store.py save
+```
+
+起こること:
+
+- 最新の `inbox/live/*.jsonl` を対象にする
+- 同じ場所に `.session.json` を作る
+- 元のJSONLは削除・移動しない
+- Git commit はしない
+
+### 再開できるセッションを見る
+
+```powershell
+python scripts\session_store.py resume-list
+```
+
+起こること:
+
+- 最後のuser入力が10日以内の `inbox/live/*.jsonl` を表示する
+- 10日を超えたセッションは再開候補に出さない
+
+### 最新セッションを再開する
+
+```powershell
+python scripts\codex_conversation.py --resume
+```
+
+会話中に候補を見る場合:
+
+```text
+/resume
+```
+
+PowerShellの対話端末では、候補一覧を `Up/Down` で移動して `Enter` で再開します。中止は `Esc` または `q` です。
+
+パイプ入力などカーソル選択できない環境では、番号入力に戻ります。
+
+会話中に特定セッションを再開する場合:
+
+```text
+/resume 2026-07-01_223000
+```
+
+### 10日超セッションの削除候補を見る
+
+```powershell
+python scripts\session_store.py prune
+```
+
+実際に削除する場合:
+
+```powershell
+python scripts\session_store.py prune --delete
+```
+
+`prune` はデフォルトでは削除せず、対象表示だけ行います。
 
 ## Codexで記憶整理する
 
