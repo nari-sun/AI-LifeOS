@@ -147,6 +147,21 @@ class ProcessChatTests(unittest.TestCase):
         )
         self.assertEqual("整理して", calls[0][1]["input"])
 
+    def test_prepare_memory_targets_creates_memory_and_journal_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            process_chat.prepare_memory_targets(
+                root=root,
+                target_at=datetime(2026, 7, 2, 19, 48, 18),
+            )
+
+            self.assertEqual(
+                "# Long-Term Memory\n\n",
+                (root / "memory" / "long_term.md").read_text(encoding="utf-8"),
+            )
+            self.assertTrue((root / "journal" / "2026" / "07").is_dir())
+
     def test_commit_changes_stages_expected_paths_and_commits(self):
         calls = []
 
@@ -168,8 +183,9 @@ class ProcessChatTests(unittest.TestCase):
             ["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"],
             calls[0],
         )
-        self.assertEqual(["git", "diff", "--cached", "--quiet"], calls[1])
-        self.assertEqual(["git", "commit", "-m", "Process chat session 2026-06-28"], calls[2])
+        self.assertEqual([sys.executable, "scripts/privacy_check.py", "--staged"], calls[1])
+        self.assertEqual(["git", "diff", "--cached", "--quiet"], calls[2])
+        self.assertEqual(["git", "commit", "-m", "Process chat session 2026-06-28"], calls[3])
 
     def test_commit_changes_skips_commit_when_no_staged_changes(self):
         calls = []
@@ -189,6 +205,7 @@ class ProcessChatTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"],
+                [sys.executable, "scripts/privacy_check.py", "--staged"],
                 ["git", "diff", "--cached", "--quiet"],
             ],
             calls,
@@ -220,6 +237,31 @@ class ProcessChatTests(unittest.TestCase):
         self.assertTrue(result.git.committed)
         self.assertEqual("codex.cmd", calls[0][0])
         self.assertEqual(["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"], calls[1])
+
+    def test_commit_changes_stops_when_privacy_check_fails(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if command == [sys.executable, "scripts/privacy_check.py", "--staged"]:
+                return subprocess.CompletedProcess(command, 1)
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(RuntimeError):
+                process_chat.commit_changes(
+                    root=Path(temp_dir),
+                    message="Process chat session 2026-06-28",
+                    run_command=fake_run,
+                )
+
+        self.assertEqual(
+            [
+                ["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"],
+                [sys.executable, "scripts/privacy_check.py", "--staged"],
+            ],
+            calls,
+        )
 
     def test_process_chat_session_does_not_commit_when_codex_fails(self):
         calls = []

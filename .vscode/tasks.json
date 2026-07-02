@@ -3,7 +3,7 @@
   "tasks": [
     {
       "label": "Phase2.6: Start Codex Conversation",
-      "type": "shell",
+      "type": "process",
       "command": "python",
       "args": [
         "scripts\\codex_conversation.py"
@@ -12,17 +12,8 @@
         "cwd": "${workspaceFolder}",
         "env": {
           "PYTHONUTF8": "1",
-          "PYTHONIOENCODING": "utf-8"
-        },
-        "shell": {
-          "executable": "powershell.exe",
-          "args": [
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command"
-          ]
+          "PYTHONIOENCODING": "utf-8",
+          "AI_LIFEOS_DEBUG_LOG": "${workspaceFolder}\\logs\\codex_conversation_debug.log"
         }
       },
       "group": {

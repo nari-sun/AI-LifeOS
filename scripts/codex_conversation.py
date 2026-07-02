@@ -1,24 +1,192 @@
 import argparse
+import traceback
 import shutil
+import subprocess
 import sys
+import tempfile
+import threading
 import textwrap
+import time
+import os
+from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
+from finalize_live_chat import FinalizeLiveChatResult, finalize_live_chat
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from session_store import ResumeSession, list_resumable_sessions, load_resume_session
+
+DEBUG_LOG_ENV = "AI_LIFEOS_DEBUG_LOG"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Start an AI-LifeOS live conversation session.")
-    parser.add_argument("--root", default=ROOT, help="AI-LifeOSのルートディレクトリ")
+    parser.add_argument("--root", default=ROOT, help="AI-LifeOS root directory.")
     parser.add_argument(
         "--resume",
         nargs="?",
         const="latest",
-        help="指定したセッションID、または未指定なら最新の再開可能セッションをロードする",
+        help="Load the latest resumable session, or a specific session id/path.",
     )
-    parser.add_argument("--resume-days", type=int, default=10, help="最後のuser入力から何日以内を再開対象にするか")
+    parser.add_argument(
+        "--resume-days",
+        type=int,
+        default=10,
+        help="Only sessions whose last user input is within this many days can be resumed.",
+    )
+    parser.add_argument("--codex-command", default="codex.cmd", help="Codex CLI command.")
+    parser.add_argument(
+        "--codex-sandbox",
+        default="read-only",
+        choices=("read-only", "workspace-write", "danger-full-access"),
+        help="Sandbox mode for chat replies. read-only is the Phase2.6 default.",
+    )
+    parser.add_argument(
+        "--codex-approval",
+        default="never",
+        choices=("untrusted", "on-request", "never"),
+        help="Approval policy for Codex exec.",
+    )
+    parser.add_argument(
+        "--max-context-messages",
+        type=int,
+        default=20,
+        help="Maximum recent messages to pass to Codex on each turn.",
+    )
+    parser.add_argument(
+        "--no-ai",
+        action="store_true",
+        help="Save user messages without calling Codex. Useful for offline logging tests.",
+    )
+    parser.add_argument(
+        "--no-finalize-on-exit",
+        action="store_true",
+        help="Do not convert the live JSONL into raw.md when the session exits.",
+    )
+    parser.add_argument(
+        "--no-process-on-exit",
+        action="store_true",
+        help="Finalize raw.md on exit, but do not run the Phase2.5 summary/journal/memory task.",
+    )
+    parser.add_argument(
+        "--commit-on-exit",
+        action="store_true",
+        help="After finalizing and processing on exit, commit the generated changes.",
+    )
+    parser.add_argument(
+        "--no-exit-progress",
+        action="store_true",
+        help="Do not show the spinner/progress line during exit processing.",
+    )
     return parser
+
+
+def _debug_log_path(root: Path | str | None = None) -> Path:
+    override = os.environ.get(DEBUG_LOG_ENV)
+    if override:
+        return Path(override)
+
+    base = Path(root) if root is not None else ROOT
+    return base / "logs" / "codex_conversation_debug.log"
+
+
+def _debug_log(root: Path | str | None, message: str) -> None:
+    try:
+        path = _debug_log_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with path.open("a", encoding="utf-8") as file:
+            file.write(f"{timestamp} pid={os.getpid()} {message}\n")
+    except OSError:
+        pass
+
+
+def build_codex_chat_prompt(messages: list[LiveMessage], max_context_messages: int = 20) -> str:
+    recent_messages = messages[-max(max_context_messages, 1) :]
+    transcript_lines = []
+    for message in recent_messages:
+        label = "User" if message.role == "user" else "Assistant"
+        transcript_lines.extend([f"{label}:", message.content, ""])
+
+    return "\n".join(
+        [
+            "You are the AI-LifeOS Phase2.6 conversation assistant.",
+            "Reply conversationally to the latest user message.",
+            "Do not edit files, run commands, commit changes, or update memory/journal.",
+            "The application has already saved the user message to the live JSONL log.",
+            "Use the transcript below as context and return only the assistant reply.",
+            "",
+            "Transcript:",
+            "",
+            *transcript_lines,
+        ]
+    ).rstrip()
+
+
+def generate_assistant_reply(
+    root: Path | str,
+    messages: list[LiveMessage],
+    codex_command: str = "codex.cmd",
+    sandbox: str = "read-only",
+    approval: str = "never",
+    max_context_messages: int = 20,
+    run_command=subprocess.run,
+) -> str:
+    root = Path(root)
+    _debug_log(root, f"assistant_reply.start messages={len(messages)} sandbox={sandbox}")
+    prompt = build_codex_chat_prompt(messages, max_context_messages=max_context_messages)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_file = Path(temp_dir) / "assistant_reply.md"
+        command = [
+            codex_command,
+            "--ask-for-approval",
+            approval,
+            "exec",
+            "-C",
+            str(root),
+            "--sandbox",
+            sandbox,
+            "--color",
+            "never",
+            "--output-last-message",
+            str(output_file),
+            "-",
+        ]
+
+        try:
+            completed = run_command(
+                command,
+                cwd=root,
+                input=prompt,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+        except FileNotFoundError as exc:
+            _debug_log(root, "assistant_reply.error codex_not_found")
+            raise RuntimeError("Codex CLI was not found. On Windows, use codex.cmd.") from exc
+
+        _debug_log(root, f"assistant_reply.codex_exit returncode={completed.returncode}")
+        if completed.returncode != 0:
+            detail = "\n".join(
+                part.strip()
+                for part in (getattr(completed, "stderr", ""), getattr(completed, "stdout", ""))
+                if part and part.strip()
+            )
+            raise RuntimeError(f"Codex CLI failed with exit code {completed.returncode}.\n{detail}".strip())
+
+        if output_file.exists():
+            reply = output_file.read_text(encoding="utf-8").strip()
+        else:
+            reply = (getattr(completed, "stdout", "") or "").strip()
+
+    if not reply:
+        _debug_log(root, "assistant_reply.error empty_reply")
+        raise RuntimeError("Codex CLI completed but returned an empty assistant reply.")
+
+    _debug_log(root, f"assistant_reply.success chars={len(reply)}")
+    return reply
 
 
 def _display_path(path: Path, root: Path) -> str:
@@ -83,7 +251,7 @@ def _render_screen(
             message_lines.extend(_wrap_message(message.role, message.content, width))
             message_lines.append("")
     else:
-        message_lines.append("(まだメッセージはありません)")
+        message_lines.append("(No messages yet.)")
 
     visible_messages = message_lines[-message_height:]
     blank_count = max(message_height - len(visible_messages), 0)
@@ -118,9 +286,9 @@ def _load_resume_messages(root: Path, session_ref: str, retention_days: int) -> 
 
 def _format_resume_list(sessions: list[ResumeSession]) -> str:
     if not sessions:
-        return "再開できるセッションはありません。"
+        return "No resumable sessions."
 
-    lines = ["再開する番号を入力してください。/cancel で中止します。"]
+    lines = ["Enter a number to resume, or /cancel to cancel."]
     for index, session in enumerate(sessions[:10], start=1):
         lines.append(
             f"{index}. {session.session_id} | {session.last_user_at.isoformat(timespec='seconds')} | "
@@ -213,46 +381,250 @@ def _select_resume_candidate_with_cursor(candidates: list[ResumeSession]) -> Res
                 return candidates[digit - 1]
 
 
+def _save_messages(session: LiveSession, messages: list[LiveMessage]) -> None:
+    if messages:
+        session.write_messages(messages)
+
+
+def _write_exit_marker() -> None:
+    marker = os.environ.get("AI_LIFEOS_EXIT_MARKER")
+    if not marker:
+        _debug_log(None, "exit_marker.skip no_env")
+        return
+
+    try:
+        path = Path(marker)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ok\n", encoding="utf-8")
+        _debug_log(None, f"exit_marker.wrote path={path}")
+    except OSError:
+        _debug_log(None, f"exit_marker.error path={marker}")
+
+
+class ExitProgress:
+    def __init__(self, enabled: bool | None = None) -> None:
+        self.enabled = sys.stdout.isatty() if enabled is None else enabled
+        self._percent = 0
+        self._message = ""
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "ExitProgress":
+        if self.enabled:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.stop()
+
+    def update(self, percent: int, message: str) -> None:
+        with self._lock:
+            self._percent = max(0, min(percent, 100))
+            self._message = message
+
+        if not self.enabled:
+            return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        if self.enabled:
+            print("\r" + " " * 100 + "\r", end="", flush=True)
+
+    def _run(self) -> None:
+        frames = "|/-\\"
+        index = 0
+        while not self._stop.is_set():
+            with self._lock:
+                percent = self._percent
+                message = self._message or "Working..."
+            frame = frames[index % len(frames)]
+            print(f"\r{frame} {percent:3d}% {message}", end="", flush=True)
+            index += 1
+            time.sleep(0.12)
+
+
+def finish_session(
+    root: Path | str,
+    session: LiveSession,
+    messages: list[LiveMessage],
+    has_new_messages: bool,
+    finalize_on_exit: bool = True,
+    process_on_exit: bool = True,
+    commit_on_exit: bool = False,
+    codex_command: str = "codex.cmd",
+    codex_approval: str = "never",
+    progress: Callable[[int, str], None] | None = None,
+    run_command=subprocess.run,
+) -> tuple[bool, str, FinalizeLiveChatResult | None]:
+    root = Path(root)
+    _debug_log(
+        root,
+        "finish_session.start "
+        f"messages={len(messages)} has_new={has_new_messages} finalize={finalize_on_exit} "
+        f"process={process_on_exit} commit={commit_on_exit} session={session.path}",
+    )
+    if progress:
+        progress(5, "Saving live log...")
+    _save_messages(session, messages)
+    _debug_log(root, f"finish_session.saved_live exists={session.path.exists()} path={session.path}")
+    if not messages:
+        if progress:
+            progress(100, "No messages to save.")
+        _debug_log(root, "finish_session.no_messages")
+        return False, "Exited without messages.", None
+
+    if not finalize_on_exit:
+        if progress:
+            progress(100, "Saved live log.")
+        _debug_log(root, "finish_session.finalize_disabled")
+        return True, f"Saved {len(messages)} messages and exited.", None
+
+    if not has_new_messages:
+        if progress:
+            progress(100, "Saved live log.")
+        _debug_log(root, "finish_session.no_new_messages")
+        return True, f"Saved {len(messages)} messages. No new messages, skipped finalize.", None
+
+    _debug_log(root, "finish_session.finalize_start")
+    result = finalize_live_chat(
+        root=root,
+        session_file=session.path,
+        run_codex=process_on_exit,
+        commit=commit_on_exit,
+        force=True,
+        codex_command=codex_command,
+        codex_sandbox="workspace-write",
+        codex_approval=codex_approval,
+        progress=progress,
+        run_command=run_command,
+    )
+    _debug_log(root, f"finish_session.finalize_done raw={result.raw_file} codex={bool(result.codex)} git={bool(result.git)}")
+
+    parts = [
+        f"Saved {len(messages)} messages.",
+        f"Finalized: {result.raw_file.name}",
+    ]
+    if result.codex:
+        parts.append("Updated summary/journal/memory.")
+    if result.git:
+        parts.append("Committed changes." if result.git.committed else "No Git changes to commit.")
+
+    _debug_log(root, "finish_session.success")
+    return True, " ".join(parts), result
+
+
+def finish_session_for_exit(
+    root: Path | str,
+    session: LiveSession,
+    messages: list[LiveMessage],
+    has_new_messages: bool,
+    finalize_on_exit: bool = True,
+    process_on_exit: bool = True,
+    commit_on_exit: bool = False,
+    codex_command: str = "codex.cmd",
+    codex_approval: str = "never",
+    show_progress: bool = True,
+    run_command=subprocess.run,
+) -> tuple[bool, str, int]:
+    root = Path(root)
+    _debug_log(
+        root,
+        "finish_session_for_exit.start "
+        f"messages={len(messages)} has_new={has_new_messages} finalize={finalize_on_exit} "
+        f"process={process_on_exit} commit={commit_on_exit} progress={show_progress}",
+    )
+    try:
+        with ExitProgress(enabled=show_progress and sys.stdout.isatty()) as progress:
+            saved, status, _ = finish_session(
+                root=root,
+                session=session,
+                messages=messages,
+                has_new_messages=has_new_messages,
+                finalize_on_exit=finalize_on_exit,
+                process_on_exit=process_on_exit,
+                commit_on_exit=commit_on_exit,
+                codex_command=codex_command,
+                codex_approval=codex_approval,
+                progress=progress.update,
+                run_command=run_command,
+            )
+        _debug_log(root, f"finish_session_for_exit.success saved={saved} status={status!r}")
+        return saved, status, 0
+    except KeyboardInterrupt:
+        _save_messages(session, messages)
+        saved = bool(messages)
+        _write_exit_marker()
+        _debug_log(root, "finish_session_for_exit.keyboard_interrupt")
+        return saved, "Saved live log, but exit processing was interrupted.", 0
+    except (FileNotFoundError, FileExistsError, RuntimeError, ValueError) as exc:
+        _save_messages(session, messages)
+        saved = bool(messages)
+        _write_exit_marker()
+        _debug_log(root, f"finish_session_for_exit.error type={type(exc).__name__} message={exc}")
+        return saved, f"Saved live log, but finalize failed: {exc}", 0
+
+
 def main() -> int:
     args = build_parser().parse_args()
     root = Path(args.root)
+    _debug_log(root, f"main.start argv={sys.argv[1:]}")
 
     try:
         if args.resume:
             session, messages = _load_resume_messages(root=root, session_ref=args.resume, retention_days=args.resume_days)
-            status = f"セッションを再開しました: {session.path.name}"
+            status = f"Resumed session: {session.path.name}"
+            _debug_log(root, f"main.session_resumed path={session.path} messages={len(messages)}")
         else:
             session = create_live_session(root=root)
             messages: list[LiveMessage] = []
-            status = "起動成功"
+            status = "Started a new live session."
+            _debug_log(root, f"main.session_created path={session.path}")
     except (FileNotFoundError, ValueError) as exc:
+        _debug_log(root, f"main.session_error type={type(exc).__name__} message={exc}")
         print(f"ERROR: {exc}")
         return 1
 
     session_display_path = _display_path(session.path, root)
     saved = False
+    has_new_messages = False
     resume_candidates: list[ResumeSession] = []
+    exit_code = 0
 
     _render_screen(messages, session_display_path, status)
 
     try:
         while True:
             message = input("You > ")
+            normalized = message.strip().lower()
 
-            if message.strip().lower() == "/exit":
-                if messages:
-                    session.write_messages(messages)
-                    saved = True
-                    status = f"{len(messages)}件のメッセージを保存して終了します。"
-                else:
-                    status = "保存するメッセージはありません。終了します。"
+            if normalized == "/exit":
+                _debug_log(root, "main.command_exit")
+                saved, status, finish_exit_code = finish_session_for_exit(
+                    root=root,
+                    session=session,
+                    messages=messages,
+                    has_new_messages=has_new_messages,
+                    finalize_on_exit=not args.no_finalize_on_exit,
+                    process_on_exit=not args.no_process_on_exit and not args.no_ai,
+                    commit_on_exit=args.commit_on_exit,
+                    codex_command=args.codex_command,
+                    codex_approval=args.codex_approval,
+                    show_progress=not args.no_exit_progress,
+                )
+                if finish_exit_code:
+                    exit_code = finish_exit_code
                 _render_screen(messages, session_display_path, status)
                 break
 
-            if message.strip().lower() == "/resume":
+            if normalized == "/resume":
+                _debug_log(root, "main.command_resume_menu")
                 resume_candidates = _resume_candidates(root=root, retention_days=args.resume_days)
                 if not resume_candidates:
-                    status = "再開できるセッションはありません。"
+                    status = "No resumable sessions."
                     _render_screen(messages, session_display_path, status)
                     continue
 
@@ -260,13 +632,11 @@ def main() -> int:
                     selected = _select_resume_candidate_with_cursor(resume_candidates)
                     if selected is None:
                         resume_candidates = []
-                        status = "セッション再開を中止しました。"
+                        status = "Resume canceled."
                         _render_screen(messages, session_display_path, status)
                         continue
 
-                    if messages:
-                        session.write_messages(messages)
-
+                    _save_messages(session, messages)
                     try:
                         session, messages = _load_resume_messages(
                             root=root,
@@ -274,9 +644,10 @@ def main() -> int:
                             retention_days=args.resume_days,
                         )
                         session_display_path = _display_path(session.path, root)
-                        status = f"セッションを再開しました: {session.path.name}"
+                        status = f"Resumed session: {session.path.name}"
+                        has_new_messages = False
                     except (FileNotFoundError, ValueError) as exc:
-                        status = f"再開できません: {exc}"
+                        status = f"Could not resume: {exc}"
                     resume_candidates = []
                     _render_screen(messages, session_display_path, status)
                     continue
@@ -285,22 +656,21 @@ def main() -> int:
                 _render_screen(messages, session_display_path, status)
                 continue
 
-            if resume_candidates and message.strip().lower() == "/cancel":
+            if resume_candidates and normalized == "/cancel":
+                _debug_log(root, "main.command_resume_cancel")
                 resume_candidates = []
-                status = "セッション再開を中止しました。"
+                status = "Resume canceled."
                 _render_screen(messages, session_display_path, status)
                 continue
 
             if resume_candidates and message.strip().isdigit():
                 selected_index = int(message.strip()) - 1
                 if not 0 <= selected_index < len(resume_candidates):
-                    status = f"番号は1から{len(resume_candidates)}の範囲で入力してください。/cancel で中止できます。"
+                    status = f"Enter a number from 1 to {len(resume_candidates)}, or /cancel."
                     _render_screen(messages, session_display_path, status)
                     continue
 
-                if messages:
-                    session.write_messages(messages)
-
+                _save_messages(session, messages)
                 selected = resume_candidates[selected_index]
                 try:
                     session, messages = _load_resume_messages(
@@ -309,17 +679,18 @@ def main() -> int:
                         retention_days=args.resume_days,
                     )
                     session_display_path = _display_path(session.path, root)
-                    status = f"セッションを再開しました: {session.path.name}"
+                    status = f"Resumed session: {session.path.name}"
                     resume_candidates = []
+                    has_new_messages = False
                 except (FileNotFoundError, ValueError) as exc:
-                    status = f"再開できません: {exc}"
+                    status = f"Could not resume: {exc}"
                 _render_screen(messages, session_display_path, status)
                 continue
 
-            if message.strip().lower().startswith("/resume "):
+            if normalized.startswith("/resume "):
                 session_ref = message.strip().split(maxsplit=1)[1]
-                if messages:
-                    session.write_messages(messages)
+                _debug_log(root, f"main.command_resume_ref ref={session_ref}")
+                _save_messages(session, messages)
                 try:
                     session, messages = _load_resume_messages(
                         root=root,
@@ -327,42 +698,94 @@ def main() -> int:
                         retention_days=args.resume_days,
                     )
                     session_display_path = _display_path(session.path, root)
-                    status = f"セッションを再開しました: {session.path.name}"
+                    status = f"Resumed session: {session.path.name}"
                     resume_candidates = []
+                    has_new_messages = False
                 except (FileNotFoundError, ValueError) as exc:
-                    status = f"再開できません: {exc}"
+                    status = f"Could not resume: {exc}"
                 _render_screen(messages, session_display_path, status)
                 continue
 
             if resume_candidates:
-                status = f"再開する番号を1から{len(resume_candidates)}の範囲で入力してください。/cancel で中止できます。"
+                status = f"Enter a number from 1 to {len(resume_candidates)}, or /cancel."
                 _render_screen(messages, session_display_path, status)
                 continue
 
             if not message.strip():
-                status = "空のメッセージは保存しません。"
+                status = "Empty messages are not saved."
                 _render_screen(messages, session_display_path, status)
                 continue
 
             messages.append(create_live_message("user", message))
-            resume_candidates = []
-            status = "AI返答の接続は次のステップです。/exit でまとめて保存して終了します。"
-            _render_screen(messages, session_display_path, status)
-    except (KeyboardInterrupt, EOFError):
-        if messages:
+            has_new_messages = True
             session.write_messages(messages)
             saved = True
-            status = f"{len(messages)}件のメッセージを保存して終了します。"
-        else:
-            status = "保存するメッセージはありません。終了します。"
+            resume_candidates = []
+            _debug_log(root, f"main.user_saved messages={len(messages)} path={session.path}")
+
+            if args.no_ai:
+                status = "Saved user message. --no-ai is active."
+                _render_screen(messages, session_display_path, status)
+                continue
+
+            status = "Waiting for Codex reply..."
+            _render_screen(messages, session_display_path, status)
+
+            try:
+                reply = generate_assistant_reply(
+                    root=root,
+                    messages=messages,
+                    codex_command=args.codex_command,
+                    sandbox=args.codex_sandbox,
+                    approval=args.codex_approval,
+                    max_context_messages=args.max_context_messages,
+                )
+            except RuntimeError as exc:
+                _debug_log(root, f"main.assistant_reply_failed type={type(exc).__name__} message={exc}")
+                status = f"Codex reply failed: {exc}"
+                _render_screen(messages, session_display_path, status)
+                continue
+
+            messages.append(create_live_message("assistant", reply))
+            session.write_messages(messages)
+            _debug_log(root, f"main.assistant_saved messages={len(messages)} path={session.path}")
+            status = "Saved assistant reply."
+            _render_screen(messages, session_display_path, status)
+    except (KeyboardInterrupt, EOFError):
+        _debug_log(root, f"main.input_interrupted type={sys.exc_info()[0].__name__ if sys.exc_info()[0] else 'unknown'}")
+        saved, status, finish_exit_code = finish_session_for_exit(
+            root=root,
+            session=session,
+            messages=messages,
+            has_new_messages=has_new_messages,
+            finalize_on_exit=not args.no_finalize_on_exit,
+            process_on_exit=not args.no_process_on_exit and not args.no_ai,
+            commit_on_exit=args.commit_on_exit,
+            codex_command=args.codex_command,
+            codex_approval=args.codex_approval,
+            show_progress=not args.no_exit_progress,
+        )
+        if finish_exit_code:
+            exit_code = finish_exit_code
         _render_screen(messages, session_display_path, status)
 
     if saved:
-        print(f"ログ: {session_display_path}")
+        print(f"Log: {session_display_path}")
     else:
-        print("ログファイルは作成していません。")
-    return 0
+        print("No log file was written.")
+    _write_exit_marker()
+    _debug_log(root, f"main.exit code={exit_code} saved={saved} status={status!r}")
+    return exit_code
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted. Live log was saved if a session had messages.")
+        _debug_log(None, "top_level.keyboard_interrupt")
+        _write_exit_marker()
+        raise SystemExit(0)
+    except Exception:
+        _debug_log(None, "top_level.unhandled_exception\n" + traceback.format_exc())
+        raise

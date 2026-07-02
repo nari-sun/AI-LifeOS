@@ -1,5 +1,6 @@
 import argparse
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -103,12 +104,27 @@ def process_chat(
     )
 
 
+def prepare_memory_targets(root: Path | str = ROOT, target_at: datetime | None = None) -> None:
+    root = Path(root)
+    now = target_at or datetime.now()
+
+    memory_dir = root / "memory"
+    memory_dir.mkdir(exist_ok=True)
+    long_term = memory_dir / "long_term.md"
+    if not long_term.exists():
+        long_term.write_text("# Long-Term Memory\n\n", encoding="utf-8")
+
+    journal_dir = root / "journal" / now.strftime("%Y") / now.strftime("%m")
+    journal_dir.mkdir(parents=True, exist_ok=True)
+
+
 def run_codex_task(
     root: Path | str,
     prompt: str,
     codex_command: str = "codex.cmd",
     sandbox: str = "workspace-write",
     approval: str = "never",
+    capture_output: bool = False,
     run_command=subprocess.run,
 ) -> CodexRunResult:
     root = Path(root)
@@ -125,12 +141,18 @@ def run_codex_task(
     )
 
     try:
+        run_kwargs = {
+            "cwd": root,
+            "input": prompt,
+            "text": True,
+            "encoding": "utf-8",
+        }
+        if capture_output:
+            run_kwargs["capture_output"] = True
+
         completed = run_command(
             list(command),
-            cwd=root,
-            input=prompt,
-            text=True,
-            encoding="utf-8",
+            **run_kwargs,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
@@ -138,9 +160,23 @@ def run_codex_task(
         ) from exc
 
     if completed.returncode != 0:
-        raise RuntimeError(f"Codex CLI が失敗しました。exit code: {completed.returncode}")
+        detail = _completed_process_output(completed) if capture_output else ""
+        suffix = f"\n{detail}" if detail else ""
+        raise RuntimeError(f"Codex CLI が失敗しました。exit code: {completed.returncode}{suffix}")
 
     return CodexRunResult(command=command, returncode=completed.returncode)
+
+
+def _completed_process_output(completed) -> str:
+    parts = []
+    for label in ("stderr", "stdout"):
+        value = getattr(completed, label, "")
+        if value:
+            text = str(value).strip()
+            if text:
+                parts.append(f"{label}:\n{text[-2000:]}")
+
+    return "\n".join(parts)
 
 
 def commit_changes(
@@ -159,6 +195,15 @@ def commit_changes(
     )
     if add_result.returncode != 0:
         raise RuntimeError(f"git add が失敗しました。exit code: {add_result.returncode}")
+
+    privacy_result = run_command(
+        [sys.executable, "scripts/privacy_check.py", "--staged"],
+        cwd=root,
+        text=True,
+        encoding="utf-8",
+    )
+    if privacy_result.returncode != 0:
+        raise RuntimeError("個人情報・秘密情報チェックが失敗しました。commitを中止します。")
 
     diff_result = run_command(
         ["git", "diff", "--cached", "--quiet"],
@@ -205,6 +250,7 @@ def process_chat_session(
 
     codex_result = None
     if run_codex:
+        prepare_memory_targets(root=root, target_at=chat_result.imported_at)
         codex_result = run_codex_task(
             root=root,
             prompt=chat_result.prompt,

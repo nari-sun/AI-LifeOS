@@ -68,6 +68,7 @@ Session: 会話の短い名前
 ## 安全ルール
 
 - 会話ログにないことは書かない
+- Windows PowerShellでMarkdownを読む場合は、文字化けを避けるため必ず `Get-Content -Encoding UTF8` または `Get-Content -Raw -Encoding UTF8` を使う
 - APIキー、秘密情報、`.env` 前提の内容を書かない
 - OpenAI API直叩きを前提にしない
 - Markdownで書く

@@ -2,7 +2,7 @@
 
 AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、後から要約・日記・長期メモリとして活用するための個人用AI記憶システムです。
 
-現在は Phase2.5 付近です。OpenAI API、`.env`、外部ベクトルDBは使わず、ローカルMarkdown、Codex CLI、Gitで運用します。
+現在は Phase2.65 までのMVPが入っています。OpenAI API、`.env`、外部ベクトルDBは使わず、ローカルMarkdown、Codex CLI、Gitで運用します。
 
 Windows PowerShellでMarkdownの日本語が文字化けして見える場合は、ファイル自体ではなく表示時の文字コードが原因のことがあります。確認するときは次のようにUTF-8を指定してください。
 
@@ -17,7 +17,10 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - 保存した会話ごとに Codex 用タスク `tasks/latest_codex_task.md` を生成する
 - `codex.cmd exec` で `summary.md`、`journal`、`memory/long_term.md` を自動更新する
 - PowerShellスクリプトで保存、Codex実行、Git commitまで自動実行する
+- PowerShell上でlive会話を行い、`inbox/live/*.jsonl` に逐次保存する
+- live JSONLを `raw.md` に変換し、既存のPhase2.5記憶整理へ接続する
 - live会話セッションを保存済みメタデータ化し、10日以内のセッションを再開候補として扱う
+- commit前にステージ済み差分の個人情報・秘密情報チェックを実行する
 - `python -m unittest` で保存処理をテストする
 
 ## Directory Layout
@@ -49,12 +52,20 @@ AI-LifeOS/
 │  ├─ process_chat.py
 │  ├─ save_chat.ps1
 │  ├─ codex_conversation.py
+│  ├─ finalize_live_chat.py
 │  ├─ live_session.py
 │  └─ session_store.py
+├─ docs/
+│  ├─ codex_conversation_mvp.md
+│  └─ session_save_mvp.md
 ├─ tasks/
 │  └─ latest_codex_task.md
 └─ tests/
-   └─ test_process_chat.py
+   ├─ test_codex_conversation.py
+   ├─ test_finalize_live_chat.py
+   ├─ test_live_session.py
+   ├─ test_process_chat.py
+   └─ test_session_store.py
 ```
 
 ## 基本フロー
@@ -67,6 +78,26 @@ AI-LifeOS/
 6. `codex.cmd exec` が非対話で実行される
 7. Codexが `summary.md`、`journal/YYYY/MM/YYYY-MM-DD.md`、`memory/long_term.md` を更新する
 8. 対象ファイルがGit commitされる
+
+live会話側の基本フロー:
+
+```text
+python scripts\codex_conversation.py
+↓
+会話する
+↓
+inbox/live/YYYY-MM-DD_HHMMSS.jsonl に user/assistant を逐次保存
+↓
+/exit または Ctrl+C
+↓
+conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md を作成
+↓
+Codexが summary / journal / memory を更新
+↓
+必要なら --commit-on-exit でcommit
+```
+
+会話中は `journal` や `memory/long_term.md` を更新しません。journal / memory への反映は、`/exit` または Ctrl+C の終了処理で自動実行します。
 
 ## コマンド
 
@@ -176,6 +207,90 @@ python scripts\process_chat.py --run-codex --commit
 - Codexは実行しない
 - 保存結果だけGit commitする
 
+### live会話CLIを起動する
+
+```powershell
+python scripts\codex_conversation.py
+```
+
+起こること:
+
+- `inbox/live/YYYY-MM-DD_HHMMSS.jsonl` を作る
+- ユーザー発言をCodexへ送る前に保存する
+- Codex返答を受け取った後にassistant発言として保存する
+- Codex返答生成は `codex.cmd exec` を `read-only` サンドボックスで呼ぶ
+- `/exit` または Ctrl+C で終了する
+- 終了時にlive JSONLを `raw.md` 化する
+- 終了時に既存Phase2.5処理で `summary.md`、`journal`、`memory/long_term.md` を更新する
+- 終了時の整理中はスピナーと段階ベースの%を表示する
+- 会話中に `journal`、`memory/long_term.md`、Git commit は実行しない
+- Git commit は自動では実行しない
+
+AI返答なしで起動する場合:
+
+```powershell
+python scripts\codex_conversation.py --no-ai
+```
+
+AI返答も終了時整理も止めて、JSONLログ保存だけ確認する場合:
+
+```powershell
+python scripts\codex_conversation.py --no-ai --no-finalize-on-exit
+```
+
+終了時の自動整理を止める場合:
+
+```powershell
+python scripts\codex_conversation.py --no-finalize-on-exit
+```
+
+終了時にraw.md化だけして、summary / journal / memory 更新を止める場合:
+
+```powershell
+python scripts\codex_conversation.py --no-process-on-exit
+```
+
+終了時に整理処理後のcommitまで行う場合:
+
+```powershell
+python scripts\codex_conversation.py --commit-on-exit
+```
+
+終了時の進捗表示を消す場合:
+
+```powershell
+python scripts\codex_conversation.py --no-exit-progress
+```
+
+### live JSONLをraw.md化する
+
+```powershell
+python scripts\finalize_live_chat.py
+```
+
+起こること:
+
+- 最新の `inbox/live/*.jsonl` を対象にする
+- `conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md` を作る
+- `tasks/latest_codex_task.md` を作る
+- 元のJSONLは削除・移動しない
+- Codex は実行しない
+- Git commit はしない
+
+通常の `python scripts\codex_conversation.py` では終了時に自動実行されます。このコマンドは、過去のlive JSONLを手動で再処理したい場合に使います。
+
+raw.md化後にsummary / journal / memoryまで更新する場合:
+
+```powershell
+python scripts\finalize_live_chat.py --run-codex
+```
+
+更新後にcommitまで行う場合:
+
+```powershell
+python scripts\finalize_live_chat.py --run-codex --commit
+```
+
 ### liveセッションを保存済みにする
 
 ```powershell
@@ -236,6 +351,31 @@ python scripts\session_store.py prune --delete
 
 `prune` はデフォルトでは削除せず、対象表示だけ行います。
 
+### commit前に個人情報・秘密情報を確認する
+
+```powershell
+python scripts\privacy_check.py --staged
+```
+
+起こること:
+
+- ステージ済みファイルを確認する
+- APIキー、token、password、メールアドレス、電話番号らしき文字列を検出する
+- 検出した場合はexit code 1で止める
+
+`python scripts\process_chat.py --run-codex --commit` と `.\scripts\save_chat.ps1` の自動commit前にも、このチェックを実行します。
+
+### push前に未pushコミットを確認する
+
+```powershell
+python scripts\privacy_check.py --range origin/main..HEAD
+```
+
+起こること:
+
+- `origin/main..HEAD` に含まれる変更ファイルを確認する
+- push前に、すでにcommit済みの内容へ個人情報・秘密情報が含まれていないか確認できる
+
 ## Codexで記憶整理する
 
 通常は `.\scripts\save_chat.ps1` が `codex.cmd exec` を自動実行します。
@@ -267,7 +407,11 @@ python -m unittest
 - `--date` が効く
 - `--keep-inbox` が効く
 - `codex.cmd exec` 用のコマンドが組み立てられる
+- live会話JSONLが保存される
+- live JSONLを `raw.md` に変換できる
+- `finalize_live_chat.py --run-codex --commit` の接続コマンドが組み立てられる
 - Git commit用の対象ファイルが限定される
+- commit前の個人情報・秘密情報チェックが失敗した場合はcommitしない
 - 空の `inbox/chat.txt` では保存しない
 - プロンプトテンプレートがない場合に中途半端なファイルを作らない
 
@@ -275,6 +419,8 @@ python -m unittest
 
 - 会話ログにないことは記録しない
 - APIキーや秘密情報は保存しない
+- commit / push 前に `python scripts\privacy_check.py --staged` を実行する
+- push 前に未pushコミットがある場合は `python scripts\privacy_check.py --range origin/main..HEAD` を実行する
 - `.env` やOpenAI API直叩きは前提にしない
 - `memory/long_term.md` は長期的に重要な情報だけ追記する
 - 自動commit対象は `conversations`、`journal`、`memory`、`inbox`、`tasks` に限定する

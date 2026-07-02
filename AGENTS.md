@@ -19,13 +19,13 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 
 ## Current Status
 
-現在は Phase2.5 まで完了済みです。
+現在は Phase2.65 まで完了済みです。
 
-次は Phase3 の検索機能へ進む前に、Phase2.6 として Codex SDK または Codex app-server を利用した会話専用MVPを検討・実装します。
+Phase2.6 として、PowerShell上の会話専用MVP、live JSONL保存、raw.md化、既存Phase2.5記憶整理への接続を実装済みです。
 
-その次に Phase2.65 として、会話セッションを保存・再開できる Session Save / Resume MVP を検討・実装します。
+Phase2.65 として、会話セッションを保存・再開できる Session Save / Resume MVP を実装済みです。
 
-その次に Phase2.7 として、Phase2.6 と Phase2.65 の会話エンジン・セッション保存処理をGUIから利用できる Chat GUI MVP を検討・実装します。
+次は Phase2.7 として、Phase2.6 と Phase2.65 の会話エンジン・セッション保存処理をGUIから利用できる Chat GUI MVP を検討・実装します。
 
 Phase1 は完了済みです。
 
@@ -39,8 +39,10 @@ Phase1 は完了済みです。
 * process_chat.py で raw.md と Codex 用タスクを生成する運用
 * codex.cmd exec で summary / journal / memory 更新を非対話実行する運用
 * 保存から Codex 実行、Git commit までを save_chat.ps1 で実行する運用
-* Phase2.6 の会話専用MVPを計画中
-* Phase2.65 のSession Save / Resume MVPを計画中
+* Phase2.6 の会話専用MVPを実装済み
+* Phase2.6 の live JSONL から raw.md への変換を実装済み
+* Phase2.6 の live会話から既存Phase2.5記憶整理への接続を実装済み
+* Phase2.65 のSession Save / Resume MVPを実装済み
 * Phase2.7 のChat GUI MVPを計画中
 
 現在の方針:
@@ -50,7 +52,7 @@ Phase1 は完了済みです。
 * ChatGPT Plus / Codex CLI 側を使う
 * Phase2.5 では自動実行を進めるが、必要に応じて SourceTree や git diff で確認できる状態を保つ
 * save_chat.ps1 は保存、Codex実行、Git commit まで自動で行う
-* Phase2.6 では会話中に自由なファイル操作をさせず、整理処理は既存スクリプトまたは明示コマンドで行う
+* Phase2.6 では会話中に自由なファイル操作をさせず、/exit または Ctrl+C の終了処理で既存スクリプト経由の整理処理を行う
 * Phase2.65 では /resume で過去10日以内の会話セッションを再開できるようにし、10日超の削除は明示コマンドに限定する
 * Phase2.7 ではPhase2.6の会話エンジンとPhase2.65のセッション保存処理を薄く包むGUIを作り、検索機能や多機能化はPhase3以降に分ける
 
@@ -158,10 +160,9 @@ Phase2.6 で追加予定の会話専用MVPフロー:
 2. PowerShell上で継続会話する
 3. 会話を inbox/live/YYYY-MM-DD_HHMMSS.jsonl に逐次保存する
 4. /exit または Ctrl+C で会話を終了する
-5. python scripts\finalize_live_chat.py を実行する
-6. JSONL を conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md に変換する
-7. 既存Phase2.5処理で summary.md / journal / memory を更新する
-8. 必要に応じて Git commit する
+5. /exit または Ctrl+C の終了処理で JSONL を conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md に変換する
+6. 終了処理で既存Phase2.5処理を実行し summary.md / journal / memory を更新する
+7. 必要に応じて --commit-on-exit または別コマンドで Git commit する
 ```
 
 Phase2.65 で追加予定のSession Save / Resume MVPフロー:
@@ -307,7 +308,9 @@ Phase2.6 の目的は、OpenAI APIを直接使わず、ChatGPTログイン済み
 
 codex exec は1回ごとの非対話実行に近く、ChatGPTのような自然な継続会話には向きにくいです。
 
-そのため、Phase2.6 では Codex SDK または Codex app-server を調査し、1つの会話スレッドを維持しながら複数ターン会話できる構成を検討実装します。
+ただし、Phase2.6 MVPでは依存関係を増やさず、既存のCodex CLIログインを使えるようにするため、`codex.cmd exec` を read-only サンドボックスで呼び、直近会話をプロンプトに含める最小アダプタを採用しています。
+
+Codex SDK または Codex app-server は、将来的に永続スレッドやストリーミング応答が必要になった時の置き換え候補として `docs/codex_conversation_mvp.md` に整理済みです。
 
 Phase2.6 は Phase3 の検索機能へ進む前の実験フェーズとして扱います。
 
@@ -316,10 +319,12 @@ Phase2.6 は Phase3 の検索機能へ進む前の実験フェーズとして扱
 * ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない
 * OpenAI APIを直接叩く構成を前提にしない
 * Codex CLI / Codex SDK / Codex app-server の利用を優先する
+* 現MVPでは `codex.cmd exec` を read-only サンドボックスで使う
 * まずはデスクトップGUIではなく、PowerShellで動くCLIチャットMVPから始める
 * 会話は逐次ローカル保存する
 * 普段の会話ではファイル操作をさせない
-* ファイル操作、要約、日記、メモリ更新、Git commit は既存スクリプトまたは明示コマンドで行う
+* ファイル操作、要約、日記、メモリ更新は会話終了時の既存スクリプト経由で行う
+* Git commit は --commit-on-exit または明示コマンドで行う
 * 既存の inbox/chat.txt 運用は壊さない
 
 ### 作りたいもの
@@ -408,15 +413,15 @@ Phase2.6の会話中、Codexには原則として自由なファイル操作を�
 
 * 会話中は読み取り専用に近い扱い
 * AGENTS.md / memory/long_term.md / 直近summary.md は必要に応じてコンテキストとして読む
-* ファイル更新はユーザーが明示的に実行する既存スクリプトに任せる
+* ファイル更新は /exit または Ctrl+C の終了処理、またはユーザーが明示的に実行する既存スクリプトに任せる
 * Git commit も自動会話中には行わない
 
 許可する処理:
 
 * 会話ログJSONLへの追記
-* 会話終了後の明示的な finalize 処理
+* 会話終了時の自動 finalize 処理
 * 既存Phase2.5のsummary/journal/memory生成スクリプト呼び出し
-* ユーザーが明示した場合のみGit commit
+* ユーザーが --commit-on-exit または別コマンドで明示した場合のみGit commit
 
 禁止:
 
@@ -427,19 +432,17 @@ Phase2.6の会話中、Codexには原則として自由なファイル操作を�
 * .env前提に戻す
 * OpenAI API直叩き前提に戻す
 
-### Codex SDK / app-server 調査タスク
+### Codex SDK / app-server 調査結果
 
-実装前に以下を確認します。
+以下を確認済みです。
 
-* 現在の環境でCodex SDKが利用できるか
-* Python SDKで継続会話スレッドを作れるか
-* ChatGPTログイン済みのCodex認証を利用できるか
-* sandboxをread_only相当にできるか
-* app-serverのほうがCLIチャットMVPに向いているか
-* Windows PowerShellで安定動作するか
-* 依存関係を増やしすぎないか
+* 現在の環境では Python SDK `openai_codex` は未インストール
+* Codex SDK は将来的に永続スレッド化する候補
+* Codex app-server はGUIやストリーミング応答が必要になった時の候補
+* 現MVPでは依存関係を増やさず `codex.cmd exec` を利用
+* 会話中のCodex実行は read-only サンドボックスをデフォルトにする
 
-調査結果は以下にまとめます。
+調査結果は以下にまとめ済みです。
 
 ```text
 docs/codex_conversation_mvp.md
@@ -449,7 +452,7 @@ docs/codex_conversation_mvp.md
 
 #### Step 1: 調査ドキュメント作成
 
-作成:
+作成済み:
 
 ```text
 docs/codex_conversation_mvp.md
@@ -466,7 +469,7 @@ docs/codex_conversation_mvp.md
 
 #### Step 2: JSONL保存の土台を作る
 
-作成候補:
+作成済み:
 
 ```text
 scripts/live_session.py
@@ -481,7 +484,7 @@ scripts/live_session.py
 
 #### Step 3: CLIチャットMVPを作る
 
-作成候補:
+作成済み:
 
 ```text
 scripts/codex_conversation.py
@@ -497,11 +500,13 @@ scripts/codex_conversation.py
 * 返答を表示する
 * 逐次JSONL保存する
 * /exitで終了する
-* ファイル更新やGit commitはしない
+* /exit または Ctrl+C の終了時に finalize_live_chat.py 相当の処理を行う
+* 会話中のファイル更新やGit commitはしない
+* Git commitは --commit-on-exit または別コマンドで明示した時だけ行う
 
 #### Step 4: live JSONLをraw.md化する
 
-作成候補:
+作成済み:
 
 ```text
 scripts/finalize_live_chat.py
@@ -513,7 +518,8 @@ scripts/finalize_live_chat.py
 * 最新ファイルを対象にできる
 * conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md を作る
 * 既存Phase2.5処理に渡せる形にする
-* 変換後にsummary/journal/memory生成を行うかは、最初は別ステップでもよい
+* codex_conversation.py の終了時にも同じ変換処理を呼べる
+* 変換後にsummary/journal/memory生成を行える
 
 #### Step 5: 既存Phase2.5処理と接続
 
@@ -526,7 +532,7 @@ python scripts\codex_conversation.py
 ↓
 inbox/live/YYYY-MM-DD_HHMMSS.jsonl に逐次保存
 ↓
-python scripts\finalize_live_chat.py
+/exit または Ctrl+C
 ↓
 raw.md生成
 ↓
@@ -534,7 +540,7 @@ raw.md生成
 ↓
 summary.md / journal / memory 更新
 ↓
-Git commit
+必要に応じて --commit-on-exit または別コマンドでGit commit
 ```
 
 ### Phase3との関係
@@ -1037,6 +1043,10 @@ Codexは以下のルールを守ること。
 * summary は後でAIが読んで分かるように書く
 * 変更後はどのファイルを変更したか報告する
 * 可能なら差分確認しやすい粒度で変更する
+* commit または push の前に、必ず差分へ個人情報・秘密情報が含まれていないか確認する
+* commit の前に、原則として `python scripts\privacy_check.py --staged` を実行する
+* push の前に未pushコミットがある場合は、原則として `python scripts\privacy_check.py --range origin/main..HEAD` を実行する
+* privacy check が失敗した場合は commit / push を中止し、検出箇所をユーザーへ報告する
 * Phase2.6 の会話専用MVPでは、会話ログJSONLへの追記以外のファイル操作をユーザー明示操作に限定する
 * Phase2.6 の調査結果は docs/codex_conversation_mvp.md に整理する
 * Phase2.65 のSession Save / Resume MVPでは、/resume対象を最後のuser入力から10日以内に限定する
@@ -1056,6 +1066,8 @@ Codexは以下のルールを守ること。
 * 過去ログを勝手に削除しない
 * journal に感情や体調を勝手に推測して書かない
 * Git commit を勝手に連発しない
+* 個人情報・秘密情報チェックを省略して commit / push しない
+* privacy check が失敗した状態で commit / push しない
 * 破壊的変更をしない
 * Phase2.6 の会話中に memory/long_term.md を勝手に編集しない
 * Phase2.6 の会話中に過去ログを勝手に削除・移動しない
@@ -1104,6 +1116,13 @@ Pythonだけで最後まで実行:
 
 ```powershell
 python scripts\process_chat.py --run-codex --commit
+```
+
+commit / push 前の個人情報・秘密情報チェック:
+
+```powershell
+python scripts\privacy_check.py --staged
+python scripts\privacy_check.py --range origin/main..HEAD
 ```
 
 Phase2.6 調査ドキュメント作成後の想定CLIチャット:
@@ -1202,7 +1221,7 @@ Phase2.5 の完了条件:
 
 Phase2.6 の完了条件:
 
-* Codex SDKまたはapp-serverを使う方針が docs/codex_conversation_mvp.md に整理されている
+* Codex SDK / app-server の調査結果と現MVPの採用方針が docs/codex_conversation_mvp.md に整理されている
 * python scripts\codex_conversation.py で継続会話できる
 * 会話が inbox/live/*.jsonl に逐次保存される
 * ユーザー発言とassistant返答が role / timestamp / content 付きで保存される
