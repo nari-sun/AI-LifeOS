@@ -322,6 +322,8 @@ Phase2.6 は Phase3 の検索機能へ進む前の実験フェーズとして扱
 * OpenAI APIを直接叩く構成を前提にしない
 * Codex CLI / Codex SDK / Codex app-server の利用を優先する
 * 現MVPでは `codex.cmd exec` を read-only サンドボックスで使う
+* 会話返答生成は `gpt-5.4-mini` / `model_reasoning_effort="medium"` / `service_tier="fast"` を使う
+* summary / journal / memory 更新は `gpt-5.5` / `model_reasoning_effort="xhigh"` を使う
 * まずはデスクトップGUIではなく、PowerShellで動くCLIチャットMVPから始める
 * 会話は逐次ローカル保存する
 * 普段の会話ではファイル操作をさせない

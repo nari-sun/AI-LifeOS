@@ -5,7 +5,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from process_chat import CodexRunResult, GitCommitResult, commit_changes, prepare_memory_targets, run_codex_task
+from process_chat import (
+    DEFAULT_MEMORY_CODEX_MODEL,
+    DEFAULT_MEMORY_CODEX_REASONING_EFFORT,
+    CodexRunResult,
+    GitCommitResult,
+    commit_changes,
+    prepare_memory_targets,
+    run_codex_task,
+)
 from session_store import save_session
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +41,8 @@ def finalize_live_chat(
     codex_command: str = "codex.cmd",
     codex_sandbox: str = "workspace-write",
     codex_approval: str = "never",
+    codex_model: str | None = DEFAULT_MEMORY_CODEX_MODEL,
+    codex_reasoning_effort: str | None = DEFAULT_MEMORY_CODEX_REASONING_EFFORT,
     progress: Callable[[int, str], None] | None = None,
     run_command=None,
 ) -> FinalizeLiveChatResult:
@@ -81,6 +91,8 @@ def finalize_live_chat(
             codex_command=codex_command,
             sandbox=codex_sandbox,
             approval=codex_approval,
+            model=codex_model,
+            reasoning_effort=codex_reasoning_effort,
             capture_output=True,
             run_command=command_runner,
         )
@@ -264,6 +276,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-codex", action="store_true", help="Run the existing Phase2.5 Codex task after raw.md is created.")
     parser.add_argument("--commit", action="store_true", help="Commit generated conversation, journal, memory, inbox, and tasks changes.")
     parser.add_argument("--codex-command", default="codex.cmd", help="Codex CLI command.")
+    parser.add_argument("--codex-model", default=DEFAULT_MEMORY_CODEX_MODEL, help="Codex model for summary/journal/memory.")
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        default=DEFAULT_MEMORY_CODEX_REASONING_EFFORT,
+        choices=("minimal", "low", "medium", "high", "xhigh"),
+        help="Codex reasoning effort for summary/journal/memory.",
+    )
     parser.add_argument(
         "--codex-sandbox",
         default="workspace-write",
@@ -293,6 +312,8 @@ def main() -> int:
             codex_command=args.codex_command,
             codex_sandbox=args.codex_sandbox,
             codex_approval=args.codex_approval,
+            codex_model=args.codex_model,
+            codex_reasoning_effort=args.codex_reasoning_effort,
         )
     except (FileNotFoundError, FileExistsError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}")

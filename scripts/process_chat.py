@@ -5,8 +5,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from codex_cli_options import add_codex_model_options
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_COMMIT_PATHS = ("conversations", "journal", "memory", "inbox", "tasks")
+DEFAULT_MEMORY_CODEX_MODEL = "gpt-5.5"
+DEFAULT_MEMORY_CODEX_REASONING_EFFORT = "xhigh"
 
 
 @dataclass(frozen=True)
@@ -124,20 +128,31 @@ def run_codex_task(
     codex_command: str = "codex.cmd",
     sandbox: str = "workspace-write",
     approval: str = "never",
+    model: str | None = DEFAULT_MEMORY_CODEX_MODEL,
+    reasoning_effort: str | None = DEFAULT_MEMORY_CODEX_REASONING_EFFORT,
     capture_output: bool = False,
     run_command=subprocess.run,
 ) -> CodexRunResult:
     root = Path(root)
-    command = (
+    command = [
         codex_command,
         "--ask-for-approval",
         approval,
         "exec",
-        "-C",
-        str(root),
-        "--sandbox",
-        sandbox,
-        "-",
+    ]
+    add_codex_model_options(
+        command,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+    command.extend(
+        [
+            "-C",
+            str(root),
+            "--sandbox",
+            sandbox,
+            "-",
+        ]
     )
 
     try:
@@ -151,7 +166,7 @@ def run_codex_task(
             run_kwargs["capture_output"] = True
 
         completed = run_command(
-            list(command),
+            command,
             **run_kwargs,
         )
     except FileNotFoundError as exc:
@@ -164,7 +179,7 @@ def run_codex_task(
         suffix = f"\n{detail}" if detail else ""
         raise RuntimeError(f"Codex CLI が失敗しました。exit code: {completed.returncode}{suffix}")
 
-    return CodexRunResult(command=command, returncode=completed.returncode)
+    return CodexRunResult(command=tuple(command), returncode=completed.returncode)
 
 
 def _completed_process_output(completed) -> str:
@@ -238,6 +253,8 @@ def process_chat_session(
     codex_command: str = "codex.cmd",
     codex_sandbox: str = "workspace-write",
     codex_approval: str = "never",
+    codex_model: str | None = DEFAULT_MEMORY_CODEX_MODEL,
+    codex_reasoning_effort: str | None = DEFAULT_MEMORY_CODEX_REASONING_EFFORT,
     run_command=subprocess.run,
 ) -> ProcessChatSessionResult:
     root = Path(root)
@@ -257,6 +274,8 @@ def process_chat_session(
             codex_command=codex_command,
             sandbox=codex_sandbox,
             approval=codex_approval,
+            model=codex_model,
+            reasoning_effort=codex_reasoning_effort,
             run_command=run_command,
         )
 
@@ -279,6 +298,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-codex", action="store_true", help="保存後に Codex CLI を非対話で実行する")
     parser.add_argument("--commit", action="store_true", help="保存・Codex実行後の変更をGit commitする")
     parser.add_argument("--codex-command", default="codex.cmd", help="実行するCodex CLIコマンド")
+    parser.add_argument("--codex-model", default=DEFAULT_MEMORY_CODEX_MODEL, help="記憶整理に使うCodexモデル")
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        default=DEFAULT_MEMORY_CODEX_REASONING_EFFORT,
+        choices=("minimal", "low", "medium", "high", "xhigh"),
+        help="記憶整理に使うCodex reasoning effort",
+    )
     parser.add_argument(
         "--codex-sandbox",
         default="workspace-write",
@@ -306,6 +332,8 @@ def main() -> int:
             codex_command=args.codex_command,
             codex_sandbox=args.codex_sandbox,
             codex_approval=args.codex_approval,
+            codex_model=args.codex_model,
+            codex_reasoning_effort=args.codex_reasoning_effort,
         )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}")

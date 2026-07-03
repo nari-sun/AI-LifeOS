@@ -111,6 +111,8 @@ class FinalizeLiveChatTests(unittest.TestCase):
             self.assertIsNotNone(result.codex)
             self.assertIsNotNone(result.git)
             self.assertEqual("codex.cmd", calls[0][0][0])
+            self.assertEqual("gpt-5.5", calls[0][0][calls[0][0].index("--model") + 1])
+            self.assertIn('model_reasoning_effort="xhigh"', calls[0][0])
             self.assertTrue(calls[0][1]["capture_output"])
             self.assertTrue((root / "memory" / "long_term.md").exists())
             self.assertTrue((root / "journal" / "2026" / "07").is_dir())

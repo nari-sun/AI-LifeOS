@@ -137,6 +137,10 @@ class ProcessChatTests(unittest.TestCase):
                 "--ask-for-approval",
                 "never",
                 "exec",
+                "--model",
+                "gpt-5.5",
+                "-c",
+                'model_reasoning_effort="xhigh"',
                 "-C",
                 str(root),
                 "--sandbox",
@@ -236,6 +240,8 @@ class ProcessChatTests(unittest.TestCase):
         self.assertIsNotNone(result.git)
         self.assertTrue(result.git.committed)
         self.assertEqual("codex.cmd", calls[0][0])
+        self.assertEqual("gpt-5.5", calls[0][calls[0].index("--model") + 1])
+        self.assertIn('model_reasoning_effort="xhigh"', calls[0])
         self.assertEqual(["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"], calls[1])
 
     def test_commit_changes_stops_when_privacy_check_fails(self):

@@ -12,11 +12,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from codex_cli_options import add_codex_model_options
 from finalize_live_chat import FinalizeLiveChatResult, finalize_live_chat
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from session_store import ResumeSession, list_resumable_sessions, load_resume_session
 
 DEBUG_LOG_ENV = "AI_LIFEOS_DEBUG_LOG"
+DEFAULT_CHAT_CODEX_MODEL = "gpt-5.4-mini"
+DEFAULT_CHAT_CODEX_REASONING_EFFORT = "medium"
+DEFAULT_CHAT_CODEX_SERVICE_TIER = "fast"
+DEFAULT_CHAT_CODEX_FAST_MODE = True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,6 +40,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only sessions whose last user input is within this many days can be resumed.",
     )
     parser.add_argument("--codex-command", default="codex.cmd", help="Codex CLI command.")
+    parser.add_argument("--chat-codex-model", default=DEFAULT_CHAT_CODEX_MODEL, help="Codex model for chat replies.")
+    parser.add_argument(
+        "--chat-codex-reasoning-effort",
+        default=DEFAULT_CHAT_CODEX_REASONING_EFFORT,
+        choices=("minimal", "low", "medium", "high", "xhigh"),
+        help="Codex reasoning effort for chat replies.",
+    )
+    parser.add_argument(
+        "--chat-codex-service-tier",
+        default=DEFAULT_CHAT_CODEX_SERVICE_TIER,
+        help="Codex service tier for chat replies. The default requests Fast mode.",
+    )
+    parser.add_argument(
+        "--no-chat-codex-fast-mode",
+        action="store_true",
+        help="Do not pass features.fast_mode=true for chat replies.",
+    )
     parser.add_argument(
         "--codex-sandbox",
         default="read-only",
@@ -129,6 +151,10 @@ def generate_assistant_reply(
     codex_command: str = "codex.cmd",
     sandbox: str = "read-only",
     approval: str = "never",
+    model: str | None = DEFAULT_CHAT_CODEX_MODEL,
+    reasoning_effort: str | None = DEFAULT_CHAT_CODEX_REASONING_EFFORT,
+    service_tier: str | None = DEFAULT_CHAT_CODEX_SERVICE_TIER,
+    fast_mode: bool | None = DEFAULT_CHAT_CODEX_FAST_MODE,
     max_context_messages: int = 20,
     run_command=subprocess.run,
 ) -> str:
@@ -143,16 +169,27 @@ def generate_assistant_reply(
             "--ask-for-approval",
             approval,
             "exec",
-            "-C",
-            str(root),
-            "--sandbox",
-            sandbox,
-            "--color",
-            "never",
-            "--output-last-message",
-            str(output_file),
-            "-",
         ]
+        add_codex_model_options(
+            command,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
+            fast_mode=fast_mode,
+        )
+        command.extend(
+            [
+                "-C",
+                str(root),
+                "--sandbox",
+                sandbox,
+                "--color",
+                "never",
+                "--output-last-message",
+                str(output_file),
+                "-",
+            ]
+        )
 
         try:
             completed = run_command(
@@ -738,6 +775,10 @@ def main() -> int:
                     codex_command=args.codex_command,
                     sandbox=args.codex_sandbox,
                     approval=args.codex_approval,
+                    model=args.chat_codex_model,
+                    reasoning_effort=args.chat_codex_reasoning_effort,
+                    service_tier=args.chat_codex_service_tier,
+                    fast_mode=not args.no_chat_codex_fast_mode,
                     max_context_messages=args.max_context_messages,
                 )
             except RuntimeError as exc:

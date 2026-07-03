@@ -32,6 +32,7 @@ Tauri 2
 * user / assistant発言の表示
 * user発言をCodex呼び出し前に `inbox/live/*.jsonl` へ保存
 * assistant返答を受信後に `inbox/live/*.jsonl` へ保存
+* assistant返答生成は `gpt-5.4-mini` / `model_reasoning_effort="medium"` / `service_tier="fast"` を使う
 * 10日以内の再開可能セッション一覧表示
 * セッション再開
 * セッションメタデータ保存
@@ -111,6 +112,7 @@ npm run bundle
 * ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない
 * GUI中に `memory/long_term.md` や `journal` を勝手に編集しない
 * memory / journal / summary 更新は「会話を整理して保存」操作で既存finalize処理に接続する
+* memory / journal / summary 更新は `gpt-5.5` / `model_reasoning_effort="xhigh"` を使う
 * Git commitはGUIから自動連発しない
 
 ## ログ

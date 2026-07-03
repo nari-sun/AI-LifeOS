@@ -219,9 +219,11 @@ python scripts\codex_conversation.py
 - ユーザー発言をCodexへ送る前に保存する
 - Codex返答を受け取った後にassistant発言として保存する
 - Codex返答生成は `codex.cmd exec` を `read-only` サンドボックスで呼ぶ
+- 会話返答生成は `gpt-5.4-mini` / `model_reasoning_effort="medium"` / `service_tier="fast"` を使う
 - `/exit` または Ctrl+C で終了する
 - 終了時にlive JSONLを `raw.md` 化する
 - 終了時に既存Phase2.5処理で `summary.md`、`journal`、`memory/long_term.md` を更新する
+- summary / journal / memory 更新は `gpt-5.5` / `model_reasoning_effort="xhigh"` を使う
 - 終了時の整理中はスピナーと段階ベースの%を表示する
 - 会話中に `journal`、`memory/long_term.md`、Git commit は実行しない
 - Git commit は自動では実行しない
