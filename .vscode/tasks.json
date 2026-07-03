@@ -28,6 +28,114 @@
         "close": true
       },
       "problemMatcher": []
+    },
+    {
+      "label": "Phase2.7: Install Desktop Dependencies",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\scripts\\chat_gui_task.ps1",
+        "-Mode",
+        "install"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "focus": true,
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Phase2.7: Start Chat GUI",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\scripts\\chat_gui_task.ps1",
+        "-Mode",
+        "dev"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONUTF8": "1",
+          "PYTHONIOENCODING": "utf-8",
+          "AI_LIFEOS_GUI_LOG": "${workspaceFolder}\\logs\\chat_gui_bridge.log",
+          "AI_LIFEOS_TAURI_LOG": "${workspaceFolder}\\logs\\chat_gui_tauri.log"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "focus": true,
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Phase2.7: Build Chat GUI",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\scripts\\chat_gui_task.ps1",
+        "-Mode",
+        "build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONUTF8": "1",
+          "PYTHONIOENCODING": "utf-8",
+          "AI_LIFEOS_GUI_LOG": "${workspaceFolder}\\logs\\chat_gui_bridge.log",
+          "AI_LIFEOS_TAURI_LOG": "${workspaceFolder}\\logs\\chat_gui_tauri.log"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "focus": true,
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Phase2.7: Launch Built Chat GUI",
+      "type": "process",
+      "command": "${workspaceFolder}\\desktop\\app\\src-tauri\\target\\release\\ai-lifeos-desktop.exe",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONUTF8": "1",
+          "PYTHONIOENCODING": "utf-8",
+          "AI_LIFEOS_GUI_LOG": "${workspaceFolder}\\logs\\chat_gui_bridge.log",
+          "AI_LIFEOS_TAURI_LOG": "${workspaceFolder}\\logs\\chat_gui_tauri.log"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "clear": false
+      },
+      "problemMatcher": []
     }
   ]
 }

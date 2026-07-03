@@ -25,7 +25,7 @@ Phase2.6 として、PowerShell上の会話専用MVP、live JSONL保存、raw.md
 
 Phase2.65 として、会話セッションを保存・再開できる Session Save / Resume MVP を実装済みです。
 
-次は Phase2.7 として、Phase2.6 と Phase2.65 の会話エンジン・セッション保存処理をGUIから利用できる Chat GUI MVP を検討・実装します。
+次は Phase2.7 として、Phase2.6 と Phase2.65 の会話エンジン・セッション保存処理を Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui のGUIから利用できる Chat GUI MVP として実装します。
 
 Phase1 は完了済みです。
 
@@ -44,6 +44,7 @@ Phase1 は完了済みです。
 * Phase2.6 の live会話から既存Phase2.5記憶整理への接続を実装済み
 * Phase2.65 のSession Save / Resume MVPを実装済み
 * Phase2.7 のChat GUI MVPを計画中
+* Phase2.7 のGUI技術スタックは Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui に決定済み
 
 現在の方針:
 
@@ -55,6 +56,7 @@ Phase1 は完了済みです。
 * Phase2.6 では会話中に自由なファイル操作をさせず、/exit または Ctrl+C の終了処理で既存スクリプト経由の整理処理を行う
 * Phase2.65 では /resume で過去10日以内の会話セッションを再開できるようにし、10日超の削除は明示コマンドに限定する
 * Phase2.7 ではPhase2.6の会話エンジンとPhase2.65のセッション保存処理を薄く包むGUIを作り、検索機能や多機能化はPhase3以降に分ける
+* Phase2.7 のGUIは Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui で作る
 
 ---
 
@@ -683,6 +685,7 @@ Phase2.7 は Phase3 の検索機能とは分離し、今後の会話をGUIから
 
 * Phase2.6 の会話エンジンを再利用する
 * Phase2.65 のセッション保存・再開処理を再利用する
+* GUI技術スタックは Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui を採用する
 * GUIは既存処理の薄いラッパーにする
 * いきなり多機能化しない
 * ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない
@@ -697,6 +700,13 @@ Phase2.7 は Phase3 の検索機能とは分離し、今後の会話をGUIから
 * Git commit はユーザー明示操作または既存スクリプト経由にする
 * Phase3の検索機能とは分離する
 
+### 決定事項
+
+* Phase2.7 のGUI技術スタックは Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui にする
+* Tauri 側は既存Pythonスクリプトを安全に呼ぶ薄いラッパーとして扱う
+* React/Vite/shadcn/ui でChatGPT風のチャット表示、入力欄、セッション一覧、保存ボタンなどのUIを作る
+* 既存の Phase2.6 / Phase2.65 の保存・再開・finalize 処理を壊さず再利用する
+
 ### 作りたいもの
 
 #### 1. ChatGPT風の最小GUI
@@ -708,12 +718,6 @@ desktop/
 ├─ README.md
 ├─ app/
 └─ backend/
-```
-
-最初は軽量に以下でもよいです。
-
-```text
-scripts/chat_gui.py
 ```
 
 GUIに必要な最小要素:
@@ -753,24 +757,31 @@ raw.md生成
 Git commit
 ```
 
-### 技術スタック候補
+### 採用技術スタック
 
-最初の候補:
+Phase2.7 では以下を採用する。
 
-* Python + Textual
-* Python + PySide6
-* FastAPI + ローカルWeb UI
+```text
+Tauri 2
++ React
++ Vite
++ TypeScript
++ Tailwind CSS
++ shadcn/ui
++ 既存Pythonスクリプト呼び出し
+```
 
-将来的な候補:
+採用理由:
 
-* Tauri + React
-* Electron
-
-最初から本格的なデスクトップアプリにしなくてよいです。まずはローカルで動く最小GUI、またはブラウザで開けるローカルWeb UIで十分です。
+* 見た目のよいChatGPT風UIを作りやすい
+* Electronより軽量なデスクトップアプリにしやすい
+* React / Vite / Tailwind CSS / shadcn/ui はAIが実装支援しやすい
+* 既存のPython処理をTauri側から呼ぶ薄い構成にできる
+* Phase3以降の検索UIやメモリ閲覧UIへ拡張しやすい
 
 ### 推奨実装順
 
-#### Step 1: GUI方式の調査
+#### Step 1: GUI方式の整理
 
 作成候補:
 
@@ -780,13 +791,9 @@ docs/chat_gui_mvp.md
 
 内容:
 
-* Textual案
-* PySide6案
-* FastAPI + Web UI案
-* Tauri案
-* Electron案
-* 採用候補
+* Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の採用理由
 * 初期MVPの範囲
+* 既存Pythonスクリプトとの接続方針
 * 未確定事項
 
 #### Step 2: GUIなしでも使える会話エンジンを確認
@@ -1044,6 +1051,7 @@ Codexは以下のルールを守ること。
 * 変更後はどのファイルを変更したか報告する
 * 可能なら差分確認しやすい粒度で変更する
 * commit または push の前に、必ず差分へ個人情報・秘密情報が含まれていないか確認する
+* commit する場合は、コミットコメントに日本語で修正内容を必ず記載する
 * commit の前に、原則として `python scripts\privacy_check.py --staged` を実行する
 * push の前に未pushコミットがある場合は、原則として `python scripts\privacy_check.py --range origin/main..HEAD` を実行する
 * privacy check が失敗した場合は commit / push を中止し、検出箇所をユーザーへ報告する
@@ -1161,10 +1169,19 @@ Phase2.65 10日超セッションの削除候補確認:
 python scripts\session_store.py prune
 ```
 
-Phase2.7 調査ドキュメント作成後の想定GUI:
+Phase2.7 Chat GUI MVP 開発起動:
 
 ```powershell
-python scripts\chat_gui.py
+cd desktop\app
+npm install
+npm run tauri dev
+```
+
+Phase2.7 配布用ビルド:
+
+```powershell
+cd desktop\app
+npm run bundle
 ```
 
 Git状態確認:
@@ -1188,8 +1205,10 @@ git add .
 コミット:
 
 ```powershell
-git commit -m "Process chat session YYYY-MM-DD"
+git commit -m "YYYY-MM-DDの会話保存処理を更新"
 ```
+
+コミットコメントには、修正内容が分かる日本語の説明を必ず記載する。
 
 ブランチ名を main に変更する場合:
 
@@ -1252,8 +1271,9 @@ Phase2.7 の完了条件:
 
 * AGENTS.mdにPhase2.7が追加されている
 * docs/chat_gui_mvp.md にGUI方針が整理されている
-* GUI候補技術が比較されている
+* GUI技術スタックが Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui に決まっている
 * 最小GUIの実装方針が決まっている
+* Tauri GUIから既存Python処理を呼ぶブリッジが実装されている
 * Phase2.6の会話処理との接続方針が明記されている
 * Phase2.65のセッション保存・再開処理との接続方針が明記されている
 * inbox/live/*.jsonl への逐次保存方針が維持されている

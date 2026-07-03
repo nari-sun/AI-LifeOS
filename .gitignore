@@ -13,6 +13,12 @@ __pycache__/
 logs/*
 !logs/.gitkeep
 
+# Desktop app generated files
+desktop/app/node_modules/
+desktop/app/dist/
+desktop/app/src-tauri/target/
+desktop/app/src-tauri/gen/
+
 # AI-LifeOS generated data
 conversations/**
 !conversations/

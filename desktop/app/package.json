@@ -1,0 +1,38 @@
+{
+  "name": "ai-lifeos-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "bundle": "npm run build && tauri build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.2.3",
+    "@tauri-apps/api": "^2.9.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tailwind-merge": "^3.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "autoprefixer": "^10.4.22",
+    "postcss": "^8.5.16",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3"
+  }
+}
