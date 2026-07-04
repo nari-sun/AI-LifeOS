@@ -69,7 +69,12 @@ Phase2.5 : Safer Automation
 Phase2.6 : Codex Conversation MVP
 Phase2.65: Session Save / Resume MVP
 Phase2.7 : Chat GUI MVP
-Phase3   : Searchable Memory
+Phase3.0 : Searchable Memory Design
+Phase3.1 : Markdown Search MVP
+Phase3.2 : Tags and Metadata
+Phase3.3 : SQLite Memory Index
+Phase3.4 : Memory Retrieval for Answers
+Phase3.5 : Vector Search Evaluation
 Phase4   : MCP Integration
 Phase5   : Life Improvement Agent
 Phase6   : Daily Automation
@@ -897,6 +902,17 @@ Phase2.7によって、将来的に以下がやりやすくなります。
 
 Phase3 の目的は、保存済みの会話ログを検索できるようにすることです。
 
+Phase3 は一気にDBやベクトル検索へ進めず、以下の小フェーズに分けます。
+
+```text
+Phase3.0 : Searchable Memory Design
+Phase3.1 : Markdown Search MVP
+Phase3.2 : Tags and Metadata
+Phase3.3 : SQLite Memory Index
+Phase3.4 : Memory Retrieval for Answers
+Phase3.5 : Vector Search Evaluation
+```
+
 候補:
 
 * SQLite全文検索
@@ -909,10 +925,12 @@ Phase3 の目的は、保存済みの会話ログを検索できるようにす�
 最初はベクトルDBに飛びつかず、以下の順番で進めます。
 
 ```text
-1. Markdownファイル検索
-2. タグ検索
-3. SQLite管理
-4. ベクトル検索
+1. 検索対象とメタデータ設計
+2. Markdown / ripgrep 検索
+3. タグ検索
+4. SQLite管理
+5. 回答用コンテキスト抽出
+6. ベクトル検索の評価
 ```
 
 Phase3で作るもの:
@@ -923,6 +941,137 @@ scripts/
 ├─ search_memory.py
 └─ rebuild_index.py
 ```
+
+### Phase3.0: Searchable Memory Design
+
+目的:
+
+* 何を検索対象にするかを決める
+* raw.md / summary.md / journal / memory の役割を分ける
+* 検索結果として返す項目を決める
+* DB化する前に、必要なメタデータを整理する
+
+対象候補:
+
+* conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md
+* conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/summary.md
+* journal/YYYY/MM/YYYY-MM-DD.md
+* memory/long_term.md
+* memory/preferences.md
+* memory/projects.md
+
+この段階ではDBを作らず、設計と読み取り方針を決めます。
+
+### Phase3.1: Markdown Search MVP
+
+目的:
+
+* まずはDBなしで保存済みMarkdownを検索できるようにする
+* ripgrep または Python の全文検索で、過去会話を探せる最小CLIを作る
+
+実装候補:
+
+```text
+scripts/search_memory.py
+```
+
+要件:
+
+* raw.md / summary.md / journal / memory を読み取り専用で検索する
+* 検索語に一致したファイルパス、見出し、前後の短い抜粋を表示する
+* 検索だけを行い、memory / journal / conversations を更新しない
+* 個人情報を外部サービスへ送らない
+
+### Phase3.2: Tags and Metadata
+
+目的:
+
+* 会話単位で探しやすくするため、タグや日付などのメタデータを扱えるようにする
+* summary.md のタグ欄を検索に使える形へ寄せる
+
+扱うメタデータ候補:
+
+* conversation_id
+* date
+* title
+* tags
+* source_path
+* summary_path
+* raw_path
+
+この段階では、メタデータ抽出とタグ検索を優先し、まだ高度なDB設計に踏み込みすぎない。
+
+### Phase3.3: SQLite Memory Index
+
+目的:
+
+* 記憶を取り出しやすくするため、保存済み会話・要約・タグをSQLiteで管理する
+* Markdown検索より速く、構造化された検索をできるようにする
+
+実装候補:
+
+```text
+scripts/index_conversations.py
+scripts/rebuild_index.py
+```
+
+DB保存先候補:
+
+```text
+memory/search_index.sqlite3
+```
+
+要件:
+
+* DBは既存Markdownから再生成できる派生データとして扱う
+* conversations / journal / memory の元ファイルを勝手に書き換えない
+* conversation、document、tag のように検索しやすい単位で保存する
+* FTS5 が使える場合は全文検索テーブルを使う
+* rebuild_index.py でゼロから再構築できるようにする
+* DBファイルに秘密情報を追加で生成しない。元ファイルにある情報の索引化に限定する
+
+### Phase3.4: Memory Retrieval for Answers
+
+目的:
+
+* AI-LifeOSの記憶を読んで回答できるようにする
+* ユーザー質問に関連する memory / summary / journal / raw.md の抜粋を取得し、会話プロンプトへ読み取り専用コンテキストとして渡す
+
+実装候補:
+
+```text
+scripts/search_memory.py
+scripts/build_answer_context.py
+```
+
+要件:
+
+* 検索結果をそのまま大量投入せず、短い抜粋と出典パスに絞る
+* 出典ファイルパスを保持し、後で確認できるようにする
+* GUIやCLIの会話中に memory / journal を勝手に編集しない
+* 回答に使った記憶が不確かな場合は、推測ではなく「見つかった範囲では」と扱う
+* まずはキーワード検索とSQLite検索の結果を使い、ベクトル検索は必須にしない
+
+### Phase3.5: Vector Search Evaluation
+
+目的:
+
+* キーワード検索やSQLite検索だけでは弱い場合に、ベクトル検索を評価する
+* いきなり本番依存にせず、ローカルで安全に扱える候補を比較する
+
+候補:
+
+* SQLiteVec
+* LanceDB
+* Chroma
+* Qdrant
+
+要件:
+
+* OpenAI API直叩きを前提にしない
+* ローカル運用、再構築可能性、バックアップ容易性を優先する
+* ベクトルDB導入前に、SQLite全文検索で足りない理由を明確にする
+* 個人情報を外部サービスへ送らない
 
 検索したい例:
 
@@ -1287,10 +1436,12 @@ Phase2.7 の完了条件:
 
 Phase3 の完了条件:
 
-* 過去の raw.md / summary.md を検索できる
-* キーワード検索できる
-* タグまたはメタデータで探せる
-* 必要に応じてベクトル検索できる
+* Phase3.0: 検索対象、メタデータ、DB化方針が整理されている
+* Phase3.1: 過去の raw.md / summary.md / journal / memory をMarkdown検索できる
+* Phase3.2: タグまたはメタデータで探せる
+* Phase3.3: SQLite index を作成・再構築できる
+* Phase3.4: 検索結果を回答用コンテキストとして安全に渡せる
+* Phase3.5: ベクトル検索の必要性と候補が評価されている
 
 最終形の完了条件:
 
