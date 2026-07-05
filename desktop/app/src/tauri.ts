@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 
 import type {
+  CleanupExpiredResult,
   FinalizeSessionResult,
   ListResumableResult,
   ResumeSessionResult,
@@ -59,4 +60,8 @@ export async function finalizeSession(sessionFile: string) {
       run_codex: true,
     },
   })
+}
+
+export async function cleanupExpiredSessions() {
+  return invoke<CleanupExpiredResult>("cleanup_expired_sessions", { payload: defaultPayload })
 }

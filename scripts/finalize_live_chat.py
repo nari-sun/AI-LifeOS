@@ -15,7 +15,7 @@ from process_chat import (
     run_codex_task,
 )
 from memory_index import rebuild_index
-from session_store import save_session
+from session_store import get_session_organization, save_session
 
 ROOT = Path(__file__).resolve().parents[1]
 VALID_ROLES = {"user", "assistant"}
@@ -30,6 +30,7 @@ class FinalizeLiveChatResult:
     imported_at: datetime
     codex: CodexRunResult | None
     git: GitCommitResult | None
+    organization: dict[str, Any]
 
 
 def finalize_live_chat(
@@ -54,51 +55,175 @@ def finalize_live_chat(
     if not records:
         raise ValueError("live JSONL has no messages.")
 
-    imported_at = _session_datetime(jsonl_file=jsonl_file, records=records)
-    raw_file = _raw_file_for(root=root, imported_at=imported_at)
-    if raw_file.exists() and not force:
-        raise FileExistsError(f"raw.md already exists: {_relative_path(raw_file, root)}")
+    session_started_at = _session_datetime(jsonl_file=jsonl_file, records=records)
+    raw_file = _raw_file_for(root=root, imported_at=session_started_at)
+    task_file = root / "tasks" / "latest_codex_task.md"
+    organization = get_session_organization(root=root, session_file=jsonl_file)
+    raw_current = _stage_done_for_current(organization, "raw")
+    memory_current = _stage_done_for_current(organization, "memory")
+    index_current = _stage_done_for_current(organization, "index")
+    records_to_write, message_offset = _records_for_next_raw(records=records, organization=organization)
+    imported_at = records_to_write[0]["timestamp"] if records_to_write else session_started_at
 
-    _emit_progress(progress, 30, "Creating raw.md...")
-    raw_file.parent.mkdir(parents=True, exist_ok=True)
-    raw_file.write_text(
-        _format_raw_markdown(
-            records=records,
+    if index_current:
+        _emit_progress(progress, 100, "Session is already organized.")
+        prompt = _read_or_write_codex_task(root=root, raw_file=raw_file)
+        return FinalizeLiveChatResult(
             jsonl_file=jsonl_file,
-            root=root,
-            session_id=jsonl_file.stem,
+            raw_file=raw_file,
+            task_file=task_file,
+            prompt=prompt,
             imported_at=imported_at,
-        ),
-        encoding="utf-8",
-    )
+            codex=None,
+            git=None,
+            organization=organization,
+        )
 
-    _emit_progress(progress, 45, "Writing Codex task...")
-    prompt = _write_codex_task(root=root, raw_file=raw_file)
+    if raw_current:
+        _emit_progress(progress, 35, "raw.md already exists for the current messages.")
+        prompt = _read_or_write_codex_task(root=root, raw_file=raw_file)
+    else:
+        if raw_file.exists() and not force:
+            raise FileExistsError(f"raw.md already exists: {_relative_path(raw_file, root)}")
 
-    if write_session_metadata:
-        _emit_progress(progress, 50, "Writing session metadata...")
-        save_session(root=root, session_file=jsonl_file, status="finalized")
+        try:
+            _emit_progress(progress, 30, "Creating raw.md...")
+            raw_file.parent.mkdir(parents=True, exist_ok=True)
+            raw_file.write_text(
+                _format_raw_markdown(
+                    records=records_to_write,
+                    jsonl_file=jsonl_file,
+                    root=root,
+                    session_id=jsonl_file.stem,
+                    imported_at=imported_at,
+                    message_offset=message_offset,
+                    total_messages=len(records),
+                ),
+                encoding="utf-8",
+            )
+
+            _emit_progress(progress, 45, "Writing Codex task...")
+            prompt = _write_codex_task(root=root, raw_file=raw_file)
+            if write_session_metadata:
+                _emit_progress(progress, 50, "Writing raw stage metadata...")
+                save_session(
+                    root=root,
+                    session_file=jsonl_file,
+                    status="raw_created",
+                    organize_update={
+                        "raw_created": True,
+                        "memory_processed": False,
+                        "index_updated": False,
+                        "failed_stage": None,
+                        "last_error": None,
+                        "raw_file": _relative_path(raw_file, root),
+                        "task_file": _relative_path(task_file, root),
+                        "raw_message_count": len(records),
+                        "raw_updated_at": records[-1]["timestamp"].isoformat(timespec="seconds"),
+                    },
+                )
+        except Exception as exc:
+            if write_session_metadata:
+                _write_failure_metadata(
+                    root=root,
+                    jsonl_file=jsonl_file,
+                    status="raw_failed",
+                    stage="raw",
+                    error=exc,
+                    raw_file=raw_file,
+                    task_file=task_file,
+                )
+            raise
+        organization = get_session_organization(root=root, session_file=jsonl_file) if write_session_metadata else organization
+        raw_current = True
+        memory_current = False
+        index_current = False
 
     command_runner = run_command or __import__("subprocess").run
 
     codex_result = None
     if run_codex:
-        _emit_progress(progress, 60, "Preparing journal and memory files...")
-        prepare_memory_targets(root=root, target_at=imported_at)
-        _emit_progress(progress, 70, "Updating summary, journal, and memory...")
-        codex_result = run_codex_task(
+        if not raw_current:
+            raise RuntimeError("raw.md stage did not complete.")
+        if not memory_current:
+            try:
+                _emit_progress(progress, 60, "Preparing journal and memory files...")
+                prepare_memory_targets(root=root, target_at=imported_at)
+                _emit_progress(progress, 70, "Updating summary, journal, and memory...")
+                codex_result = run_codex_task(
+                    root=root,
+                    prompt=prompt,
+                    codex_command=codex_command,
+                    sandbox=codex_sandbox,
+                    approval=codex_approval,
+                    model=codex_model,
+                    reasoning_effort=codex_reasoning_effort,
+                    capture_output=True,
+                    run_command=command_runner,
+                )
+                if write_session_metadata:
+                    save_session(
+                        root=root,
+                        session_file=jsonl_file,
+                        status="raw_created",
+                        organize_update={
+                            "memory_processed": True,
+                            "failed_stage": None,
+                            "last_error": None,
+                        },
+                    )
+                _emit_progress(progress, 85, "Finished memory processing.")
+            except Exception as exc:
+                if write_session_metadata:
+                    _write_failure_metadata(
+                        root=root,
+                        jsonl_file=jsonl_file,
+                        status="memory_failed",
+                        stage="memory",
+                        error=exc,
+                        raw_file=raw_file,
+                        task_file=task_file,
+                    )
+                raise
+
+        organization = get_session_organization(root=root, session_file=jsonl_file)
+        index_current = _stage_done_for_current(organization, "index")
+        if not index_current:
+            try:
+                _emit_progress(progress, 90, "Updating search index...")
+                rebuild_index(root=root)
+                if write_session_metadata:
+                    save_session(
+                        root=root,
+                        session_file=jsonl_file,
+                        status="finalized",
+                        organize_update={
+                            "index_updated": True,
+                            "failed_stage": None,
+                            "last_error": None,
+                            "processed_message_count": len(records),
+                            "processed_updated_at": records[-1]["timestamp"].isoformat(timespec="seconds"),
+                            "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        },
+                    )
+            except Exception as exc:
+                if write_session_metadata:
+                    _write_failure_metadata(
+                        root=root,
+                        jsonl_file=jsonl_file,
+                        status="index_failed",
+                        stage="index",
+                        error=exc,
+                        raw_file=raw_file,
+                        task_file=task_file,
+                    )
+                raise
+    elif write_session_metadata:
+        save_session(
             root=root,
-            prompt=prompt,
-            codex_command=codex_command,
-            sandbox=codex_sandbox,
-            approval=codex_approval,
-            model=codex_model,
-            reasoning_effort=codex_reasoning_effort,
-            capture_output=True,
-            run_command=command_runner,
+            session_file=jsonl_file,
+            status="raw_created",
         )
-        _emit_progress(progress, 90, "Finished memory processing.")
-        rebuild_index(root=root)
 
     git_result = None
     if commit:
@@ -109,21 +234,95 @@ def finalize_live_chat(
             run_command=command_runner,
         )
 
+    organization = get_session_organization(root=root, session_file=jsonl_file)
     _emit_progress(progress, 100, "Exit processing complete.")
     return FinalizeLiveChatResult(
         jsonl_file=jsonl_file,
         raw_file=raw_file,
-        task_file=root / "tasks" / "latest_codex_task.md",
+        task_file=task_file,
         prompt=prompt,
         imported_at=imported_at,
         codex=codex_result,
         git=git_result,
+        organization=organization,
     )
 
 
 def _emit_progress(progress: Callable[[int, str], None] | None, percent: int, message: str) -> None:
     if progress:
         progress(percent, message)
+
+
+def _stage_done_for_current(organization: dict[str, Any], stage: str) -> bool:
+    stages = organization.get("stages", {})
+    value = stages.get(stage, {})
+    return isinstance(value, dict) and value.get("status") == "done"
+
+
+def _records_for_next_raw(
+    records: list[dict[str, Any]],
+    organization: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    processed_count = int(organization.get("organized_message_count") or 0)
+    if (
+        processed_count > 0
+        and processed_count < len(records)
+        and organization.get("failed_stage") is None
+    ):
+        return records[processed_count:], processed_count
+
+    return records, 0
+
+
+def _read_or_write_codex_task(root: Path, raw_file: Path) -> str:
+    task_file = root / "tasks" / "latest_codex_task.md"
+    if task_file.exists():
+        text = task_file.read_text(encoding="utf-8")
+        if str(raw_file.relative_to(root)) in text or raw_file.as_posix() in text:
+            return text
+
+    return _write_codex_task(root=root, raw_file=raw_file)
+
+
+def _write_failure_metadata(
+    root: Path,
+    jsonl_file: Path,
+    status: str,
+    stage: str,
+    error: Exception,
+    raw_file: Path,
+    task_file: Path,
+) -> None:
+    organize_update: dict[str, Any] = {
+        "failed_stage": stage,
+        "last_error": f"{type(error).__name__}: {error}",
+        "raw_file": _relative_path(raw_file, root),
+        "task_file": _relative_path(task_file, root),
+    }
+    if stage == "raw":
+        organize_update.update(
+            {
+                "raw_created": False,
+                "memory_processed": False,
+                "index_updated": False,
+            }
+        )
+    elif stage == "memory":
+        organize_update.update(
+            {
+                "memory_processed": False,
+                "index_updated": False,
+            }
+        )
+    elif stage == "index":
+        organize_update["index_updated"] = False
+
+    save_session(
+        root=root,
+        session_file=jsonl_file,
+        status=status,
+        organize_update=organize_update,
+    )
 
 
 def _resolve_session_file(root: Path, session_file: Path | str | None) -> Path:
@@ -218,9 +417,12 @@ def _format_raw_markdown(
     root: Path,
     session_id: str,
     imported_at: datetime,
+    message_offset: int = 0,
+    total_messages: int | None = None,
 ) -> str:
     date = imported_at.strftime("%Y-%m-%d")
     time_text = imported_at.strftime("%H:%M:%S")
+    total = total_messages or len(records)
     lines = [
         "# Chat Log",
         "",
@@ -229,6 +431,7 @@ def _format_raw_markdown(
         "Source: AI-LifeOS live session",
         f"Session: {session_id}",
         f"Live JSONL: {_relative_path(jsonl_file, root)}",
+        f"Message Range: {message_offset + 1}-{message_offset + len(records)} of {total}",
         "",
         "---",
         "",

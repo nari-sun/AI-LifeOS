@@ -6,9 +6,36 @@ export interface ChatMessage {
   timestamp: string
 }
 
+export type OrganizeStageName = "raw" | "memory" | "index"
+export type OrganizeStageStatus = "pending" | "done" | "failed"
+
+export interface OrganizeStage {
+  name: OrganizeStageName
+  label: string
+  status: OrganizeStageStatus
+}
+
+export interface SessionOrganization {
+  status: string
+  label: string
+  can_organize: boolean
+  is_organized: boolean
+  next_stage: OrganizeStageName | null
+  failed_stage: OrganizeStageName | null
+  last_error: string | null
+  raw_file: string | null
+  task_file: string | null
+  current_message_count: number
+  current_updated_at: string | null
+  organized_message_count: number
+  organized_updated_at: string | null
+  stages: Record<OrganizeStageName, OrganizeStage>
+}
+
 export interface SessionFile {
   session_id: string
   jsonl_file: string
+  organization: SessionOrganization
 }
 
 export interface ResumeSession {
@@ -19,6 +46,7 @@ export interface ResumeSession {
   started_at: string
   updated_at: string
   last_user_at: string
+  organization: SessionOrganization
 }
 
 export interface StartSessionResult {
@@ -64,10 +92,23 @@ export interface SaveSessionResult {
 
 export interface FinalizeSessionResult {
   ok: boolean
+  session: SessionFile
   jsonl_file: string
   raw_file: string
   task_file: string
   imported_at: string
   codex_updated: boolean
   git_committed: boolean
+  organization: SessionOrganization
+}
+
+export interface CleanupExpiredResult {
+  ok: boolean
+  results: Array<{
+    session_id: string
+    status: string
+    deleted_paths: string[]
+    raw_file: string | null
+    error: string | null
+  }>
 }

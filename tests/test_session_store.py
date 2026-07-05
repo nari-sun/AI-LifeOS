@@ -60,6 +60,8 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual("2026-07-01T22:30:00+09:00", metadata["started_at"])
             self.assertEqual("2026-07-01T22:30:05+09:00", metadata["updated_at"])
             self.assertEqual("2026-07-01T22:31:00+09:00", metadata["saved_at"])
+            self.assertIsNone(metadata["finalized_message_count"])
+            self.assertFalse(metadata["organize"]["raw_created"])
 
     def test_save_session_uses_title_override(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -139,7 +141,7 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(2, len(records))
             self.assertEqual("セッション保存を追加したい", records[0]["content"])
 
-    def test_prune_expired_sessions_requires_delete_to_unlink_files(self):
+    def test_prune_expired_sessions_does_not_delete_unorganized_sessions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             live_file = self.make_live_file(root, "old.jsonl")
@@ -169,11 +171,155 @@ class SessionStoreTests(unittest.TestCase):
                 retention_days=10,
                 now=now,
                 delete=True,
+                auto_finalize=False,
             )
 
-            self.assertEqual([live_file, metadata_file], deleted_targets)
+            self.assertEqual([], deleted_targets)
+            self.assertTrue(live_file.exists())
+            self.assertTrue(metadata_file.exists())
+
+    def test_cleanup_expired_sessions_deletes_only_organized_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_file = self.make_live_file(root, "old.jsonl")
+            live_file.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "role": "user",
+                                "timestamp": "2026-06-20T22:30:00+09:00",
+                                "content": "古い入力",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "role": "assistant",
+                                "timestamp": "2026-06-20T22:30:05+09:00",
+                                "content": "古い返答",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            raw_file = root / "conversations" / "2026" / "06" / "2026-06-20_223000" / "raw.md"
+            raw_file.parent.mkdir(parents=True)
+            raw_file.write_text("raw", encoding="utf-8")
+            updated_at = "2026-06-20T22:30:05+09:00"
+            session_store.save_session(
+                root=root,
+                session_file=live_file,
+                status="finalized",
+                organize_update={
+                    "raw_created": True,
+                    "memory_processed": True,
+                    "index_updated": True,
+                    "raw_file": "conversations/2026/06/2026-06-20_223000/raw.md",
+                    "raw_message_count": 2,
+                    "raw_updated_at": updated_at,
+                    "processed_message_count": 2,
+                    "processed_updated_at": updated_at,
+                },
+            )
+            metadata_file = live_file.with_suffix(".session.json")
+            now = datetime(2026, 7, 1, 22, 30, 0, tzinfo=timezone(timedelta(hours=9)))
+
+            results = session_store.cleanup_expired_sessions(root=root, retention_days=10, now=now)
+
+            self.assertEqual(1, len(results))
+            self.assertEqual("削除済み", results[0].status)
+            self.assertEqual((live_file, metadata_file, raw_file), results[0].deleted_paths)
             self.assertFalse(live_file.exists())
             self.assertFalse(metadata_file.exists())
+            self.assertFalse(raw_file.exists())
+
+    def test_cleanup_expired_sessions_keeps_failed_sessions_for_manual_resume(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_file = self.make_live_file(root, "old.jsonl")
+            live_file.write_text(
+                json.dumps(
+                    {
+                        "role": "user",
+                        "timestamp": "2026-06-20T22:30:00+09:00",
+                        "content": "古い入力",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            session_store.save_session(
+                root=root,
+                session_file=live_file,
+                status="memory_failed",
+                organize_update={
+                    "raw_created": True,
+                    "memory_processed": False,
+                    "index_updated": False,
+                    "failed_stage": "memory",
+                    "last_error": "RuntimeError: failed",
+                    "raw_message_count": 1,
+                    "raw_updated_at": "2026-06-20T22:30:00+09:00",
+                },
+            )
+            metadata_file = live_file.with_suffix(".session.json")
+            now = datetime(2026, 7, 1, 22, 30, 0, tzinfo=timezone(timedelta(hours=9)))
+
+            results = session_store.cleanup_expired_sessions(root=root, retention_days=10, now=now)
+
+            self.assertEqual(1, len(results))
+            self.assertEqual("整理失敗", results[0].status)
+            self.assertEqual((), results[0].deleted_paths)
+            self.assertTrue(live_file.exists())
+            self.assertTrue(metadata_file.exists())
+
+    def test_session_organization_switches_to_unorganized_when_messages_are_added(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_file = self.make_live_file(root)
+            updated_at = "2026-07-01T22:30:05+09:00"
+            session_store.save_session(
+                root=root,
+                session_file=live_file,
+                status="finalized",
+                organize_update={
+                    "raw_created": True,
+                    "memory_processed": True,
+                    "index_updated": True,
+                    "raw_message_count": 2,
+                    "raw_updated_at": updated_at,
+                    "processed_message_count": 2,
+                    "processed_updated_at": updated_at,
+                },
+            )
+
+            organized = session_store.get_session_organization(root=root, session_file=live_file)
+            self.assertTrue(organized["is_organized"])
+            self.assertFalse(organized["can_organize"])
+
+            with live_file.open("a", encoding="utf-8", newline="\n") as file:
+                file.write(
+                    json.dumps(
+                        {
+                            "role": "user",
+                            "timestamp": "2026-07-01T22:31:00+09:00",
+                            "content": "追加の会話",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            session_store.save_session(root=root, session_file=live_file, status="saved")
+
+            unorganized = session_store.get_session_organization(root=root, session_file=live_file)
+            self.assertEqual("unorganized_new", unorganized["status"])
+            self.assertTrue(unorganized["can_organize"])
+            self.assertEqual(2, unorganized["organized_message_count"])
 
 
 if __name__ == "__main__":

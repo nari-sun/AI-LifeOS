@@ -76,7 +76,11 @@ class FinalizeLiveChatTests(unittest.TestCase):
                 "Target:\nconversations\\2026\\07\\2026-07-01_223000\\raw.md\n",
                 task_file.read_text(encoding="utf-8"),
             )
-            self.assertEqual("finalized", json.loads(metadata_file.read_text(encoding="utf-8"))["status"])
+            metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+            self.assertEqual("raw_created", metadata["status"])
+            self.assertTrue(metadata["organize"]["raw_created"])
+            self.assertFalse(metadata["organize"]["memory_processed"])
+            self.assertIsNone(metadata["organize"]["failed_stage"])
 
     def test_finalize_live_chat_refuses_to_overwrite_raw_without_force(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -123,6 +127,92 @@ class FinalizeLiveChatTests(unittest.TestCase):
             self.assertTrue((root / "journal" / "2026" / "07").is_dir())
             self.assertEqual(EXPECTED_GIT_ADD, calls[1][0])
             self.assertEqual([sys.executable, "scripts/privacy_check.py", "--staged"], calls[2][0])
+
+    def test_finalize_live_chat_marks_all_stages_when_codex_and_index_succeed(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            live_file = self.make_live_file(root)
+
+            result = finalize_live_chat.finalize_live_chat(
+                root=root,
+                session_file=live_file,
+                run_codex=True,
+                run_command=fake_run,
+            )
+
+            metadata = json.loads(live_file.with_suffix(".session.json").read_text(encoding="utf-8"))
+            self.assertEqual("finalized", metadata["status"])
+            self.assertEqual(2, metadata["finalized_message_count"])
+            self.assertTrue(metadata["organize"]["raw_created"])
+            self.assertTrue(metadata["organize"]["memory_processed"])
+            self.assertTrue(metadata["organize"]["index_updated"])
+            self.assertTrue(result.organization["is_organized"])
+            self.assertFalse(result.organization["can_organize"])
+            self.assertTrue((root / "memory" / "search_index.sqlite3").exists())
+
+    def test_finalize_live_chat_records_memory_failure_for_manual_resume(self):
+        def fake_run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 7, stdout="bad", stderr="failed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            live_file = self.make_live_file(root)
+
+            with self.assertRaises(RuntimeError):
+                finalize_live_chat.finalize_live_chat(
+                    root=root,
+                    session_file=live_file,
+                    run_codex=True,
+                    run_command=fake_run,
+                )
+
+            metadata = json.loads(live_file.with_suffix(".session.json").read_text(encoding="utf-8"))
+            self.assertEqual("memory_failed", metadata["status"])
+            self.assertTrue(metadata["organize"]["raw_created"])
+            self.assertFalse(metadata["organize"]["memory_processed"])
+            self.assertEqual("memory", metadata["organize"]["failed_stage"])
+            organization = finalize_live_chat.get_session_organization(root=root, session_file=live_file)
+            self.assertEqual("memory_failed", organization["status"])
+            self.assertEqual("memory", organization["next_stage"])
+
+    def test_finalize_live_chat_records_index_failure_for_manual_resume(self):
+        def fake_run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0)
+
+        def failing_rebuild_index(*args, **kwargs):
+            raise RuntimeError("index boom")
+
+        original_rebuild_index = finalize_live_chat.rebuild_index
+        finalize_live_chat.rebuild_index = failing_rebuild_index
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                live_file = self.make_live_file(root)
+
+                with self.assertRaises(RuntimeError):
+                    finalize_live_chat.finalize_live_chat(
+                        root=root,
+                        session_file=live_file,
+                        run_codex=True,
+                        run_command=fake_run,
+                    )
+
+                metadata = json.loads(live_file.with_suffix(".session.json").read_text(encoding="utf-8"))
+                self.assertEqual("index_failed", metadata["status"])
+                self.assertTrue(metadata["organize"]["memory_processed"])
+                self.assertFalse(metadata["organize"]["index_updated"])
+                self.assertEqual("index", metadata["organize"]["failed_stage"])
+                organization = finalize_live_chat.get_session_organization(root=root, session_file=live_file)
+                self.assertEqual("index_failed", organization["status"])
+                self.assertEqual("index", organization["next_stage"])
+        finally:
+            finalize_live_chat.rebuild_index = original_rebuild_index
 
     def test_session_datetime_falls_back_to_first_message_timestamp(self):
         with tempfile.TemporaryDirectory() as temp_dir:

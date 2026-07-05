@@ -7,7 +7,6 @@ import {
   MessageSquarePlus,
   RefreshCw,
   RotateCcw,
-  Save,
   Send,
   User,
 } from "lucide-react"
@@ -17,26 +16,26 @@ import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
 import {
+  cleanupExpiredSessions,
   finalizeSession,
   isTauriRuntime,
   listResumableSessions,
   resumeSession,
-  saveSession,
   sendMessage,
   startSession,
 } from "@/tauri"
-import type { ChatMessage, ResumeSession, SessionFile } from "@/types"
+import type { ChatMessage, ResumeSession, SessionFile, SessionOrganization } from "@/types"
 
-type BusyState = "idle" | "starting" | "sending" | "saving" | "resuming" | "finalizing" | "refreshing"
+type BusyState = "idle" | "starting" | "sending" | "resuming" | "finalizing" | "refreshing" | "cleaning"
 
 const busyLabel: Record<BusyState, string> = {
   idle: "",
   starting: "起動中",
   sending: "送信中",
-  saving: "保存中",
   resuming: "再開中",
   finalizing: "整理中",
   refreshing: "更新中",
+  cleaning: "期限切れ整理中",
 }
 
 function App() {
@@ -52,6 +51,10 @@ function App() {
 
   const isBusy = busy !== "idle"
   const canSend = input.trim().length > 0 && !isBusy
+  const organization = session?.organization ?? null
+  const canFinalize = Boolean(session && organization?.can_organize && !isBusy)
+  const finalizeButtonLabel = getFinalizeButtonLabel(organization)
+  const statusLabel = organization?.label ?? "未開始"
 
   const sessionTitle = useMemo(() => {
     if (!session) {
@@ -90,6 +93,15 @@ function App() {
       setMessages(sessionResult.messages)
       setSessions(listResult.sessions)
       setNotice("新規セッションを開始しました")
+      setBusy("cleaning")
+      const cleanupResult = await cleanupExpiredSessions()
+      if (cleanupResult.results.length > 0) {
+        const failed = cleanupResult.results.filter((result) => result.error).length
+        const deleted = cleanupResult.results.reduce((count, result) => count + result.deleted_paths.length, 0)
+        setNotice(failed > 0 ? `期限切れ整理に失敗があります: ${failed}件` : `期限切れセッションを整理しました: ${deleted}件削除`)
+        const refreshed = await listResumableSessions()
+        setSessions(refreshed.sessions)
+      }
     } catch (err) {
       setError(formatError(err))
     } finally {
@@ -153,24 +165,6 @@ function App() {
     }
   }
 
-  async function saveCurrentSession() {
-    if (!session || isBusy) {
-      return
-    }
-
-    setBusy("saving")
-    setError(null)
-    try {
-      await saveSession(session.jsonl_file)
-      setNotice("セッションを保存しました")
-      await refreshSessionsAfterAction()
-    } catch (err) {
-      setError(formatError(err))
-    } finally {
-      setBusy("idle")
-    }
-  }
-
   async function loadSession(sessionId: string) {
     if (isBusy) {
       return
@@ -191,7 +185,11 @@ function App() {
   }
 
   async function finalizeCurrentSession() {
-    if (!session || isBusy) {
+    if (!session || !organization?.can_organize || isBusy) {
+      return
+    }
+    const confirmed = window.confirm("raw.md作成、記憶整理、検索index更新を実行します。時間がかかる場合があります。")
+    if (!confirmed) {
       return
     }
 
@@ -199,7 +197,8 @@ function App() {
     setError(null)
     try {
       const result = await finalizeSession(session.jsonl_file)
-      setNotice(`整理して保存しました: ${result.raw_file}`)
+      setSession(result.session)
+      setNotice(result.organization.is_organized ? `整理済み: ${result.raw_file}` : result.organization.label)
       await refreshSessionsAfterAction()
     } catch (err) {
       setError(formatError(err))
@@ -271,7 +270,10 @@ function App() {
                       <div className="truncate text-sm font-medium">{item.title || item.session_id}</div>
                       <div className="mt-1 truncate text-xs text-muted-foreground">{item.session_id}</div>
                     </div>
-                    <Badge variant="secondary">{item.message_count}</Badge>
+                    <div className="flex shrink-0 flex-col items-end gap-1">
+                      <Badge variant="secondary">{item.message_count}</Badge>
+                      <Badge variant={item.organization.is_organized ? "secondary" : "outline"}>{item.organization.label}</Badge>
+                    </div>
                   </div>
                   <div className="mt-2 text-xs text-muted-foreground">{formatDateTime(item.last_user_at)}</div>
                 </button>
@@ -294,31 +296,34 @@ function App() {
                 {busyLabel[busy]}
               </Badge>
             )}
-            <Button variant="outline" onClick={saveCurrentSession} disabled={!session || isBusy}>
-              <Save className="h-4 w-4" />
-              保存
-            </Button>
-            <Button variant="outline" onClick={finalizeCurrentSession} disabled={!session || isBusy || messages.length === 0}>
+            <Badge variant={organization?.is_organized ? "secondary" : "outline"}>{statusLabel}</Badge>
+            <Button variant="outline" onClick={finalizeCurrentSession} disabled={!canFinalize}>
               <Archive className="h-4 w-4" />
-              整理して保存
+              {finalizeButtonLabel}
             </Button>
           </div>
         </header>
 
         <div className="border-b border-border bg-muted/40 px-4 py-2">
-          <div className="flex min-h-6 items-center gap-2 text-sm">
-            {error ? (
-              <>
-                <RotateCcw className="h-4 w-4 shrink-0 text-destructive" />
-                <span className="break-words text-destructive">{error}</span>
-              </>
-            ) : (
-              <>
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-primary" />
-                <span className="break-words text-muted-foreground">{notice}</span>
-              </>
-            )}
+          <div className="flex min-h-6 flex-wrap items-center gap-2 text-sm">
+            <div className="flex min-w-0 items-center gap-2">
+              {error ? (
+                <>
+                  <RotateCcw className="h-4 w-4 shrink-0 text-destructive" />
+                  <span className="break-words text-destructive">{error}</span>
+                </>
+              ) : (
+                <>
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-primary" />
+                  <span className="break-words text-muted-foreground">{notice}</span>
+                </>
+              )}
+            </div>
+            {organization && <OrganizeStages organization={organization} running={busy === "finalizing"} />}
           </div>
+          {organization?.last_error && !error && (
+            <div className="mt-1 break-words text-xs text-destructive">{organization.last_error}</div>
+          )}
         </div>
 
         <div ref={viewportRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
@@ -388,6 +393,62 @@ function MessageBubble({ message }: { message: ChatMessage }) {
       )}
     </div>
   )
+}
+
+function OrganizeStages({ organization, running }: { organization: SessionOrganization; running: boolean }) {
+  const stages = [organization.stages.raw, organization.stages.memory, organization.stages.index]
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      {stages.map((stage) => {
+        const isRunning = running && organization.next_stage === stage.name && stage.status !== "done"
+        return (
+          <Badge key={stage.name} variant="outline" className={cn("gap-1", stageClassName(stage.status, isRunning))}>
+            {isRunning && <Loader2 className="h-3 w-3 animate-spin" />}
+            {stage.label}:{isRunning ? "実行中" : stageStatusLabel(stage.status)}
+          </Badge>
+        )
+      })}
+    </div>
+  )
+}
+
+function getFinalizeButtonLabel(organization: SessionOrganization | null) {
+  if (!organization) {
+    return "整理して保存"
+  }
+  if (organization.is_organized) {
+    return "整理済み"
+  }
+  if (organization.next_stage === "memory") {
+    return "記憶整理から再開"
+  }
+  if (organization.next_stage === "index") {
+    return "index更新から再開"
+  }
+  return "整理して保存"
+}
+
+function stageStatusLabel(status: string) {
+  if (status === "done") {
+    return "完了"
+  }
+  if (status === "failed") {
+    return "失敗"
+  }
+  return "待機"
+}
+
+function stageClassName(status: string, running: boolean) {
+  if (running) {
+    return "border-primary text-primary"
+  }
+  if (status === "done") {
+    return "border-emerald-600/40 text-emerald-700"
+  }
+  if (status === "failed") {
+    return "border-destructive/40 text-destructive"
+  }
+  return "text-muted-foreground"
 }
 
 function formatError(error: unknown) {

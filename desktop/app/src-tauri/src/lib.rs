@@ -36,6 +36,11 @@ async fn finalize_session(payload: Value) -> Result<Value, String> {
     run_bridge("finalize-session", payload)
 }
 
+#[tauri::command]
+async fn cleanup_expired_sessions(payload: Value) -> Result<Value, String> {
+    run_bridge("cleanup-expired", payload)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -44,7 +49,8 @@ pub fn run() {
             save_session,
             list_resumable_sessions,
             resume_session,
-            finalize_session
+            finalize_session,
+            cleanup_expired_sessions
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI-LifeOS desktop app");

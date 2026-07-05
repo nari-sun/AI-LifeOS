@@ -11,7 +11,7 @@ from typing import Any
 from codex_conversation import generate_assistant_reply
 from finalize_live_chat import finalize_live_chat
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
-from session_store import list_resumable_sessions, load_resume_session, save_session
+from session_store import cleanup_expired_sessions, get_session_organization, list_resumable_sessions, load_resume_session, save_session
 
 GUI_LOG_ENV = "AI_LIFEOS_GUI_LOG"
 
@@ -55,9 +55,10 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
                 max_context_messages=int(payload.get("max_context_messages") or 20),
                 run_command=subprocess.run,
             )
-            assistant_message = create_live_message("assistant", reply)
-            session.append_message(assistant_message.role, assistant_message.content, assistant_message.timestamp)
-            messages.append(assistant_message)
+            saved_assistant = create_live_message("assistant", reply)
+            session.append_message(saved_assistant.role, saved_assistant.content, saved_assistant.timestamp)
+            messages.append(saved_assistant)
+            assistant_message = saved_assistant
             _save_session_metadata(root=root, session_file=session_file, status="saved")
         except Exception as exc:  # Keep the already-saved user message visible to the GUI.
             error = f"{type(exc).__name__}: {exc}"
@@ -129,12 +130,39 @@ def handle_finalize_session(payload: dict[str, Any]) -> dict[str, Any]:
     )
     _gui_log(root, f"finalize_session.done session={session_file.stem} raw={_display_path(result.raw_file, root)}")
     return {
+        "session": _serialize_session_file(result.jsonl_file, root),
         "jsonl_file": _display_path(result.jsonl_file, root),
         "raw_file": _display_path(result.raw_file, root),
         "task_file": _display_path(result.task_file, root),
         "imported_at": result.imported_at.isoformat(timespec="seconds"),
         "codex_updated": bool(result.codex),
         "git_committed": bool(result.git and result.git.committed),
+        "organization": result.organization,
+    }
+
+
+def handle_cleanup_expired(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    retention_days = int(payload.get("retention_days") or 10)
+    _gui_log(root, f"cleanup_expired.start days={retention_days}")
+    results = cleanup_expired_sessions(
+        root=root,
+        retention_days=retention_days,
+        delete=True,
+        auto_finalize=True,
+    )
+    _gui_log(root, f"cleanup_expired.done count={len(results)}")
+    return {
+        "results": [
+            {
+                "session_id": result.session_id,
+                "status": result.status,
+                "deleted_paths": [_display_path(path, root) for path in result.deleted_paths],
+                "raw_file": _display_path(result.raw_file, root) if result.raw_file else None,
+                "error": result.error,
+            }
+            for result in results
+        ],
     }
 
 
@@ -145,6 +173,7 @@ COMMANDS = {
     "list-resumable": handle_list_resumable,
     "resume-session": handle_resume_session,
     "finalize-session": handle_finalize_session,
+    "cleanup-expired": handle_cleanup_expired,
 }
 
 
@@ -333,10 +362,11 @@ def _save_session_metadata(root: Path, session_file: Path, status: str) -> None:
         pass
 
 
-def _serialize_session_file(path: Path, root: Path) -> dict[str, str]:
+def _serialize_session_file(path: Path, root: Path) -> dict[str, Any]:
     return {
         "session_id": path.stem,
         "jsonl_file": _display_path(path, root),
+        "organization": _serialize_organization(root=root, session_file=path),
     }
 
 
@@ -371,7 +401,34 @@ def _serialize_resume_session(session: Any, root: Path) -> dict[str, Any]:
         "started_at": session.started_at.isoformat(timespec="seconds"),
         "updated_at": session.updated_at.isoformat(timespec="seconds"),
         "last_user_at": session.last_user_at.isoformat(timespec="seconds"),
+        "organization": _serialize_organization(root=root, session_file=session.jsonl_file),
     }
+
+
+def _serialize_organization(root: Path, session_file: Path) -> dict[str, Any]:
+    if not session_file.exists():
+        return {
+            "status": "empty",
+            "label": "未開始",
+            "can_organize": False,
+            "is_organized": False,
+            "next_stage": None,
+            "failed_stage": None,
+            "last_error": None,
+            "raw_file": None,
+            "task_file": None,
+            "current_message_count": 0,
+            "current_updated_at": None,
+            "organized_message_count": 0,
+            "organized_updated_at": None,
+            "stages": {
+                "raw": {"name": "raw", "label": "raw.md作成", "status": "pending"},
+                "memory": {"name": "memory", "label": "記憶整理", "status": "pending"},
+                "index": {"name": "index", "label": "検索index更新", "status": "pending"},
+            },
+        }
+
+    return get_session_organization(root=root, session_file=session_file)
 
 
 def _display_path(path: Path, root: Path) -> str:

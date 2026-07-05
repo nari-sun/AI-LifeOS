@@ -7,7 +7,12 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 VALID_ROLES = {"user", "assistant"}
-VALID_STATUSES = {"saved", "finalized"}
+VALID_STATUSES = {"saved", "raw_created", "raw_failed", "memory_failed", "index_failed", "finalized"}
+ORGANIZE_STAGE_LABELS = {
+    "raw": "raw.md作成",
+    "memory": "記憶整理",
+    "index": "検索index更新",
+}
 
 
 @dataclass(frozen=True)
@@ -34,16 +39,26 @@ class ResumeSession:
     last_user_at: datetime
 
 
+@dataclass(frozen=True)
+class ExpiredSessionCleanupResult:
+    session_id: str
+    status: str
+    deleted_paths: tuple[Path, ...]
+    raw_file: Path | None = None
+    error: str | None = None
+
+
 def save_session(
     root: Path | str = ROOT,
     session_file: Path | str | None = None,
     title: str | None = None,
     status: str = "saved",
     saved_at: datetime | None = None,
+    organize_update: dict[str, Any] | None = None,
 ) -> SavedSession:
     root = Path(root)
     if status not in VALID_STATUSES:
-        raise ValueError("status は saved または finalized を指定してください。")
+        raise ValueError("status が不正です。")
 
     jsonl_file = _resolve_session_file(root=root, session_file=session_file)
     records = _read_jsonl_messages(jsonl_file)
@@ -56,6 +71,14 @@ def save_session(
     started_at = records[0]["timestamp"]
     updated_at = records[-1]["timestamp"]
     metadata_file = jsonl_file.with_suffix(".session.json")
+    existing_metadata = _read_metadata_file(metadata_file)
+    organize = _merge_organize_state(
+        existing_metadata=existing_metadata,
+        update=organize_update,
+        current_message_count=len(records),
+        current_updated_at=updated_at,
+        now=now,
+    )
 
     metadata = {
         "version": 1,
@@ -67,6 +90,9 @@ def save_session(
         "started_at": started_at.isoformat(timespec="seconds"),
         "updated_at": updated_at.isoformat(timespec="seconds"),
         "saved_at": now.isoformat(timespec="seconds"),
+        "finalized_message_count": organize["processed_message_count"] if organize["index_updated"] else None,
+        "finalized_updated_at": organize["processed_updated_at"] if organize["index_updated"] else None,
+        "organize": organize,
     }
 
     metadata_file.write_text(
@@ -166,19 +192,366 @@ def prune_expired_sessions(
     retention_days: int = 10,
     now: datetime | None = None,
     delete: bool = False,
+    auto_finalize: bool = True,
 ) -> list[Path]:
     targets: list[Path] = []
     for session in list_expired_sessions(root=root, retention_days=retention_days, now=now):
-        targets.append(session.jsonl_file)
-        metadata_file = session.jsonl_file.with_suffix(".session.json")
-        if metadata_file.exists():
-            targets.append(metadata_file)
+        if delete:
+            cleanup = cleanup_expired_session(
+                root=root,
+                session_file=session.jsonl_file,
+                auto_finalize=auto_finalize,
+                delete=True,
+            )
+            targets.extend(cleanup.deleted_paths)
+            continue
 
-    if delete:
-        for target in targets:
-            target.unlink()
+        targets.extend(_session_deletion_targets(root=Path(root), session_file=session.jsonl_file, include_unorganized=True))
 
     return targets
+
+
+def cleanup_expired_sessions(
+    root: Path | str = ROOT,
+    retention_days: int = 10,
+    now: datetime | None = None,
+    delete: bool = True,
+    auto_finalize: bool = True,
+) -> list[ExpiredSessionCleanupResult]:
+    return [
+        cleanup_expired_session(
+            root=root,
+            session_file=session.jsonl_file,
+            auto_finalize=auto_finalize,
+            delete=delete,
+        )
+        for session in list_expired_sessions(root=root, retention_days=retention_days, now=now)
+    ]
+
+
+def cleanup_expired_session(
+    root: Path | str,
+    session_file: Path | str,
+    auto_finalize: bool = True,
+    delete: bool = True,
+) -> ExpiredSessionCleanupResult:
+    root = Path(root)
+    jsonl_file = _resolve_session_file(root=root, session_file=session_file)
+    organization = get_session_organization(root=root, session_file=jsonl_file)
+
+    if not organization["is_organized"]:
+        if organization["failed_stage"]:
+            return ExpiredSessionCleanupResult(
+                session_id=jsonl_file.stem,
+                status="整理失敗",
+                deleted_paths=(),
+                raw_file=_optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, jsonl_file),
+                error=organization.get("last_error"),
+            )
+        if not auto_finalize:
+            return ExpiredSessionCleanupResult(
+                session_id=jsonl_file.stem,
+                status="整理未完了",
+                deleted_paths=(),
+                raw_file=_optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, jsonl_file),
+            )
+
+        try:
+            from finalize_live_chat import finalize_live_chat
+
+            finalize_live_chat(
+                root=root,
+                session_file=jsonl_file,
+                run_codex=True,
+                commit=False,
+                force=True,
+            )
+        except Exception as exc:
+            return ExpiredSessionCleanupResult(
+                session_id=jsonl_file.stem,
+                status="整理失敗",
+                deleted_paths=(),
+                raw_file=_optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, jsonl_file),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        organization = get_session_organization(root=root, session_file=jsonl_file)
+
+    if not organization["is_organized"]:
+        return ExpiredSessionCleanupResult(
+            session_id=jsonl_file.stem,
+            status="整理未完了",
+            deleted_paths=(),
+            raw_file=_optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, jsonl_file),
+        )
+
+    targets = _session_deletion_targets(root=root, session_file=jsonl_file, include_unorganized=False)
+    deleted: list[Path] = []
+    if delete:
+        for target in targets:
+            if target.exists():
+                target.unlink()
+                deleted.append(target)
+    else:
+        deleted = targets
+
+    return ExpiredSessionCleanupResult(
+        session_id=jsonl_file.stem,
+        status="削除済み" if delete else "削除対象",
+        deleted_paths=tuple(deleted),
+        raw_file=_optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, jsonl_file),
+    )
+
+
+def get_session_organization(root: Path | str = ROOT, session_file: Path | str | None = None) -> dict[str, Any]:
+    root = Path(root)
+    jsonl_file = _resolve_session_file(root=root, session_file=session_file)
+    records = _read_jsonl_messages(jsonl_file)
+    current_message_count = len(records)
+    current_updated_at = records[-1]["timestamp"].isoformat(timespec="seconds") if records else None
+    metadata = _read_metadata_file(jsonl_file.with_suffix(".session.json"))
+    organize = _normalize_organize_state(metadata)
+
+    raw_matches_current = bool(
+        organize["raw_created"]
+        and organize["raw_message_count"] == current_message_count
+        and organize["raw_updated_at"] == current_updated_at
+    )
+    memory_matches_current = bool(organize["memory_processed"] and raw_matches_current)
+    index_matches_current = bool(
+        organize["index_updated"]
+        and organize["processed_message_count"] == current_message_count
+        and organize["processed_updated_at"] == current_updated_at
+    )
+
+    failed_stage = organize["failed_stage"]
+    if failed_stage and not raw_matches_current and failed_stage != "raw":
+        failed_stage = None
+    if failed_stage == "index" and not memory_matches_current:
+        failed_stage = None
+
+    is_organized = bool(current_message_count > 0 and index_matches_current and not failed_stage)
+    if current_message_count == 0:
+        status = "empty"
+        label = "未開始"
+        can_organize = False
+        next_stage = None
+    elif is_organized:
+        status = "organized"
+        label = "整理済み"
+        can_organize = False
+        next_stage = None
+    elif failed_stage == "raw":
+        status = "raw_failed"
+        label = "raw.md作成失敗"
+        can_organize = True
+        next_stage = "raw"
+    elif failed_stage == "memory":
+        status = "memory_failed"
+        label = "記憶整理失敗"
+        can_organize = True
+        next_stage = "memory"
+    elif failed_stage == "index":
+        status = "index_failed"
+        label = "index更新失敗"
+        can_organize = True
+        next_stage = "index"
+    elif raw_matches_current and not organize["memory_processed"]:
+        status = "raw_created"
+        label = "raw.md作成済み"
+        can_organize = True
+        next_stage = "memory"
+    elif organize["index_updated"] and organize["processed_message_count"]:
+        status = "unorganized_new"
+        label = "未整理の新規会話あり"
+        can_organize = True
+        next_stage = "raw"
+    else:
+        status = "unorganized"
+        label = "未整理"
+        can_organize = True
+        next_stage = "raw"
+
+    return {
+        "status": status,
+        "label": label,
+        "can_organize": can_organize,
+        "is_organized": is_organized,
+        "next_stage": next_stage,
+        "failed_stage": failed_stage,
+        "last_error": organize["last_error"],
+        "raw_file": organize["raw_file"],
+        "task_file": organize["task_file"],
+        "current_message_count": current_message_count,
+        "current_updated_at": current_updated_at,
+        "organized_message_count": organize["processed_message_count"],
+        "organized_updated_at": organize["processed_updated_at"],
+        "stages": {
+            "raw": _stage_status("raw", done=raw_matches_current or is_organized, failed=failed_stage == "raw"),
+            "memory": _stage_status("memory", done=memory_matches_current or is_organized, failed=failed_stage == "memory"),
+            "index": _stage_status("index", done=is_organized, failed=failed_stage == "index"),
+        },
+    }
+
+
+def _read_metadata_file(metadata_file: Path) -> dict[str, Any]:
+    if not metadata_file.exists():
+        return {}
+
+    try:
+        data = json.loads(metadata_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def _merge_organize_state(
+    existing_metadata: dict[str, Any],
+    update: dict[str, Any] | None,
+    current_message_count: int,
+    current_updated_at: datetime,
+    now: datetime,
+) -> dict[str, Any]:
+    organize = _normalize_organize_state(existing_metadata)
+    if not update:
+        return organize
+
+    merged = {**organize, **update}
+    merged["updated_at"] = now.isoformat(timespec="seconds")
+
+    if merged.get("index_updated"):
+        merged["processed_message_count"] = int(merged.get("processed_message_count") or current_message_count)
+        merged["processed_updated_at"] = str(
+            merged.get("processed_updated_at") or current_updated_at.isoformat(timespec="seconds")
+        )
+
+    return _normalize_organize_state({"organize": merged})
+
+
+def _normalize_organize_state(metadata: dict[str, Any]) -> dict[str, Any]:
+    raw = metadata.get("organize")
+    state = raw if isinstance(raw, dict) else {}
+
+    normalized = {
+        "raw_created": bool(state.get("raw_created", False)),
+        "memory_processed": bool(state.get("memory_processed", False)),
+        "index_updated": bool(state.get("index_updated", False)),
+        "failed_stage": _optional_stage(state.get("failed_stage")),
+        "last_error": _optional_string(state.get("last_error")),
+        "raw_file": _optional_string(state.get("raw_file")),
+        "task_file": _optional_string(state.get("task_file")),
+        "raw_message_count": _optional_int(state.get("raw_message_count")),
+        "raw_updated_at": _optional_string(state.get("raw_updated_at")),
+        "processed_message_count": _optional_int(state.get("processed_message_count")) or 0,
+        "processed_updated_at": _optional_string(state.get("processed_updated_at")),
+        "completed_at": _optional_string(state.get("completed_at")),
+        "updated_at": _optional_string(state.get("updated_at")),
+    }
+
+    if not state and metadata.get("status") == "finalized":
+        message_count = _optional_int(metadata.get("message_count")) or 0
+        updated_at = _optional_string(metadata.get("updated_at"))
+        normalized.update(
+            {
+                "raw_created": True,
+                "memory_processed": True,
+                "index_updated": True,
+                "raw_message_count": message_count,
+                "raw_updated_at": updated_at,
+                "processed_message_count": message_count,
+                "processed_updated_at": updated_at,
+                "completed_at": _optional_string(metadata.get("saved_at")),
+                "updated_at": _optional_string(metadata.get("saved_at")),
+            }
+        )
+
+    if normalized["failed_stage"] is not None:
+        normalized["index_updated"] = False
+        if normalized["failed_stage"] in {"raw", "memory"}:
+            normalized["memory_processed"] = normalized["failed_stage"] != "raw" and normalized["memory_processed"]
+
+    return normalized
+
+
+def _stage_status(name: str, done: bool, failed: bool) -> dict[str, str]:
+    if failed:
+        status = "failed"
+    elif done:
+        status = "done"
+    else:
+        status = "pending"
+
+    return {
+        "name": name,
+        "label": ORGANIZE_STAGE_LABELS[name],
+        "status": status,
+    }
+
+
+def _optional_stage(value: Any) -> str | None:
+    text = _optional_string(value)
+    return text if text in ORGANIZE_STAGE_LABELS else None
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_path(root: Path, value: Any) -> Path | None:
+    text = _optional_string(value)
+    if not text:
+        return None
+    path = Path(text)
+    return path if path.is_absolute() else root / path
+
+
+def _session_deletion_targets(root: Path, session_file: Path, include_unorganized: bool) -> list[Path]:
+    targets = [session_file]
+    metadata_file = session_file.with_suffix(".session.json")
+    if metadata_file.exists():
+        targets.append(metadata_file)
+
+    organization = get_session_organization(root=root, session_file=session_file)
+    raw_file = _optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, session_file)
+    if raw_file and raw_file.exists() and (include_unorganized or organization["is_organized"]):
+        targets.append(raw_file)
+
+    return targets
+
+
+def _raw_file_for_session(root: Path, session_file: Path) -> Path | None:
+    try:
+        imported_at = datetime.strptime(session_file.stem[:17], "%Y-%m-%d_%H%M%S")
+    except ValueError:
+        try:
+            records = _read_jsonl_messages(session_file)
+        except (FileNotFoundError, ValueError):
+            return None
+        if not records:
+            return None
+        imported_at = records[0]["timestamp"]
+
+    date = imported_at.strftime("%Y-%m-%d")
+    return (
+        root
+        / "conversations"
+        / imported_at.strftime("%Y")
+        / imported_at.strftime("%m")
+        / f"{date}_{imported_at.strftime('%H%M%S')}"
+        / "raw.md"
+    )
 
 
 def _resolve_session_file(root: Path, session_file: Path | str | None) -> Path:
@@ -383,6 +756,11 @@ def build_parser() -> argparse.ArgumentParser:
     prune_parser = subparsers.add_parser("prune", help="再開期限を過ぎたliveセッションを確認または削除する")
     prune_parser.add_argument("--days", type=int, default=10, help="最後のuser入力から何日以内を残すか")
     prune_parser.add_argument("--delete", action="store_true", help="期限切れセッションを実際に削除する")
+    prune_parser.add_argument(
+        "--no-auto-finalize",
+        action="store_true",
+        help="--delete 時に未整理セッションの自動整理を行わない",
+    )
 
     return parser
 
@@ -425,7 +803,12 @@ def main() -> int:
             return 0
 
         if args.command == "prune":
-            targets = prune_expired_sessions(root=root, retention_days=args.days, delete=args.delete)
+            targets = prune_expired_sessions(
+                root=root,
+                retention_days=args.days,
+                delete=args.delete,
+                auto_finalize=not args.no_auto_finalize,
+            )
             if not targets:
                 print("削除対象の期限切れセッションはありません。")
                 return 0
