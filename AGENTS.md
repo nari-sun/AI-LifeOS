@@ -276,18 +276,22 @@ journal/YYYY/MM/YYYY-MM-DD.md
 
 内容:
 
-* 150文字程度
-* 日付とやったことが分かればよい
+* 400文字程度
+* 日付、時間、ユーザーが相談・依頼したこと、AIがどう答えたか、その結果どうなったかが分かればよい
+* 結果が会話内で明示されていない場合は、推測せず「結果は会話内では未確定」と分かる書き方にする
 * 事実ベース
 * 推測や創作は禁止
 * 感情を勝手に盛らない
+* raw.md の Date と Time を使い、新規ファイルの1行目も `# YYYY-MM-DD HH:MM` にする
+* 既存ファイルへの追記は `## YYYY-MM-DD HH:MM` 見出しにする
+* raw.md に Time がない旧ログだけは `HH:MM` を省略してよい
 
 例:
 
 ```md
-# 2026-06-28
+# 2026-06-28 21:30
 
-AI-LifeOSのPhase2.0を進めた。Codex CLIでsummary、journal、memoryを半自動更新する方針を整理し、AGENTS.mdで全体方針を管理することにした。
+AI-LifeOSのPhase2.0について相談した。AIは、raw.md保存後にsummary、journal、memoryを半自動更新し、AGENTS.mdで全体方針を管理する構成を提案した。その結果、Codex CLIを使って記憶整理を進める方針を確認した。
 ```
 
 ---
@@ -313,7 +317,7 @@ memory/long_term.md
 * ユーザーは AI-LifeOS を作っている
 * ユーザーは Codex CLI を生活改善にも使いたい
 * ユーザーはローカル保存、Git管理、SourceTree確認を重視している
-* ユーザーは日記を150文字程度の簡潔な形式にしたい
+* ユーザーはjournalを400文字程度にし、AIがどう答えたか、その結果どうなったかまで記録したい
 * ユーザーはOpenAI API直叩きより、ChatGPT Plus / Codex CLIを使う運用を好む
 
 ---
@@ -1369,7 +1373,7 @@ Codexは以下のルールを守ること。
 * raw.md の内容に基づいて書く
 * 会話ログにないことは書かない
 * memory は長期的に重要な情報だけ扱う
-* journal は150文字程度にする
+* journal は400文字程度にし、AIがどう答えたか、その結果どうなったかまで事実ベースで書く
 * summary は後でAIが読んで分かるように書く
 * 変更後はどのファイルを変更したか報告する
 * 可能なら差分確認しやすい粒度で変更する
@@ -1577,7 +1581,7 @@ Phase2.0 の完了条件:
 * inbox/chat.txt から raw.md を保存できる
 * tasks/latest_codex_task.md が作られる
 * Codex が summary.md を作成できる
-* Codex が journal/YYYY/MM/YYYY-MM-DD.md を150文字程度で更新できる
+* Codex が journal/YYYY/MM/YYYY-MM-DD.md を400文字程度で更新できる
 * Codex が memory/long_term.md に長期メモリ候補を追記できる
 * SourceTreeで差分確認できる
 * 問題なければGit commitできる
