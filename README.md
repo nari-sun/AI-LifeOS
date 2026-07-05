@@ -109,6 +109,7 @@ AI-LifeOS/
 │  ├─ session_save_mvp.md
 │  ├─ chat_gui_mvp.md
 │  ├─ searchable_memory.md
+│  ├─ response_settings_ui.md
 │  ├─ vector_search_evaluation.md
 │  └─ phase4_planning_checkpoint.md
 ├─ desktop/
@@ -237,6 +238,8 @@ approval: never
 ```
 
 各スクリプトの `--codex-model`、`--codex-reasoning-effort`、`--codex-sandbox`、`--codex-approval` で必要に応じて上書きできます。
+
+GUIからのモデル・応答設定UIはまだ実装しません。会話返答生成と記憶整理の設定責務、将来GUIに出せる最小範囲は `docs/response_settings_ui.md` に整理しています。
 
 ## Commands
 
@@ -441,6 +444,7 @@ GUIでまだやらないこと:
 - 専用の過去ログ検索画面
 - ベクトル検索
 - MCP連携
+- モデル・応答設定UI
 - 10日超セッションの自動削除
 - 会話中の memory / journal 自動編集
 - 自動Git commit
