@@ -736,21 +736,21 @@ function renderInline(text: string) {
       nodes.push(text.slice(cursor, match.index))
     }
 
-    const token = match[0]
-    if (token.startsWith("`")) {
+    const inlineMarker = match[0]
+    if (inlineMarker.startsWith("`")) {
       nodes.push(
         <code key={`${match.index}-code`} className="rounded bg-muted px-1 py-0.5 font-mono text-[0.92em]">
-          {token.slice(1, -1)}
+          {inlineMarker.slice(1, -1)}
         </code>,
       )
     } else {
       nodes.push(
         <strong key={`${match.index}-strong`} className="font-semibold">
-          {token.slice(2, -2)}
+          {inlineMarker.slice(2, -2)}
         </strong>,
       )
     }
-    cursor = match.index + token.length
+    cursor = match.index + inlineMarker.length
   }
 
   if (cursor < text.length) {
