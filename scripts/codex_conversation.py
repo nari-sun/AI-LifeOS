@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from codex_cli_options import add_codex_model_options
+from build_answer_context import build_answer_context
 from finalize_live_chat import FinalizeLiveChatResult, finalize_live_chat
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from session_store import ResumeSession, list_resumable_sessions, load_resume_session
@@ -61,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--codex-sandbox",
         default="read-only",
         choices=("read-only", "workspace-write", "danger-full-access"),
-        help="Sandbox mode for chat replies. read-only is the Phase2.6 default.",
+        help="Sandbox mode for chat replies. read-only is the default.",
     )
     parser.add_argument(
         "--codex-approval",
@@ -74,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
         help="Maximum recent messages to pass to Codex on each turn.",
+    )
+    parser.add_argument(
+        "--no-memory-context",
+        action="store_true",
+        help="Do not include AI-LifeOS memory search context in chat replies.",
     )
     parser.add_argument(
         "--no-ai",
@@ -123,26 +129,29 @@ def _debug_log(root: Path | str | None, message: str) -> None:
         pass
 
 
-def build_codex_chat_prompt(messages: list[LiveMessage], max_context_messages: int = 20) -> str:
+def build_codex_chat_prompt(
+    messages: list[LiveMessage],
+    max_context_messages: int = 20,
+    memory_context: str = "",
+) -> str:
     recent_messages = messages[-max(max_context_messages, 1) :]
     transcript_lines = []
     for message in recent_messages:
         label = "User" if message.role == "user" else "Assistant"
         transcript_lines.extend([f"{label}:", message.content, ""])
 
-    return "\n".join(
-        [
-            "You are the AI-LifeOS Phase2.6 conversation assistant.",
-            "Reply conversationally to the latest user message.",
-            "Do not edit files, run commands, commit changes, or update memory/journal.",
-            "The application has already saved the user message to the live JSONL log.",
-            "Use the transcript below as context and return only the assistant reply.",
-            "",
-            "Transcript:",
-            "",
-            *transcript_lines,
-        ]
-    ).rstrip()
+    lines = [
+        "You are the AI-LifeOS conversation assistant.",
+        "Reply conversationally to the latest user message.",
+        "Do not edit files, run commands, commit changes, or update memory/journal.",
+        "The application has already saved the user message to the live JSONL log.",
+        "Use the transcript and any read-only memory context below, then return only the assistant reply.",
+        "",
+    ]
+    if memory_context.strip():
+        lines.extend(["Memory Context:", "", memory_context.strip(), ""])
+    lines.extend(["Transcript:", "", *transcript_lines])
+    return "\n".join(lines).rstrip()
 
 
 def generate_assistant_reply(
@@ -156,11 +165,22 @@ def generate_assistant_reply(
     service_tier: str | None = DEFAULT_CHAT_CODEX_SERVICE_TIER,
     fast_mode: bool | None = DEFAULT_CHAT_CODEX_FAST_MODE,
     max_context_messages: int = 20,
+    include_memory_context: bool = True,
     run_command=subprocess.run,
 ) -> str:
     root = Path(root)
     _debug_log(root, f"assistant_reply.start messages={len(messages)} sandbox={sandbox}")
-    prompt = build_codex_chat_prompt(messages, max_context_messages=max_context_messages)
+    memory_context = ""
+    if include_memory_context:
+        latest_user = _latest_user_content(messages)
+        context = build_answer_context(root=root, question=latest_user)
+        memory_context = context.text
+        _debug_log(root, f"assistant_reply.memory_context enabled={bool(memory_context)} results={len(context.results)}")
+    prompt = build_codex_chat_prompt(
+        messages,
+        max_context_messages=max_context_messages,
+        memory_context=memory_context,
+    )
 
     with tempfile.TemporaryDirectory() as temp_dir:
         output_file = Path(temp_dir) / "assistant_reply.md"
@@ -226,6 +246,13 @@ def generate_assistant_reply(
     return reply
 
 
+def _latest_user_content(messages: list[LiveMessage]) -> str:
+    for message in reversed(messages):
+        if message.role == "user":
+            return message.content
+    return ""
+
+
 def _display_path(path: Path, root: Path) -> str:
     try:
         return str(path.relative_to(root))
@@ -271,7 +298,7 @@ def _render_screen(
     width, height = _terminal_size()
     rule = "-" * width
     header = [
-        "AI-LifeOS Phase2.6 - Codex Conversation MVP",
+        "AI-LifeOS - Codex Conversation",
         f"Log: {session_display_path}",
         "Enter: send    /resume: list    /resume <id|latest>: load    /exit: quit",
         rule,
@@ -780,6 +807,7 @@ def main() -> int:
                     service_tier=args.chat_codex_service_tier,
                     fast_mode=not args.no_chat_codex_fast_mode,
                     max_context_messages=args.max_context_messages,
+                    include_memory_context=not args.no_memory_context,
                 )
             except RuntimeError as exc:
                 _debug_log(root, f"main.assistant_reply_failed type={type(exc).__name__} message={exc}")

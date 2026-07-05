@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from codex_cli_options import add_codex_model_options
+from memory_index import ensure_memory_files, rebuild_index
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_COMMIT_PATHS = ("conversations", "journal", "memory", "inbox", "tasks")
@@ -112,11 +113,7 @@ def prepare_memory_targets(root: Path | str = ROOT, target_at: datetime | None =
     root = Path(root)
     now = target_at or datetime.now()
 
-    memory_dir = root / "memory"
-    memory_dir.mkdir(exist_ok=True)
-    long_term = memory_dir / "long_term.md"
-    if not long_term.exists():
-        long_term.write_text("# Long-Term Memory\n\n", encoding="utf-8")
+    ensure_memory_files(root)
 
     journal_dir = root / "journal" / now.strftime("%Y") / now.strftime("%m")
     journal_dir.mkdir(parents=True, exist_ok=True)
@@ -278,6 +275,7 @@ def process_chat_session(
             reasoning_effort=codex_reasoning_effort,
             run_command=run_command,
         )
+        rebuild_index(root=root)
 
     git_result = None
     if commit:

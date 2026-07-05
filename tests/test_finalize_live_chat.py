@@ -115,6 +115,8 @@ class FinalizeLiveChatTests(unittest.TestCase):
             self.assertIn('model_reasoning_effort="xhigh"', calls[0][0])
             self.assertTrue(calls[0][1]["capture_output"])
             self.assertTrue((root / "memory" / "long_term.md").exists())
+            self.assertTrue((root / "memory" / "preferences.md").exists())
+            self.assertTrue((root / "memory" / "projects.md").exists())
             self.assertTrue((root / "journal" / "2026" / "07").is_dir())
             self.assertEqual(["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"], calls[1][0])
             self.assertEqual([sys.executable, "scripts/privacy_check.py", "--staged"], calls[2][0])

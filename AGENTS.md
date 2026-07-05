@@ -27,7 +27,11 @@ Phase2.65 として、会話セッションを保存・再開できる Session S
 
 Phase2.7 として、Phase2.6 と Phase2.65 の会話エンジン・セッション保存処理を Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui のGUIから利用できる Chat GUI MVP として実装済みです。
 
-次は Phase3.0 として、保存済み会話・summary・journal・memory を検索できるようにするための Searchable Memory Design に進みます。Phase3 の検索機能、SQLite index、記憶を読んで回答する機能はまだ未着手です。
+現在は Phase3.6 まで実装済みです。
+
+Phase3 として、保存済み会話・summary・journal・memory を検索する Markdown Search MVP、タグ/メタデータ抽出、SQLite Memory Index、記憶を読んで回答するための read-only memory context、Vector Search Evaluation、Phase4 Planning Checkpoint を実装済みです。
+
+次は Phase4.0 として、Phase3 の検索・記憶取得基盤を前提に、MCP連携や外部ツール連携の範囲を決めます。
 
 Phase1 は完了済みです。
 
@@ -47,7 +51,12 @@ Phase1 は完了済みです。
 * Phase2.65 のSession Save / Resume MVPを実装済み
 * Phase2.7 のChat GUI MVPを実装済み
 * Phase2.7 のGUI技術スタックは Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui に決定済み
-* Phase3 の検索機能は未着手
+* Phase3.1 の Markdown Search MVP を実装済み
+* Phase3.2 のタグ/メタデータ抽出を実装済み
+* Phase3.3 の SQLite Memory Index を実装済み
+* Phase3.4 の Memory Retrieval for Answers を実装済み
+* Phase3.5 の Vector Search Evaluation を docs/vector_search_evaluation.md に整理済み
+* Phase3.6 の Phase4 Planning Checkpoint を docs/phase4_planning_checkpoint.md に整理済み
 
 現在の方針:
 
@@ -60,6 +69,10 @@ Phase1 は完了済みです。
 * Phase2.65 では /resume で過去10日以内の会話セッションを再開できるようにし、10日超の削除は明示コマンドに限定する
 * Phase2.7 ではPhase2.6の会話エンジンとPhase2.65のセッション保存処理を薄く包むGUIを作り、検索機能や多機能化はPhase3以降に分ける
 * Phase2.7 のGUIは Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui で作る
+* Phase3 では保存済みMarkdownを読み取り専用で検索し、SQLite index は再生成可能な派生データとして扱う
+* Phase3 の会話中memory contextは `memory/long_term.md` と `memory/preferences.md` を優先し、必要に応じて `journal` を検索する
+* Phase3 の検索・回答用コンテキスト生成では、`memory` / `journal` / `conversations` を勝手に編集しない
+* Phase3 ではベクトルDBを本番導入せず、SQLite検索で足りない理由が明確になった場合に再評価する
 
 ---
 
@@ -113,7 +126,8 @@ AI-LifeOS/
 ├─ memory/
 │  ├─ long_term.md
 │  ├─ preferences.md
-│  └─ projects.md
+│  ├─ projects.md
+│  └─ search_index.sqlite3  (generated, not tracked)
 │
 ├─ prompts/
 │  └─ codex_phase2_prompt.md
@@ -128,12 +142,20 @@ AI-LifeOS/
 │  ├─ chat_gui.py
 │  ├─ finalize_live_chat.py
 │  ├─ session_store.py
-│  └─ live_session.py
+│  ├─ live_session.py
+│  ├─ memory_index.py
+│  ├─ search_memory.py
+│  ├─ index_conversations.py
+│  ├─ rebuild_index.py
+│  └─ build_answer_context.py
 │
 ├─ docs/
 │  ├─ codex_conversation_mvp.md
 │  ├─ session_save_mvp.md
-│  └─ chat_gui_mvp.md
+│  ├─ chat_gui_mvp.md
+│  ├─ searchable_memory.md
+│  ├─ vector_search_evaluation.md
+│  └─ phase4_planning_checkpoint.md
 │
 ├─ desktop/
 │  ├─ README.md
@@ -202,6 +224,19 @@ Phase2.7 で追加予定のChat GUI MVPフロー:
 9. raw.md を生成する
 10. 既存Phase2.5処理で summary / journal / memory を生成する
 11. 必要に応じて Git commit する
+```
+
+Phase3 で追加済みのSearchable Memoryフロー:
+
+```text
+1. raw.md / summary.md / journal / memory をローカルMarkdownとして保存する
+2. python scripts\index_conversations.py または scripts\rebuild_index.py で memory/search_index.sqlite3 を作る
+3. python scripts\search_memory.py で保存済み記憶を読み取り専用検索する
+4. タグ検索が必要な場合は summary.md のタグを使う
+5. 私的な質問、好み、生活、学習進捗、過去行動、AI-LifeOSの過去方針に関係する質問では build_answer_context.py が memory/long_term.md と memory/preferences.md を優先して読む
+6. memoryだけで足りない場合は journal と summary.md / raw.md を検索して短い抜粋を回答用コンテキストに入れる
+7. codex_conversation.py は通常の会話返答生成時に read-only memory context をプロンプトへ渡す
+8. 会話中に memory / journal / conversations は編集しない
 ```
 
 ---
@@ -560,7 +595,7 @@ summary.md / journal / memory 更新
 
 Phase2.6 はPhase3の前段階です。
 
-Phase3では検索機能を作る予定だが、その前に「今後の会話を最初から構造化して保存できる入口」を作ります。
+Phase3では検索機能を実装済みですが、Phase2.6 はその前に「今後の会話を最初から構造化して保存できる入口」を作る段階でした。
 
 Phase2.6によって、将来的に以下がやりやすくなります。
 
@@ -888,7 +923,7 @@ Phase2.7では以下をやらない。
 
 Phase2.7 は Phase3 の前段階です。
 
-Phase3では保存済み会話の検索機能を作る予定です。その前に、今後の会話をGUIから自然に保存できる入口を作るのがPhase2.7です。
+Phase3では保存済み会話の検索機能を実装済みです。Phase2.7 は、その前段として今後の会話をGUIから自然に保存できる入口を作る段階でした。
 
 Phase2.7によって、将来的に以下がやりやすくなります。
 
@@ -943,10 +978,32 @@ Phase3で作るもの:
 
 ```text
 scripts/
+├─ memory_index.py
 ├─ index_conversations.py
 ├─ search_memory.py
-└─ rebuild_index.py
+├─ rebuild_index.py
+└─ build_answer_context.py
 ```
+
+Phase3実装済みドキュメント:
+
+```text
+docs/searchable_memory.md
+docs/vector_search_evaluation.md
+docs/phase4_planning_checkpoint.md
+```
+
+Phase3実装済み仕様:
+
+* `scripts/memory_index.py` は検索対象Markdownの収集、タグ/日付/タイトル抽出、SQLite index作成、検索結果ランキングを提供する共通モジュールです。
+* `scripts/search_memory.py` は手動検索CLIです。`--no-index` でMarkdown直接検索、`--rebuild-index` で検索前index再構築、`--type` と `--tag` で絞り込みできます。
+* `scripts/index_conversations.py` と `scripts/rebuild_index.py` は `memory/search_index.sqlite3` を再構築します。
+* `scripts/build_answer_context.py` は私的な質問、好み、生活、学習進捗、過去行動、AI-LifeOSの過去方針に関係する質問だけ、read-only memory context を生成します。
+* `scripts/codex_conversation.py` は通常の会話返答生成時に `build_answer_context.py` の結果をプロンプトへ入れます。`--no-memory-context` で無効化できます。
+* `scripts/process_chat.py --run-codex` と `scripts/finalize_live_chat.py --run-codex` は、summary / journal / memory 更新後に SQLite index を再構築します。
+* SQLite index は `memory/search_index.sqlite3` に作ります。これは再生成可能な派生データで、Git管理しません。
+* SQLiteには全文を保存しますが、日本語の部分一致を安定させるため、MVPのランキングはPython側で行います。FTS5が使える環境では `documents_fts` も作成します。
+* 現時点のローカル実装自体はWeb検索クライアントを持ちません。現在性や外部情報が必要な質問では、会話プロンプト上でWeb検索が必要な補助手段であることを明示します。
 
 ### Phase3.0: Searchable Memory Design
 
@@ -1012,6 +1069,14 @@ scripts/search_memory.py
 * 検索だけを行い、memory / journal / conversations を更新しない
 * 個人情報を外部サービスへ送らない
 
+実装済み:
+
+```powershell
+python scripts\search_memory.py "検索語"
+python scripts\search_memory.py "検索語" --no-index
+python scripts\search_memory.py "検索語" --json
+```
+
 ### Phase3.2: Tags and Metadata
 
 目的:
@@ -1041,6 +1106,12 @@ scripts/search_memory.py
 * `long_term.md` と重複する場合は、事実・方針は long_term、好み・選好は preferences に分ける
 * 既存内容を勝手に削除・大幅改変しない
 * 自動更新前に、summary の「長期メモリ候補」相当で確認できる形にする
+
+実装済み:
+
+* `memory/preferences.md` は `memory/long_term.md`、`memory/projects.md` と同じく記憶ファイルとして自動作成対象です。
+* `prompts/codex_phase2_prompt.md` は、明示された好み・判断基準・回答スタイル・生活/学習/開発上の嗜好だけを `memory/preferences.md` へ追記するよう更新済みです。
+* `summary.md` の `## タグ` / `## Tags` / `## Tag` からタグを抽出し、検索とSQLite indexに使います。
 
 ### Phase3.3: SQLite Memory Index
 
@@ -1074,6 +1145,14 @@ memory/search_index.sqlite3
 * セットアップ時または初回起動時にDBを生成できるようにする
 * `journal` は日付単位で検索・取得しやすい形でindexする
 * `memory/preferences.md` も memory document としてindex対象に含める
+
+実装済み:
+
+```powershell
+python scripts\index_conversations.py
+python scripts\rebuild_index.py
+python scripts\search_memory.py "検索語" --rebuild-index
+```
 
 ### Phase3.4: Memory Retrieval for Answers
 
@@ -1109,6 +1188,15 @@ scripts/build_answer_context.py
 * Web検索語に含める情報には原則として制限を設けない
 * 記憶を読んだ回答の出典は、通常は自然文に混ぜる。ユーザーが詳細確認を求めた場合だけ、日付やファイルパスを明示する
 
+実装済み:
+
+```powershell
+python scripts\build_answer_context.py "俺の好みに合う店は？"
+python scripts\codex_conversation.py --no-memory-context
+```
+
+`build_answer_context.py` は、一般質問ではmemory contextを作らず、私的な質問・好み・生活・学習進捗・過去行動・AI-LifeOSの過去方針に関係する質問だけで `memory/long_term.md` と `memory/preferences.md` を読みます。必要に応じて `journal` と `summary.md` / `raw.md` を検索し、短い抜粋と出典を保持します。
+
 ### Phase3.5: Vector Search Evaluation
 
 目的:
@@ -1130,6 +1218,12 @@ scripts/build_answer_context.py
 * ベクトルDB導入前に、SQLite全文検索で足りない理由を明確にする
 * 個人情報を外部サービスへ送らない
 
+実装済み:
+
+* `docs/vector_search_evaluation.md` に SQLiteVec / LanceDB / Chroma / Qdrant の評価を整理済みです。
+* 現時点ではベクトルDBを本番導入しません。Markdown検索 + SQLite index + 日本語部分一致で不足が明確になった場合に再評価します。
+* 最有力候補はSQLite単一ファイル運用と相性がよいSQLiteVecですが、Windows導入性とローカルembedding方針が決まるまでは保留します。
+
 ### Phase3.6: Phase4 Planning Checkpoint
 
 目的:
@@ -1144,6 +1238,12 @@ scripts/build_answer_context.py
 * 個人情報を含む検索・連携の安全ルール
 * Phase3.4の記憶回答機能からPhase4へ渡すべき設計課題
 * 現在性が必要な質問での自動Web検索を、MCP連携や外部ツール連携とどう統合するか
+
+実装済み:
+
+* `docs/phase4_planning_checkpoint.md` に Phase4 優先候補と安全ルールを整理済みです。
+* Phase4では、まず Filesystem MCP / GitHub MCP / Playwright MCP を優先候補にします。
+* Gmail / Calendar / Discord など個人情報が多い連携は、読み取り範囲と保存前確認を設計してから扱います。
 
 検索したい例:
 
@@ -1286,6 +1386,11 @@ Codexは以下のルールを守ること。
 * Phase2.7 のChat GUI MVPはPhase2.6の会話エンジンを再利用する薄いラッパーとして設計する
 * Phase2.7 の調査結果は docs/chat_gui_mvp.md に整理する
 * Phase2.7 のGUIは会話ログを inbox/live/*.jsonl に逐次保存する方針を維持する
+* Phase3 の検索・index・memory context仕様は docs/searchable_memory.md に整理する
+* Phase3 の SQLite index は `memory/search_index.sqlite3` に作り、Markdownから再生成可能な派生データとして扱う
+* Phase3 の会話中memory contextは読み取り専用にし、`memory` / `journal` / `conversations` を勝手に編集しない
+* Phase3 のベクトル検索評価は docs/vector_search_evaluation.md に整理し、導入前にSQLite検索で足りない理由を明確にする
+* Phase3.6 のPhase4引き継ぎは docs/phase4_planning_checkpoint.md に整理する
 
 ### Do Not
 
@@ -1308,6 +1413,9 @@ Codexは以下のルールを守ること。
 * Phase2.7 のGUI中に memory/long_term.md や journal を勝手に編集しない
 * Phase2.7 で過去ログ検索UI、ベクトルDB検索、MCP連携を先取りしない
 * Phase2.7 で勝手なGit commitを連発しない
+* Phase3 の検索処理で元Markdownを勝手に書き換えない
+* `memory/search_index.sqlite3` をGit管理対象として扱わない
+* ベクトルDBを必要性の説明なしに本番依存へ追加しない
 
 ---
 
@@ -1405,6 +1513,27 @@ Phase2.7 配布用ビルド:
 ```powershell
 cd desktop\app
 npm run bundle
+```
+
+Phase3 保存済み記憶検索:
+
+```powershell
+python scripts\search_memory.py "検索語"
+python scripts\search_memory.py "検索語" --type journal
+python scripts\search_memory.py "" --tag Phase3
+```
+
+Phase3 SQLite index 再構築:
+
+```powershell
+python scripts\index_conversations.py
+python scripts\rebuild_index.py
+```
+
+Phase3 回答用memory context確認:
+
+```powershell
+python scripts\build_answer_context.py "俺の好みに合う店は？"
 ```
 
 Git状態確認:

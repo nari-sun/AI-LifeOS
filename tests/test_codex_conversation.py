@@ -136,6 +136,32 @@ class CodexConversationTests(unittest.TestCase):
         self.assertEqual("read-only", command[command.index("--sandbox") + 1])
         self.assertIn("User:\nHello", calls[0][1]["input"])
 
+    def test_generate_assistant_reply_includes_memory_context_for_private_question(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("好みに合わせた返答です。\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "memory").mkdir()
+            (root / "memory" / "long_term.md").write_text("# Long-Term Memory\n\n- ユーザーはAI-LifeOSを作っている。\n", encoding="utf-8")
+            (root / "memory" / "preferences.md").write_text("# Preferences\n\n- ユーザーは静かな店を好む。\n", encoding="utf-8")
+
+            reply = codex_conversation.generate_assistant_reply(
+                root=root,
+                messages=[create_live_message("user", "俺の好みに合う店は？")],
+                run_command=fake_run,
+            )
+
+        self.assertEqual("好みに合わせた返答です。", reply)
+        prompt = calls[0][1]["input"]
+        self.assertIn("AI-LifeOS memory context", prompt)
+        self.assertIn("静かな店を好む", prompt)
+
     def test_finish_session_finalizes_and_processes_new_messages(self):
         calls = []
         progress_events = []

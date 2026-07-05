@@ -14,6 +14,7 @@ from process_chat import (
     prepare_memory_targets,
     run_codex_task,
 )
+from memory_index import rebuild_index
 from session_store import save_session
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,6 +98,7 @@ def finalize_live_chat(
             run_command=command_runner,
         )
         _emit_progress(progress, 90, "Finished memory processing.")
+        rebuild_index(root=root)
 
     git_result = None
     if commit:

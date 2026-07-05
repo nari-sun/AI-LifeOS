@@ -2,7 +2,7 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Phase2.6: Start Codex Conversation",
+      "label": "Start Codex Conversation",
       "type": "process",
       "command": "python",
       "args": [
@@ -30,7 +30,7 @@
       "problemMatcher": []
     },
     {
-      "label": "Phase2.7: Install Desktop Dependencies",
+      "label": "Install Desktop Dependencies",
       "type": "process",
       "command": "powershell.exe",
       "args": [
@@ -55,7 +55,7 @@
       "problemMatcher": []
     },
     {
-      "label": "Phase2.7: Start Chat GUI",
+      "label": "Start Chat GUI",
       "type": "process",
       "command": "powershell.exe",
       "args": [
@@ -86,7 +86,7 @@
       "problemMatcher": []
     },
     {
-      "label": "Phase2.7: Build Chat GUI",
+      "label": "Build Chat GUI",
       "type": "process",
       "command": "powershell.exe",
       "args": [
@@ -117,7 +117,7 @@
       "problemMatcher": []
     },
     {
-      "label": "Phase2.7: Launch Built Chat GUI",
+      "label": "Launch Built Chat GUI",
       "type": "process",
       "command": "${workspaceFolder}\\desktop\\app\\src-tauri\\target\\release\\ai-lifeos-desktop.exe",
       "options": {

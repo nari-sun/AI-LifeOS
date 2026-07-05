@@ -1,10 +1,10 @@
 # AI-LifeOS
 
-AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、後から要約・日記・長期メモリとして活用するための個人用AI記憶システムです。
+AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、後から検索・要約・日記・長期メモリとして活用するための個人用AI記憶システムです。
 
-現在は Phase2.7 Chat GUI MVP までの実装が入っています。Phase2.6 の live conversation、Phase2.65 の Session Save / Resume、Phase2.7 の Tauri 2 + React GUI を、OpenAI API 直叩きや `.env` 前提なしで動かす方針です。
+現在は Phase3 Searchable Memory までの実装が入っています。Phase2.6 の live conversation、Phase2.65 の Session Save / Resume、Phase2.7 の Tauri 2 + React GUI、Phase3 の検索・SQLite index・回答用記憶コンテキストを、OpenAI API 直叩きや `.env` 前提なしで動かす方針です。
 
-運用の中心は、ローカルの Markdown / JSONL、Codex CLI、Git です。ChatGPT公式Webや公式デスクトップアプリのスクレイピング、外部ベクトルDB、クラウド同期はまだ扱いません。
+運用の中心は、ローカルの Markdown / JSONL / SQLite、Codex CLI、Git です。ChatGPT公式Webや公式デスクトップアプリのスクレイピング、外部ベクトルDB、クラウド同期はまだ扱いません。
 
 Windows PowerShellでMarkdownの日本語が文字化けして見える場合は、ファイル自体ではなく表示時の文字コードが原因のことがあります。確認するときはUTF-8を指定してください。
 
@@ -20,7 +20,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - Phase2.6: PowerShell上の live conversation CLI、JSONL逐次保存、終了時finalizeを実装済み
 - Phase2.65: `.session.json` によるセッション保存、10日以内の resume、dry-run prune を実装済み
 - Phase2.7: Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の Chat GUI MVP を実装済み
-- Phase3: 保存済み会話の検索機能は未着手
+- Phase3: Markdown検索、タグ/メタデータ抽出、SQLite index、回答用memory context、ベクトル検索評価、Phase4引き継ぎを実装済み
 
 ## できること
 
@@ -32,6 +32,9 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - live JSONLを raw.md に変換し、既存の Phase2.5 記憶整理へ接続する
 - live 会話セッションを `.session.json` として保存し、最後のuser入力から10日以内のセッションを再開する
 - Tauri GUIから新規チャット、送信、保存、セッション再開、整理して保存を実行する
+- 保存済みの raw.md / summary.md / journal / memory を検索する
+- `memory/search_index.sqlite3` を再構築可能な検索indexとして生成する
+- 私的な質問や好みに関係する会話では、`memory/long_term.md` と `memory/preferences.md` を読み取り専用コンテキストとして回答に渡す
 - `python -m unittest` で Python 側の保存・再開・GUIブリッジ処理をテストする
 
 ## Phase Overview
@@ -43,7 +46,13 @@ Phase2.5 : Safer Automation
 Phase2.6 : Codex Conversation MVP
 Phase2.65: Session Save / Resume MVP
 Phase2.7 : Chat GUI MVP
-Phase3   : Searchable Memory
+Phase3.0 : Searchable Memory Design
+Phase3.1 : Markdown Search MVP
+Phase3.2 : Tags and Metadata
+Phase3.3 : SQLite Memory Index
+Phase3.4 : Memory Retrieval for Answers
+Phase3.5 : Vector Search Evaluation
+Phase3.6 : Phase4 Planning Checkpoint
 Phase4   : MCP Integration
 Phase5   : Life Improvement Agent
 Phase6   : Daily Automation
@@ -73,7 +82,8 @@ AI-LifeOS/
 ├─ memory/
 │  ├─ long_term.md
 │  ├─ preferences.md
-│  └─ projects.md
+│  ├─ projects.md
+│  └─ search_index.sqlite3  (generated, not tracked)
 ├─ prompts/
 │  ├─ codex_phase2_prompt.md
 │  ├─ journal_prompt.md
@@ -88,11 +98,19 @@ AI-LifeOS/
 │  ├─ session_store.py
 │  ├─ chat_gui_bridge.py
 │  ├─ chat_gui_task.ps1
+│  ├─ memory_index.py
+│  ├─ search_memory.py
+│  ├─ index_conversations.py
+│  ├─ rebuild_index.py
+│  ├─ build_answer_context.py
 │  └─ codex_cli_options.py
 ├─ docs/
 │  ├─ codex_conversation_mvp.md
 │  ├─ session_save_mvp.md
-│  └─ chat_gui_mvp.md
+│  ├─ chat_gui_mvp.md
+│  ├─ searchable_memory.md
+│  ├─ vector_search_evaluation.md
+│  └─ phase4_planning_checkpoint.md
 ├─ desktop/
 │  ├─ README.md
 │  └─ app/
@@ -108,6 +126,7 @@ AI-LifeOS/
    ├─ test_codex_conversation.py
    ├─ test_finalize_live_chat.py
    ├─ test_live_session.py
+   ├─ test_phase3_memory.py
    ├─ test_process_chat.py
    └─ test_session_store.py
 ```
@@ -260,6 +279,7 @@ python scripts\codex_conversation.py --no-finalize-on-exit
 python scripts\codex_conversation.py --no-process-on-exit
 python scripts\codex_conversation.py --commit-on-exit
 python scripts\codex_conversation.py --resume
+python scripts\codex_conversation.py --no-memory-context
 ```
 
 会話中コマンド:
@@ -307,6 +327,36 @@ python scripts\session_store.py prune --delete
 - `prune` はデフォルトでは削除しない
 - 実削除は `prune --delete` を明示した場合だけ行う
 - 削除対象は同名の `.jsonl` と `.session.json` に限定する
+
+### 保存済み記憶を検索する
+
+```powershell
+python scripts\search_memory.py "検索語"
+python scripts\search_memory.py "検索語" --no-index
+python scripts\search_memory.py "検索語" --type journal
+python scripts\search_memory.py "" --tag Phase3
+python scripts\search_memory.py "検索語" --json
+```
+
+`raw.md` / `summary.md` / `journal` / `memory` を読み取り専用で検索します。
+
+### SQLite indexを再構築する
+
+```powershell
+python scripts\index_conversations.py
+python scripts\rebuild_index.py
+python scripts\search_memory.py "検索語" --rebuild-index
+```
+
+DBは `memory/search_index.sqlite3` に作成されます。このDBはMarkdownから再生成できる派生データで、Git管理しません。
+
+### 回答用memory contextを作る
+
+```powershell
+python scripts\build_answer_context.py "俺の好みに合う店は？"
+```
+
+私的な質問、好み、生活、学習進捗、過去行動、AI-LifeOSの過去方針に関係する質問では、`memory/long_term.md` と `memory/preferences.md` を優先して読み、必要に応じて `journal` と `summary.md` / `raw.md` を検索した短い抜粋を返します。
 
 ### Chat GUIを起動する
 
@@ -360,7 +410,7 @@ GUIでできること:
 
 GUIでまだやらないこと:
 
-- 過去ログ全文検索
+- 専用の過去ログ検索画面
 - ベクトル検索
 - MCP連携
 - 10日超セッションの自動削除
@@ -421,6 +471,7 @@ python -m unittest
 - CLIの `/resume` が番号選択に対応する
 - GUIブリッジが start / send / resume を処理できる
 - GUIブリッジログに会話本文を残さない
+- Phase3のMarkdown検索、タグ抽出、SQLite index、回答用memory contextが動く
 
 GUI側のビルド確認:
 
@@ -444,6 +495,10 @@ Get-Content -Raw -Encoding UTF8 tasks\latest_codex_task.md
 - 同じ会話フォルダの `summary.md`
 - `journal/YYYY/MM/YYYY-MM-DD.md`
 - `memory/long_term.md`
+- `memory/preferences.md`
+- `memory/projects.md`
+
+`--run-codex` を使う処理の完了後は、`memory/search_index.sqlite3` も再構築されます。
 
 Codex用プロンプトの元ファイルは `prompts/codex_phase2_prompt.md` です。
 
@@ -458,4 +513,5 @@ Codex用プロンプトの元ファイルは `prompts/codex_phase2_prompt.md` �
 - 10日超セッションは自動削除しない
 - Git commit はユーザー明示操作、または既存スクリプトの明示オプション経由にする
 - 自動commit対象は `conversations`、`journal`、`memory`、`inbox`、`tasks` に限定する
-- Phase3の検索機能、ベクトル検索、MCP連携はPhase2.7に混ぜない
+- SQLite index は再生成可能な派生データとして扱い、Git管理しない
+- ベクトル検索とMCP連携は、Phase3の検索基盤の上で必要性を確認してから扱う

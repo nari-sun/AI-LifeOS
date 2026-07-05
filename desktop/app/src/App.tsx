@@ -45,7 +45,7 @@ function App() {
   const [sessions, setSessions] = useState<ResumeSession[]>([])
   const [input, setInput] = useState("")
   const [busy, setBusy] = useState<BusyState>("idle")
-  const [notice, setNotice] = useState("Phase2.7 Chat GUI")
+  const [notice, setNotice] = useState("AI-LifeOS Chat")
   const [error, setError] = useState<string | null>(null)
   const viewportRef = useRef<HTMLDivElement | null>(null)
   const initializedRef = useRef(false)
@@ -230,7 +230,7 @@ function App() {
         <div className="flex h-14 items-center justify-between border-b border-border px-4">
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold">AI-LifeOS</div>
-            <div className="truncate text-xs text-muted-foreground">Phase2.7</div>
+            <div className="truncate text-xs text-muted-foreground">Chat GUI</div>
           </div>
           <Button variant="ghost" size="icon" onClick={refreshSessions} disabled={isBusy} title="更新">
             <RefreshCw className={cn("h-4 w-4", busy === "refreshing" && "animate-spin")} />
