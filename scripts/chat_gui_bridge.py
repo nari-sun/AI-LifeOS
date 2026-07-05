@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import traceback
@@ -14,6 +15,7 @@ from live_session import ROOT, LiveMessage, LiveSession, create_live_message, cr
 from session_store import cleanup_expired_sessions, get_session_organization, list_resumable_sessions, load_resume_session, save_session
 
 GUI_LOG_ENV = "AI_LIFEOS_GUI_LOG"
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class AssistantGenerationCancelled(RuntimeError):
@@ -347,8 +349,7 @@ def _required_request_id(value: Any) -> str:
 def _sanitize_request_id(value: str) -> str:
     if len(value) > 128:
         raise ValueError("request_id is too long.")
-    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
-    if any(char not in allowed for char in value):
+    if not REQUEST_ID_PATTERN.fullmatch(value):
         raise ValueError("request_id contains invalid characters.")
     return value
 
