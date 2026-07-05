@@ -40,6 +40,9 @@ imports/**
 !imports/
 !imports/.gitkeep
 
+# Local questionnaires and private answers
+questionnaire/
+
 # OS/editor
 .DS_Store
 Thumbs.db
