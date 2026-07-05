@@ -9,7 +9,19 @@ from codex_cli_options import add_codex_model_options
 from memory_index import ensure_memory_files, rebuild_index
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_COMMIT_PATHS = ("conversations", "journal", "memory", "inbox", "tasks")
+# PublicEdition keeps generated personal data local; commits only stage project files.
+DEFAULT_COMMIT_PATHS = (
+    ".gitignore",
+    "AGENTS.md",
+    "README.md",
+    "config",
+    "desktop",
+    "docs",
+    "prompts",
+    "scripts",
+    "templates",
+    "tests",
+)
 DEFAULT_MEMORY_CODEX_MODEL = "gpt-5.5"
 DEFAULT_MEMORY_CODEX_REASONING_EFFORT = "xhigh"
 
@@ -294,7 +306,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--date", help="保存日付を YYYY-MM-DD 形式で指定する")
     parser.add_argument("--keep-inbox", action="store_true", help="保存後も inbox/chat.txt を空にしない")
     parser.add_argument("--run-codex", action="store_true", help="保存後に Codex CLI を非対話で実行する")
-    parser.add_argument("--commit", action="store_true", help="保存・Codex実行後の変更をGit commitする")
+    parser.add_argument(
+        "--commit",
+        action="store_true",
+        help="保存・Codex実行後、公開用プロジェクトファイルだけをGit commitする",
+    )
     parser.add_argument("--codex-command", default="codex.cmd", help="実行するCodex CLIコマンド")
     parser.add_argument("--codex-model", default=DEFAULT_MEMORY_CODEX_MODEL, help="記憶整理に使うCodexモデル")
     parser.add_argument(
@@ -354,9 +370,9 @@ def main() -> int:
 
     if result.git:
         if result.git.committed:
-            print(f"\nGit commit したぞ: {result.git.message}")
+            print(f"\n公開用プロジェクトファイルをGit commitしたぞ: {result.git.message}")
         else:
-            print("\nGit commit対象の変更はなかったぞ。")
+            print("\n公開用Git commit対象の変更はなかったぞ。")
     else:
         print("\nGit commit はしていないぞ。")
     return 0

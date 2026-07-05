@@ -12,6 +12,9 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import finalize_live_chat  # noqa: E402
+import process_chat  # noqa: E402
+
+EXPECTED_GIT_ADD = ["git", "add", "--", *process_chat.DEFAULT_COMMIT_PATHS]
 
 
 class FinalizeLiveChatTests(unittest.TestCase):
@@ -118,7 +121,7 @@ class FinalizeLiveChatTests(unittest.TestCase):
             self.assertTrue((root / "memory" / "preferences.md").exists())
             self.assertTrue((root / "memory" / "projects.md").exists())
             self.assertTrue((root / "journal" / "2026" / "07").is_dir())
-            self.assertEqual(["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"], calls[1][0])
+            self.assertEqual(EXPECTED_GIT_ADD, calls[1][0])
             self.assertEqual([sys.executable, "scripts/privacy_check.py", "--staged"], calls[2][0])
 
     def test_session_datetime_falls_back_to_first_message_timestamp(self):

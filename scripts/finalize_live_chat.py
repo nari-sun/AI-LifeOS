@@ -102,7 +102,7 @@ def finalize_live_chat(
 
     git_result = None
     if commit:
-        _emit_progress(progress, 95, "Committing generated changes...")
+        _emit_progress(progress, 95, "Committing public project changes...")
         git_result = commit_changes(
             root=root,
             message=f"Finalize live chat {imported_at.strftime('%Y-%m-%d')}",
@@ -276,7 +276,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", help="Overwrite raw.md if it already exists.")
     parser.add_argument("--no-session-metadata", action="store_true", help="Do not write .session.json metadata.")
     parser.add_argument("--run-codex", action="store_true", help="Run the existing Phase2.5 Codex task after raw.md is created.")
-    parser.add_argument("--commit", action="store_true", help="Commit generated conversation, journal, memory, inbox, and tasks changes.")
+    parser.add_argument(
+        "--commit",
+        action="store_true",
+        help="Commit only public project files; generated conversations, journal, memory, inbox, and tasks stay local.",
+    )
     parser.add_argument("--codex-command", default="codex.cmd", help="Codex CLI command.")
     parser.add_argument("--codex-model", default=DEFAULT_MEMORY_CODEX_MODEL, help="Codex model for summary/journal/memory.")
     parser.add_argument(
@@ -330,7 +334,7 @@ def main() -> int:
     if result.codex:
         print("Codex task completed.")
     if result.git:
-        print("Git commit created." if result.git.committed else "No Git changes to commit.")
+        print("Public project Git commit created." if result.git.committed else "No Git changes to commit.")
 
     return 0
 

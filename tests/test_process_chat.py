@@ -16,6 +16,7 @@ process_chat = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = process_chat
 SPEC.loader.exec_module(process_chat)
+EXPECTED_GIT_ADD = ["git", "add", "--", *process_chat.DEFAULT_COMMIT_PATHS]
 
 
 class ProcessChatTests(unittest.TestCase):
@@ -194,10 +195,7 @@ class ProcessChatTests(unittest.TestCase):
             )
 
         self.assertTrue(result.committed)
-        self.assertEqual(
-            ["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"],
-            calls[0],
-        )
+        self.assertEqual(EXPECTED_GIT_ADD, calls[0])
         self.assertEqual([sys.executable, "scripts/privacy_check.py", "--staged"], calls[1])
         self.assertEqual(["git", "diff", "--cached", "--quiet"], calls[2])
         self.assertEqual(["git", "commit", "-m", "Process chat session 2026-06-28"], calls[3])
@@ -219,7 +217,7 @@ class ProcessChatTests(unittest.TestCase):
         self.assertFalse(result.committed)
         self.assertEqual(
             [
-                ["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"],
+                EXPECTED_GIT_ADD,
                 [sys.executable, "scripts/privacy_check.py", "--staged"],
                 ["git", "diff", "--cached", "--quiet"],
             ],
@@ -253,7 +251,7 @@ class ProcessChatTests(unittest.TestCase):
         self.assertEqual("codex.cmd", calls[0][0])
         self.assertEqual("gpt-5.5", calls[0][calls[0].index("--model") + 1])
         self.assertIn('model_reasoning_effort="xhigh"', calls[0])
-        self.assertEqual(["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"], calls[1])
+        self.assertEqual(EXPECTED_GIT_ADD, calls[1])
 
     def test_commit_changes_stops_when_privacy_check_fails(self):
         calls = []
@@ -274,7 +272,7 @@ class ProcessChatTests(unittest.TestCase):
 
         self.assertEqual(
             [
-                ["git", "add", "--", "conversations", "journal", "memory", "inbox", "tasks"],
+                EXPECTED_GIT_ADD,
                 [sys.executable, "scripts/privacy_check.py", "--staged"],
             ],
             calls,

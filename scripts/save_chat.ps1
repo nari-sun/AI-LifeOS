@@ -2,7 +2,8 @@
 param(
     [string]$Date,
     [switch]$KeepInbox,
-    [switch]$SkipCodex
+    [switch]$SkipCodex,
+    [switch]$CommitPublicChanges
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,7 +19,7 @@ if (-not $PythonCommand) {
     throw "python command was not found. Install Python 3 and make sure python is on PATH."
 }
 
-$ProcessArgs = @("scripts/process_chat.py", "--commit")
+$ProcessArgs = @("scripts/process_chat.py")
 if ($Date) {
     $ProcessArgs += @("--date", $Date)
 }
@@ -27,6 +28,9 @@ if ($KeepInbox) {
 }
 if (-not $SkipCodex) {
     $ProcessArgs += "--run-codex"
+}
+if ($CommitPublicChanges) {
+    $ProcessArgs += "--commit"
 }
 
 & python @ProcessArgs

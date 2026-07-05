@@ -44,7 +44,7 @@ Phase1 は完了済みです。
 * process_chat.py で raw.md を conversations 配下に保存
 * process_chat.py で raw.md と Codex 用タスクを生成する運用
 * codex.cmd exec で summary / journal / memory 更新を非対話実行する運用
-* 保存から Codex 実行、Git commit までを save_chat.ps1 で実行する運用
+* 保存から Codex 実行までを save_chat.ps1 で実行する運用
 * Phase2.6 の会話専用MVPを実装済み
 * Phase2.6 の live JSONL から raw.md への変換を実装済み
 * Phase2.6 の live会話から既存Phase2.5記憶整理への接続を実装済み
@@ -64,7 +64,7 @@ Phase1 は完了済みです。
 * .env は使わない
 * ChatGPT Plus / Codex CLI 側を使う
 * Phase2.5 では自動実行を進めるが、必要に応じて SourceTree や git diff で確認できる状態を保つ
-* save_chat.ps1 は保存、Codex実行、Git commit まで自動で行う
+* save_chat.ps1 は保存、Codex実行まで自動で行い、Git commit は -CommitPublicChanges を明示した場合だけ公開用プロジェクトファイルを対象に行う
 * Phase2.6 では会話中に自由なファイル操作をさせず、/exit または Ctrl+C の終了処理で既存スクリプト経由の整理処理を行う
 * Phase2.65 では /resume で過去10日以内の会話セッションを再開できるようにし、10日超の削除は明示コマンドに限定する
 * Phase2.7 ではPhase2.6の会話エンジンとPhase2.65のセッション保存処理を薄く包むGUIを作り、検索機能や多機能化はPhase3以降に分ける
@@ -73,6 +73,8 @@ Phase1 は完了済みです。
 * Phase3 の会話中memory contextは `memory/long_term.md` と `memory/preferences.md` を優先し、必要に応じて `journal` を検索する
 * Phase3 の検索・回答用コンテキスト生成では、`memory` / `journal` / `conversations` を勝手に編集しない
 * Phase3 ではベクトルDBを本番導入せず、SQLite検索で足りない理由が明確になった場合に再評価する
+* PublicEdition では `conversations` / `journal` / `memory` / `inbox` / `tasks` などの個人データ・生成物を原則Git管理しない
+* PublicEdition の自動commit対象は `scripts` / `prompts` / `docs` / `desktop` / `config` / `templates` / `tests` / `README.md` / `AGENTS.md` / `.gitignore` など公開用プロジェクトファイルに限定する
 
 ---
 
@@ -182,8 +184,8 @@ Phase2.5 までの基本フロー:
 5. tasks/latest_codex_task.md が作成される
 6. codex.cmd exec が latest_codex_task.md の内容を非対話で処理する
 7. Codex が summary.md / journal / memory を更新する
-8. conversations / journal / memory / inbox / tasks を git add する
-9. 変更があれば git commit する
+8. 必要に応じて公開用プロジェクトファイルだけを git add する
+9. 変更があれば git commit する。個人データはPublicEditionではcommitしない
 ```
 
 Phase2.6 で追加予定の会話専用MVPフロー:
@@ -195,7 +197,7 @@ Phase2.6 で追加予定の会話専用MVPフロー:
 4. /exit または Ctrl+C で会話を終了する
 5. /exit または Ctrl+C の終了処理で JSONL を conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md に変換する
 6. 終了処理で既存Phase2.5処理を実行し summary.md / journal / memory を更新する
-7. 必要に応じて --commit-on-exit または別コマンドで Git commit する
+7. 必要に応じて --commit-on-exit または別コマンドで公開用プロジェクトファイルだけ Git commit する
 ```
 
 Phase2.65 で追加予定のSession Save / Resume MVPフロー:
@@ -223,7 +225,7 @@ Phase2.7 で追加予定のChat GUI MVPフロー:
 8. finalize_live_chat.py を実行する
 9. raw.md を生成する
 10. 既存Phase2.5処理で summary / journal / memory を生成する
-11. 必要に応じて Git commit する
+11. 必要に応じて公開用プロジェクトファイルだけ Git commit する
 ```
 
 Phase3 で追加済みのSearchable Memoryフロー:
@@ -341,13 +343,13 @@ Phase2.5 では、Phase2.0 の半自動運用をより安全に自動化しま�
 * summary.md のテンプレート統一
 * journal の追記ルール統一
 * memory 更新ルールの厳格化
-* SourceTree確認もできるが、通常運用では save_chat.ps1 で最後まで実行する
+* SourceTree確認もできるが、通常運用では save_chat.ps1 で保存からCodex実行まで行う
 
 自動化時の注意:
 
 * memory/long_term.md は重要な記憶なので、AIの誤追記を防ぐ必要がある
 * 会話ログにないことを書かないプロンプトを維持する
-* Git commit 対象は conversations / journal / memory / inbox / tasks に限定する
+* PublicEdition の Git commit 対象は公開用プロジェクトファイルに限定し、conversations / journal / memory / inbox / tasks の個人データ・生成物は対象にしない
 * 不安な場合は python scripts\process_chat.py だけを実行して手動確認に戻せるようにする
 
 ---
@@ -376,7 +378,7 @@ Phase2.6 は Phase3 の検索機能へ進む前の実験フェーズとして扱
 * 会話は逐次ローカル保存する
 * 普段の会話ではファイル操作をさせない
 * ファイル操作、要約、日記、メモリ更新は会話終了時の既存スクリプト経由で行う
-* Git commit は --commit-on-exit または明示コマンドで行う
+* Git commit は --commit-on-exit または明示コマンドで行い、PublicEditionでは公開用プロジェクトファイルだけを対象にする
 * 既存の inbox/chat.txt 運用は壊さない
 
 ### 作りたいもの
@@ -446,7 +448,7 @@ conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md
 ↓
 既存Phase2.5処理
 ↓
-summary.md / journal / memory / git commit
+summary.md / journal / memory / 公開用Git commit
 ```
 
 要件:
@@ -473,7 +475,7 @@ Phase2.6の会話中、Codexには原則として自由なファイル操作を�
 * 会話ログJSONLへの追記
 * 会話終了時の自動 finalize 処理
 * 既存Phase2.5のsummary/journal/memory生成スクリプト呼び出し
-* ユーザーが --commit-on-exit または別コマンドで明示した場合のみGit commit
+* ユーザーが --commit-on-exit または別コマンドで明示した場合のみ、公開用プロジェクトファイルをGit commit
 
 禁止:
 
@@ -554,7 +556,7 @@ scripts/codex_conversation.py
 * /exitで終了する
 * /exit または Ctrl+C の終了時に finalize_live_chat.py 相当の処理を行う
 * 会話中のファイル更新やGit commitはしない
-* Git commitは --commit-on-exit または別コマンドで明示した時だけ行う
+* Git commitは --commit-on-exit または別コマンドで明示した時だけ行い、PublicEditionでは公開用プロジェクトファイルだけを対象にする
 
 #### Step 4: live JSONLをraw.md化する
 
@@ -592,7 +594,7 @@ raw.md生成
 ↓
 summary.md / journal / memory 更新
 ↓
-必要に応じて --commit-on-exit または別コマンドでGit commit
+必要に応じて --commit-on-exit または別コマンドで公開用プロジェクトファイルだけGit commit
 ```
 
 ### Phase3との関係
@@ -627,7 +629,7 @@ Phase2.7 のGUIに進む前に、CLIでもGUIでも使えるセッション保�
 * 10日を超えたセッションは削除候補にできるが、自動削除はしない
 * 実削除は `prune --delete` のような明示コマンドに限定する
 * memory / journal / summary は会話再開中に勝手に編集しない
-* Git commit はユーザー明示操作または既存スクリプト経由にする
+* Git commit はユーザー明示操作または既存スクリプト経由にし、PublicEditionでは公開用プロジェクトファイルだけを対象にする
 
 ### 作りたいもの
 
@@ -745,9 +747,9 @@ Phase2.7 は Phase3 の検索機能とは分離し、今後の会話をGUIから
 * 保存済みセッションは Phase2.65 の `.session.json` で扱う
 * 10日以内のセッションをGUIから再開できるようにする
 * 会話終了後に finalize_live_chat.py で raw.md 化できるようにする
-* summary / journal / memory / Git commit は既存Phase2.5処理に接続する
+* summary / journal / memory / 公開用Git commit は既存Phase2.5処理に接続する
 * memory/long_term.md を会話中に勝手に編集しない
-* Git commit はユーザー明示操作または既存スクリプト経由にする
+* Git commit はユーザー明示操作または既存スクリプト経由にし、PublicEditionでは公開用プロジェクトファイルだけを対象にする
 * Phase3の検索機能とは分離する
 
 ### 決定事項
@@ -804,7 +806,7 @@ raw.md生成
 ↓
 既存Phase2.5処理で summary / journal / memory 生成
 ↓
-Git commit
+公開用Git commit
 ```
 
 ### 採用技術スタック
@@ -899,7 +901,7 @@ raw.md
 ↓
 summary.md / journal / memory
 ↓
-Git commit
+公開用Git commit
 ```
 
 初期MVPでは、ボタン押下時にコマンドを表示するだけでもよいです。いきなり破壊的な自動実行をしないでください。
@@ -1443,10 +1445,16 @@ Codexは以下のルールを守ること。
 
 ## Common Commands
 
-保存、Codex実行、Git commit:
+保存、Codex実行:
 
 ```powershell
 .\scripts\save_chat.ps1
+```
+
+保存、Codex実行、公開用プロジェクトファイルのGit commit:
+
+```powershell
+.\scripts\save_chat.ps1 -CommitPublicChanges
 ```
 
 raw.md と Codex 用タスクだけ保存:
@@ -1455,7 +1463,7 @@ raw.md と Codex 用タスクだけ保存:
 python scripts\process_chat.py
 ```
 
-Pythonだけで最後まで実行:
+Pythonだけで記憶整理と公開用commitまで実行:
 
 ```powershell
 python scripts\process_chat.py --run-codex --commit
@@ -1552,10 +1560,10 @@ git status
 git diff
 ```
 
-ステージング:
+公開用プロジェクトファイルのステージング:
 
 ```powershell
-git add .
+git add -- scripts prompts docs desktop config templates tests README.md AGENTS.md .gitignore
 ```
 
 コミット:
@@ -1588,10 +1596,10 @@ Phase2.0 の完了条件:
 
 Phase2.5 の完了条件:
 
-* save_chat.ps1 で raw.md 保存、Codex実行、summary/journal/memory更新、Git commit まで実行できる
+* save_chat.ps1 で raw.md 保存、Codex実行、summary/journal/memory更新まで実行できる
 * process_chat.py が --run-codex と --commit を扱える
 * Codex失敗時にGit commitしない
-* Git commit対象が conversations / journal / memory / inbox / tasks に限定されている
+* PublicEditionのGit commit対象が公開用プロジェクトファイルに限定され、conversations / journal / memory / inbox / tasks の個人データ・生成物を対象にしない
 * python -m unittest が通る
 
 Phase2.6 の完了条件:

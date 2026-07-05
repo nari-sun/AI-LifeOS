@@ -38,7 +38,7 @@ summary.md / journal / memory are updated by the existing Phase2.5 prompt
 `codex_conversation.py` automatically runs the finalize and Phase2.5 memory-processing step on exit.
 During exit processing, the CLI shows a spinner and stage-based percentage. The percentage reflects AI-LifeOS workflow stages, not Codex model-internal progress.
 
-Git commit remains explicit:
+Git commit remains explicit and only targets public project files in PublicEdition:
 
 ```powershell
 python scripts\codex_conversation.py --commit-on-exit
@@ -136,7 +136,7 @@ Start live chat and create only `raw.md` on exit:
 python scripts\codex_conversation.py --no-process-on-exit
 ```
 
-Start live chat and commit generated changes on exit:
+Start live chat and commit public project file changes on exit:
 
 ```powershell
 python scripts\codex_conversation.py --commit-on-exit
@@ -168,7 +168,7 @@ Finalize and run existing memory processing:
 python scripts\finalize_live_chat.py --run-codex
 ```
 
-Finalize, run memory processing, and commit:
+Finalize, run memory processing, and commit public project file changes:
 
 ```powershell
 python scripts\finalize_live_chat.py --run-codex --commit
@@ -183,7 +183,7 @@ python scripts\finalize_live_chat.py --run-codex --commit
 - `finalize_live_chat.py` does not delete or move the original JSONL.
 - `--no-finalize-on-exit` disables automatic exit finalization.
 - `--no-process-on-exit` writes `raw.md` but skips summary / journal / memory updates.
-- `--commit-on-exit` is explicit and uses the existing privacy check inside `process_chat.commit_changes`.
+- `--commit-on-exit` is explicit, uses the existing privacy check inside `process_chat.commit_changes`, and does not commit generated conversation, journal, memory, inbox, or task files in PublicEdition.
 
 ## Completion Criteria
 

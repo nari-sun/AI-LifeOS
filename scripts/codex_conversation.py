@@ -99,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--commit-on-exit",
         action="store_true",
-        help="After finalizing and processing on exit, commit the generated changes.",
+        help="After finalizing and processing on exit, commit only public project file changes.",
     )
     parser.add_argument(
         "--no-exit-progress",
@@ -575,7 +575,7 @@ def finish_session(
     if result.codex:
         parts.append("Updated summary/journal/memory.")
     if result.git:
-        parts.append("Committed changes." if result.git.committed else "No Git changes to commit.")
+        parts.append("Committed public project changes." if result.git.committed else "No Git changes to commit.")
 
     _debug_log(root, "finish_session.success")
     return True, " ".join(parts), result

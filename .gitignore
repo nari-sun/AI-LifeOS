@@ -32,7 +32,9 @@ memory/**
 !memory/
 !memory/.gitkeep
 
-tasks/latest_codex_task.md
+tasks/**
+!tasks/
+!tasks/.gitkeep
 inbox/chat.txt
 inbox/live/**
 
@@ -42,6 +44,9 @@ imports/**
 
 # Local questionnaires and private answers
 questionnaire/
+
+# Local renovation tickets
+renovationTickets/
 
 # OS/editor
 .DS_Store

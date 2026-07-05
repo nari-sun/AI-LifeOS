@@ -16,7 +16,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 ## Current Status
 
 - Phase1: Local Archive は完了済み
-- Phase2.5: `inbox/chat.txt` から raw.md / summary / journal / memory / Git commit までの安全な自動化を実装済み
+- Phase2.5: `inbox/chat.txt` から raw.md / summary / journal / memory までの安全な自動化と、公開用ファイル限定のGit commitを実装済み
 - Phase2.6: PowerShell上の live conversation CLI、JSONL逐次保存、終了時finalizeを実装済み
 - Phase2.65: `.session.json` によるセッション保存、10日以内の resume、dry-run prune を実装済み
 - Phase2.7: Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の Chat GUI MVP を実装済み
@@ -27,7 +27,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - `inbox/chat.txt` に貼った会話を `conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md` として保存する
 - 保存した会話ごとに Codex 用タスク `tasks/latest_codex_task.md` を生成する
 - `codex.cmd exec` で `summary.md`、`journal`、`memory/long_term.md` を更新する
-- `scripts/save_chat.ps1` で保存、Codex実行、Git commitまでまとめて実行する
+- `scripts/save_chat.ps1` で保存とCodex実行をまとめて実行する
 - PowerShell上で live 会話を行い、`inbox/live/*.jsonl` に user / assistant 発言を逐次保存する
 - live JSONLを raw.md に変換し、既存の Phase2.5 記憶整理へ接続する
 - live 会話セッションを `.session.json` として保存し、最後のuser入力から10日以内のセッションを再開する
@@ -131,6 +131,31 @@ AI-LifeOS/
    └─ test_session_store.py
 ```
 
+## PublicEdition の Git 管理方針
+
+PublicEdition では、会話ログや記憶ファイルなどの個人データを原則Git管理しません。
+
+Git管理するもの:
+
+- `scripts/`, `prompts/`, `docs/`, `desktop/`, `config/`, `templates/`, `tests/`
+- `README.md`, `AGENTS.md`, `.gitignore`
+- 空ディレクトリ維持用の `.gitkeep`
+
+Git管理しないもの:
+
+- `conversations/**`
+- `journal/**`
+- `memory/**`
+- `inbox/chat.txt`
+- `inbox/live/**`
+- `tasks/**`
+- `logs/*`
+- `imports/**`
+- `questionnaire/`
+- `renovationTickets/`
+
+個人データもGitで残したい場合は、PublicEditionではなくPrivateEditionやローカル専用運用として、`.gitignore` と commit 対象を明示的に変えて扱います。
+
 ## 基本フロー
 
 ### inbox/chat.txt 運用
@@ -148,7 +173,7 @@ tasks/latest_codex_task.md を作成
 ↓
 Codexが summary / journal / memory を更新
 ↓
-対象ファイルをGit commit
+必要な場合だけ公開用プロジェクトファイルをGit commit
 ```
 
 ### live CLI 運用
@@ -166,7 +191,7 @@ raw.md に変換
 ↓
 summary / journal / memory を更新
 ↓
-必要なら --commit-on-exit でGit commit
+必要なら --commit-on-exit で公開用プロジェクトファイルだけGit commit
 ```
 
 会話中は `journal`、`memory/long_term.md`、Git commit を実行しません。記憶整理は終了時の finalize 処理に限定します。
@@ -239,21 +264,21 @@ python scripts\process_chat.py --date 2026-06-28
 
 指定した日付で `conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md` を作成します。時刻部分は実行時刻を使います。
 
-### Pythonだけで保存からcommitまで実行する
+### Pythonだけで保存、記憶整理、公開用commitを実行する
 
 ```powershell
 python scripts\process_chat.py --run-codex --commit
 ```
 
-`raw.md` 作成後に Codex CLI で記憶整理を実行し、`conversations`、`journal`、`memory`、`inbox`、`tasks` を対象にGit commitします。
+`raw.md` 作成後に Codex CLI で記憶整理を実行します。`--commit` は `scripts`、`prompts`、`docs`、`desktop`、`config`、`templates`、`tests`、`README.md`、`AGENTS.md`、`.gitignore` など公開用プロジェクトファイルだけをGit commit対象にします。会話ログ、journal、memory、inbox、task生成物は `.gitignore` に従ってローカルに残します。
 
-### PowerShellから保存、Codex実行、commitまで実行する
+### PowerShellから保存、Codex実行をまとめて実行する
 
 ```powershell
 .\scripts\save_chat.ps1
 ```
 
-内部で `python scripts\process_chat.py --run-codex --commit` を実行します。Codexが失敗した場合はGit commitしません。
+内部で `python scripts\process_chat.py --run-codex` を実行します。通常はGit commitしません。
 
 オプション:
 
@@ -261,7 +286,10 @@ python scripts\process_chat.py --run-codex --commit
 .\scripts\save_chat.ps1 -KeepInbox
 .\scripts\save_chat.ps1 -Date 2026-06-28
 .\scripts\save_chat.ps1 -SkipCodex
+.\scripts\save_chat.ps1 -CommitPublicChanges
 ```
+
+`-CommitPublicChanges` を付けた場合だけ、公開用プロジェクトファイルをGit commit対象にします。個人データは対象にしません。
 
 ### live会話CLIを起動する
 
@@ -465,7 +493,7 @@ python -m unittest
 - Codex CLI用コマンドが組み立てられる
 - live会話JSONLが保存される
 - live JSONLを raw.md に変換できる
-- finalize後にCodex実行とcommitへ接続できる
+- finalize後にCodex実行と公開用commitへ接続できる
 - session save / list / resume-list / prune が動く
 - 10日以内のセッションだけを resume 候補にする
 - CLIの `/resume` が番号選択に対応する
@@ -502,6 +530,8 @@ Get-Content -Raw -Encoding UTF8 tasks\latest_codex_task.md
 
 Codex用プロンプトの元ファイルは `prompts/codex_phase2_prompt.md` です。
 
+これらの会話ログ・記憶ファイル・検索indexはPublicEditionではGit管理しません。
+
 ## 方針
 
 - 会話ログにないことは記録しない
@@ -512,6 +542,6 @@ Codex用プロンプトの元ファイルは `prompts/codex_phase2_prompt.md` �
 - live会話中に `journal` や `memory/long_term.md` を勝手に編集しない
 - 10日超セッションは自動削除しない
 - Git commit はユーザー明示操作、または既存スクリプトの明示オプション経由にする
-- 自動commit対象は `conversations`、`journal`、`memory`、`inbox`、`tasks` に限定する
+- PublicEdition の自動commit対象は公開用プロジェクトファイルに限定し、`conversations`、`journal`、`memory`、`inbox`、`tasks` はGit管理しない
 - SQLite index は再生成可能な派生データとして扱い、Git管理しない
 - ベクトル検索とMCP連携は、Phase3の検索基盤の上で必要性を確認してから扱う
