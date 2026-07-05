@@ -130,3 +130,22 @@ logs/chat_gui_bridge.log
 `chat_gui_tauri.log` は Tauri 側から Python ブリッジを呼ぶ前後の状態、終了コード、起動失敗を記録します。
 
 `chat_gui_bridge.log` は Python ブリッジ側のコマンド開始・完了・エラー種別を記録します。会話本文は書かず、文字数、session id、件数などの診断情報だけを残します。
+
+## RT-0008 Chat GUI UX
+
+RT-0008 では、日常的な ChatGPT 風利用に近づけるため、Chat GUI に以下を追加します。
+
+* 返答生成中、停止要求中、失敗、完了の状態表示
+* 返答生成の停止ボタン
+* assistant 返答全体のコピー
+* fenced code block の読みやすい表示とコード単位のコピー
+* エラー時の入力欄への復元、セッション一覧更新、新規チャットへの誘導
+
+停止はストリーミング停止ではありません。既存の GUI は Tauri command から `scripts/chat_gui_bridge.py` を呼び、bridge が `codex.cmd exec` を待つ構造です。そのため RT-0008 では、GUI が `request_id` 付きで送信し、停止ボタンが `cancel-message` を呼んで `logs/chat_gui_cancel/*.cancel` を作成します。bridge は生成中にその cancel file を監視し、検知した場合は Codex CLI のプロセスツリーを停止して assistant 返答を保存しません。
+
+制約:
+
+* user 発言は Codex 呼び出し前に live JSONL へ保存されるため、停止しても user 発言は残ります。
+* エラー時の「入力に戻す」は再送信ではありません。JSONLへの重複保存を避けるため、直前入力を下書きとして戻し、必要ならユーザーが修正して新規メッセージとして送信します。
+* Codex CLI や OS 側の都合でプロセス停止に時間がかかる場合、GUI は「停止中」と表示して bridge の終了を待ちます。
+* token 単位のストリーミング表示は、現行の `codex.cmd exec --output-last-message` 方式では未実装です。必要になった場合は Codex SDK または app-server への置き換えを別 RT で検討します。

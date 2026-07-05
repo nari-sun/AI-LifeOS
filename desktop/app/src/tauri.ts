@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 
 import type {
+  CancelMessageResult,
   CleanupExpiredResult,
   FinalizeSessionResult,
   ListResumableResult,
@@ -22,12 +23,21 @@ export async function startSession() {
   return invoke<StartSessionResult>("start_session", { payload: defaultPayload })
 }
 
-export async function sendMessage(sessionFile: string | null, content: string) {
+export async function sendMessage(sessionFile: string | null, content: string, requestId: string) {
   return invoke<SendMessageResult>("send_message", {
     payload: {
       ...defaultPayload,
       session_file: sessionFile,
       content,
+      request_id: requestId,
+    },
+  })
+}
+
+export async function cancelMessage(requestId: string) {
+  return invoke<CancelMessageResult>("cancel_message", {
+    payload: {
+      request_id: requestId,
     },
   })
 }

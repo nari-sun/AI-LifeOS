@@ -1,13 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react"
+import type { ReactNode } from "react"
 import {
+  AlertTriangle,
   Archive,
   Bot,
   CheckCircle2,
+  Clipboard,
+  ClipboardCheck,
   Loader2,
   MessageSquarePlus,
   RefreshCw,
   RotateCcw,
   Send,
+  Square,
   User,
 } from "lucide-react"
 
@@ -16,7 +21,7 @@ import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
 import {
-  cleanupExpiredSessions,
+  cancelMessage,
   finalizeSession,
   isTauriRuntime,
   listResumableSessions,
@@ -26,16 +31,26 @@ import {
 } from "@/tauri"
 import type { ChatMessage, ResumeSession, SessionFile, SessionOrganization } from "@/types"
 
-type BusyState = "idle" | "starting" | "sending" | "resuming" | "finalizing" | "refreshing" | "cleaning"
+type BusyState = "idle" | "starting" | "generating" | "stopping" | "resuming" | "finalizing" | "refreshing"
+type ReplyState = "idle" | "generating" | "stopping" | "stopped" | "failed" | "completed"
 
 const busyLabel: Record<BusyState, string> = {
   idle: "",
   starting: "起動中",
-  sending: "送信中",
+  generating: "生成中",
+  stopping: "停止中",
   resuming: "再開中",
   finalizing: "整理中",
   refreshing: "更新中",
-  cleaning: "期限切れ整理中",
+}
+
+const replyStateLabel: Record<ReplyState, string> = {
+  idle: "待機中",
+  generating: "生成中",
+  stopping: "停止要求中",
+  stopped: "停止済み",
+  failed: "失敗",
+  completed: "完了",
 }
 
 function App() {
@@ -44,13 +59,20 @@ function App() {
   const [sessions, setSessions] = useState<ResumeSession[]>([])
   const [input, setInput] = useState("")
   const [busy, setBusy] = useState<BusyState>("idle")
+  const [replyState, setReplyState] = useState<ReplyState>("idle")
   const [notice, setNotice] = useState("AI-LifeOS Chat")
   const [error, setError] = useState<string | null>(null)
+  const [lastSubmittedText, setLastSubmittedText] = useState("")
+  const [activeRequestId, setActiveRequestId] = useState<string | null>(null)
   const viewportRef = useRef<HTMLDivElement | null>(null)
   const initializedRef = useRef(false)
+  const activeRequestIdRef = useRef<string | null>(null)
 
   const isBusy = busy !== "idle"
+  const isGenerating = busy === "generating" || busy === "stopping"
   const canSend = input.trim().length > 0 && !isBusy
+  const canStop = busy === "generating" && activeRequestId !== null
+  const canRestoreInput = lastSubmittedText.trim().length > 0 && !isBusy
   const organization = session?.organization ?? null
   const canFinalize = Boolean(session && organization?.can_organize && !isBusy)
   const finalizeButtonLabel = getFinalizeButtonLabel(organization)
@@ -70,7 +92,7 @@ function App() {
     initializedRef.current = true
 
     if (!isTauriRuntime()) {
-      setError("Tauri環境で起動してください。")
+      setError("Tauri 環境で起動してください。")
       return
     }
 
@@ -82,87 +104,145 @@ function App() {
     if (node) {
       node.scrollTop = node.scrollHeight
     }
-  }, [messages])
+  }, [messages, isGenerating])
 
   async function initialize() {
     setBusy("starting")
+    setReplyState("idle")
     setError(null)
     try {
       const [sessionResult, listResult] = await Promise.all([startSession(), listResumableSessions()])
       setSession(sessionResult.session)
       setMessages(sessionResult.messages)
       setSessions(listResult.sessions)
-      setNotice("新規セッションを開始しました")
-      setBusy("cleaning")
-      const cleanupResult = await cleanupExpiredSessions()
-      if (cleanupResult.results.length > 0) {
-        const failed = cleanupResult.results.filter((result) => result.error).length
-        const deleted = cleanupResult.results.reduce((count, result) => count + result.deleted_paths.length, 0)
-        setNotice(failed > 0 ? `期限切れ整理に失敗があります: ${failed}件` : `期限切れセッションを整理しました: ${deleted}件削除`)
-        const refreshed = await listResumableSessions()
-        setSessions(refreshed.sessions)
-      }
+      setNotice("新規セッションを開始しました。")
     } catch (err) {
-      setError(formatError(err))
+      setReplyState("failed")
+      setError(withNextAction(formatError(err)))
     } finally {
       setBusy("idle")
     }
   }
 
   async function refreshSessions() {
+    if (isBusy) {
+      return
+    }
+
     setBusy("refreshing")
     setError(null)
     try {
       const result = await listResumableSessions()
       setSessions(result.sessions)
-      setNotice("セッション一覧を更新しました")
+      setNotice("セッション一覧を更新しました。")
     } catch (err) {
-      setError(formatError(err))
+      setReplyState("failed")
+      setError(withNextAction(formatError(err)))
     } finally {
       setBusy("idle")
     }
   }
 
   async function createSession() {
+    if (isBusy) {
+      return
+    }
+
     setBusy("starting")
+    setReplyState("idle")
     setError(null)
     try {
       const result = await startSession()
       setSession(result.session)
       setMessages(result.messages)
       setInput("")
-      setNotice("新規セッションを開始しました")
+      setNotice("新規セッションを開始しました。")
       await refreshSessionsAfterAction()
     } catch (err) {
-      setError(formatError(err))
+      setReplyState("failed")
+      setError(withNextAction(formatError(err)))
     } finally {
       setBusy("idle")
     }
   }
 
-  async function submitMessage() {
-    const content = input.trim()
+  async function submitMessage(overrideContent?: string) {
+    const content = (overrideContent ?? input).trim()
     if (!content || isBusy) {
       return
     }
 
-    setBusy("sending")
+    const requestId = createRequestId()
+    activeRequestIdRef.current = requestId
+    setActiveRequestId(requestId)
+    setBusy("generating")
+    setReplyState("generating")
     setError(null)
     setInput("")
+    setLastSubmittedText(content)
+    setNotice("返答を生成しています。停止ボタンで中断できます。")
+
     try {
-      const result = await sendMessage(session?.jsonl_file ?? null, content)
+      const result = await sendMessage(session?.jsonl_file ?? null, content, requestId)
+      if (activeRequestIdRef.current !== requestId) {
+        return
+      }
+
       setSession(result.session)
       setMessages(result.messages)
-      setNotice(result.assistant ? "返答を保存しました" : "入力を保存しました")
-      if (result.error) {
-        setError(result.error)
+      if (result.cancelled) {
+        setReplyState("stopped")
+        setNotice("返答生成を停止しました。ユーザー発言は live JSONL に保存されています。")
+      } else if (result.error) {
+        setReplyState("failed")
+        setError(withNextAction(result.error))
+        setNotice("返答生成に失敗しました。")
+      } else {
+        setReplyState("completed")
+        setNotice(result.assistant ? "返答を保存しました。" : "入力を保存しました。")
       }
       await refreshSessionsAfterAction()
     } catch (err) {
-      setError(formatError(err))
+      if (activeRequestIdRef.current === requestId) {
+        setReplyState("failed")
+        setError(withNextAction(formatError(err)))
+        setNotice("返答生成に失敗しました。")
+      }
     } finally {
-      setBusy("idle")
+      if (activeRequestIdRef.current === requestId) {
+        activeRequestIdRef.current = null
+        setActiveRequestId(null)
+        setBusy("idle")
+      }
     }
+  }
+
+  async function stopGeneration() {
+    if (!canStop || !activeRequestId) {
+      return
+    }
+
+    setBusy("stopping")
+    setReplyState("stopping")
+    setNotice("停止要求を送信しています。")
+    setError(null)
+    try {
+      await cancelMessage(activeRequestId)
+      setNotice("停止要求を送信しました。Codex CLI の終了を待っています。")
+    } catch (err) {
+      setBusy("generating")
+      setReplyState("generating")
+      setError(`停止要求に失敗しました: ${formatError(err)}\n次の操作: 生成完了を待つか、アプリを再起動してください。`)
+    }
+  }
+
+  function restoreLastSubmittedText() {
+    if (!canRestoreInput) {
+      return
+    }
+    setInput(lastSubmittedText)
+    setError(null)
+    setNotice("直前の入力を入力欄へ戻しました。必要なら修正して新規メッセージとして送信してください。")
   }
 
   async function loadSession(sessionId: string) {
@@ -171,14 +251,16 @@ function App() {
     }
 
     setBusy("resuming")
+    setReplyState("idle")
     setError(null)
     try {
       const result = await resumeSession(sessionId)
       setSession(result.session)
       setMessages(result.messages)
-      setNotice("セッションを再開しました")
+      setNotice("セッションを再開しました。")
     } catch (err) {
-      setError(formatError(err))
+      setReplyState("failed")
+      setError(withNextAction(formatError(err)))
     } finally {
       setBusy("idle")
     }
@@ -188,7 +270,7 @@ function App() {
     if (!session || !organization?.can_organize || isBusy) {
       return
     }
-    const confirmed = window.confirm("raw.md作成、記憶整理、検索index更新を実行します。時間がかかる場合があります。")
+    const confirmed = window.confirm("raw.md 作成、記憶整理、検索 index 更新を実行します。時間がかかる場合があります。")
     if (!confirmed) {
       return
     }
@@ -201,7 +283,8 @@ function App() {
       setNotice(result.organization.is_organized ? `整理済み: ${result.raw_file}` : result.organization.label)
       await refreshSessionsAfterAction()
     } catch (err) {
-      setError(formatError(err))
+      setReplyState("failed")
+      setError(withNextAction(formatError(err)))
     } finally {
       setBusy("idle")
     }
@@ -296,6 +379,7 @@ function App() {
                 {busyLabel[busy]}
               </Badge>
             )}
+            <Badge variant={replyState === "failed" ? "outline" : "secondary"}>{replyStateLabel[replyState]}</Badge>
             <Badge variant={organization?.is_organized ? "secondary" : "outline"}>{statusLabel}</Badge>
             <Button variant="outline" onClick={finalizeCurrentSession} disabled={!canFinalize}>
               <Archive className="h-4 w-4" />
@@ -305,20 +389,26 @@ function App() {
         </header>
 
         <div className="border-b border-border bg-muted/40 px-4 py-2">
-          <div className="flex min-h-6 flex-wrap items-center gap-2 text-sm">
-            <div className="flex min-w-0 items-center gap-2">
-              {error ? (
-                <>
-                  <RotateCcw className="h-4 w-4 shrink-0 text-destructive" />
-                  <span className="break-words text-destructive">{error}</span>
-                </>
-              ) : (
-                <>
-                  <CheckCircle2 className="h-4 w-4 shrink-0 text-primary" />
-                  <span className="break-words text-muted-foreground">{notice}</span>
-                </>
-              )}
-            </div>
+          <div className="flex min-h-8 flex-wrap items-center gap-2 text-sm">
+            {error ? (
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0 text-destructive" />
+                <span className="min-w-0 flex-1 whitespace-pre-wrap break-words text-destructive">{error}</span>
+                <Button type="button" size="sm" variant="outline" onClick={restoreLastSubmittedText} disabled={!canRestoreInput}>
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  入力に戻す
+                </Button>
+                <Button type="button" size="sm" variant="ghost" onClick={() => void refreshSessions()} disabled={isBusy}>
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  一覧更新
+                </Button>
+              </div>
+            ) : (
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-primary" />
+                <span className="min-w-0 break-words text-muted-foreground">{notice}</span>
+              </div>
+            )}
             {organization && <OrganizeStages organization={organization} running={busy === "finalizing"} />}
           </div>
           {organization?.last_error && !error && (
@@ -335,6 +425,7 @@ function App() {
             ) : (
               messages.map((message, index) => <MessageBubble key={`${message.timestamp}-${index}`} message={message} />)
             )}
+            {isGenerating && <GeneratingRow stopping={busy === "stopping"} />}
           </div>
         </div>
 
@@ -350,13 +441,19 @@ function App() {
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={handleInputKeyDown}
-              disabled={isBusy}
-              placeholder="メッセージを入力"
+              disabled={busy === "starting" || busy === "resuming" || busy === "finalizing" || busy === "refreshing"}
+              placeholder={isGenerating ? "生成中でも次の入力を下書きできます" : "メッセージを入力"}
               className="max-h-44 min-h-20 resize-none"
             />
-            <Button type="submit" size="icon" disabled={!canSend} title="送信">
-              {busy === "sending" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-            </Button>
+            {isGenerating ? (
+              <Button type="button" size="icon" variant="destructive" onClick={stopGeneration} disabled={!canStop} title="返答生成を停止">
+                {busy === "stopping" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
+              </Button>
+            ) : (
+              <Button type="submit" size="icon" disabled={!canSend} title="送信">
+                <Send className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         </form>
       </section>
@@ -380,7 +477,12 @@ function MessageBubble({ message }: { message: ChatMessage }) {
             isUser ? "bg-primary text-primary-foreground" : "border border-border bg-surface text-foreground",
           )}
         >
-          <div className="whitespace-pre-wrap break-words">{message.content}</div>
+          {!isUser && (
+            <div className="mb-2 flex justify-end">
+              <CopyButton text={message.content} label="返答をコピー" />
+            </div>
+          )}
+          {isUser ? <div className="whitespace-pre-wrap break-words">{message.content}</div> : <MarkdownContent content={message.content} />}
         </div>
         <div className={cn("mt-1 text-xs text-muted-foreground", isUser ? "text-right" : "text-left")}>
           {formatDateTime(message.timestamp)}
@@ -392,6 +494,157 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         </div>
       )}
     </div>
+  )
+}
+
+function GeneratingRow({ stopping }: { stopping: boolean }) {
+  return (
+    <div className="flex gap-3">
+      <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-secondary text-secondary-foreground">
+        <Bot className="h-4 w-4" />
+      </div>
+      <div className="rounded-md border border-border bg-surface px-4 py-3 text-sm text-muted-foreground shadow-sm">
+        <div className="flex items-center gap-2">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          {stopping ? "停止処理中です。" : "返答を生成しています。"}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function MarkdownContent({ content }: { content: string }) {
+  const blocks = splitMarkdownBlocks(content)
+  return (
+    <div className="space-y-3 break-words">
+      {blocks.map((block, index) =>
+        block.type === "code" ? (
+          <CodeBlock key={index} language={block.language} code={block.content} />
+        ) : (
+          <TextBlock key={index} content={block.content} />
+        ),
+      )}
+    </div>
+  )
+}
+
+function CodeBlock({ language, code }: { language: string; code: string }) {
+  return (
+    <div className="overflow-hidden rounded-md border border-border bg-muted">
+      <div className="flex h-9 items-center justify-between border-b border-border px-3 text-xs text-muted-foreground">
+        <span className="font-medium">{language || "code"}</span>
+        <CopyButton text={code} label="コードをコピー" />
+      </div>
+      <pre className="max-h-96 overflow-auto p-3 text-[13px] leading-5">
+        <code className="whitespace-pre font-mono">{code}</code>
+      </pre>
+    </div>
+  )
+}
+
+function TextBlock({ content }: { content: string }) {
+  const lines = content.split(/\r?\n/)
+  const elements: ReactNode[] = []
+  let listItems: ReactNode[] = []
+  let orderedItems: ReactNode[] = []
+
+  function flushLists(key: string) {
+    if (listItems.length > 0) {
+      elements.push(
+        <ul key={`${key}-ul`} className="my-2 list-disc space-y-1 pl-5">
+          {listItems}
+        </ul>,
+      )
+      listItems = []
+    }
+    if (orderedItems.length > 0) {
+      elements.push(
+        <ol key={`${key}-ol`} className="my-2 list-decimal space-y-1 pl-5">
+          {orderedItems}
+        </ol>,
+      )
+      orderedItems = []
+    }
+  }
+
+  lines.forEach((line, index) => {
+    const trimmed = line.trim()
+    if (!trimmed) {
+      flushLists(`blank-${index}`)
+      return
+    }
+
+    const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed)
+    if (heading) {
+      flushLists(`heading-${index}`)
+      const level = heading[1].length
+      const className = cn("font-semibold leading-tight", level === 1 ? "text-lg" : level === 2 ? "text-base" : "text-sm")
+      elements.push(
+        <div key={index} className={className}>
+          {renderInline(heading[2])}
+        </div>,
+      )
+      return
+    }
+
+    const unordered = /^[-*]\s+(.+)$/.exec(trimmed)
+    if (unordered) {
+      if (orderedItems.length > 0) {
+        flushLists(`list-switch-${index}`)
+      }
+      listItems.push(<li key={index}>{renderInline(unordered[1])}</li>)
+      return
+    }
+
+    const ordered = /^\d+[.)]\s+(.+)$/.exec(trimmed)
+    if (ordered) {
+      if (listItems.length > 0) {
+        flushLists(`list-switch-${index}`)
+      }
+      orderedItems.push(<li key={index}>{renderInline(ordered[1])}</li>)
+      return
+    }
+
+    const quote = /^>\s?(.+)$/.exec(trimmed)
+    if (quote) {
+      flushLists(`quote-${index}`)
+      elements.push(
+        <blockquote key={index} className="border-l-2 border-primary/50 pl-3 text-muted-foreground">
+          {renderInline(quote[1])}
+        </blockquote>,
+      )
+      return
+    }
+
+    flushLists(`p-${index}`)
+    elements.push(
+      <p key={index} className="whitespace-pre-wrap">
+        {renderInline(line)}
+      </p>,
+    )
+  })
+  flushLists("end")
+
+  return <div className="space-y-2">{elements}</div>
+}
+
+function CopyButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false)
+
+  async function handleCopy() {
+    const ok = await copyText(text)
+    if (!ok) {
+      return
+    }
+    setCopied(true)
+    window.setTimeout(() => setCopied(false), 1200)
+  }
+
+  return (
+    <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={handleCopy} title={label}>
+      {copied ? <ClipboardCheck className="h-3.5 w-3.5" /> : <Clipboard className="h-3.5 w-3.5" />}
+      {copied ? "コピー済み" : "コピー"}
+    </Button>
   )
 }
 
@@ -451,11 +704,75 @@ function stageClassName(status: string, running: boolean) {
   return "text-muted-foreground"
 }
 
+function splitMarkdownBlocks(content: string) {
+  const blocks: Array<{ type: "text"; content: string } | { type: "code"; language: string; content: string }> = []
+  const fence = /```([^\r\n`]*)\r?\n?([\s\S]*?)```/g
+  let cursor = 0
+  let match: RegExpExecArray | null
+
+  while ((match = fence.exec(content)) !== null) {
+    if (match.index > cursor) {
+      blocks.push({ type: "text", content: content.slice(cursor, match.index).trim() })
+    }
+    blocks.push({ type: "code", language: match[1].trim(), content: trimCodeBlock(match[2]) })
+    cursor = match.index + match[0].length
+  }
+
+  if (cursor < content.length) {
+    blocks.push({ type: "text", content: content.slice(cursor).trim() })
+  }
+
+  return blocks.filter((block) => block.content.length > 0)
+}
+
+function renderInline(text: string) {
+  const nodes: ReactNode[] = []
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*)/g
+  let cursor = 0
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > cursor) {
+      nodes.push(text.slice(cursor, match.index))
+    }
+
+    const token = match[0]
+    if (token.startsWith("`")) {
+      nodes.push(
+        <code key={`${match.index}-code`} className="rounded bg-muted px-1 py-0.5 font-mono text-[0.92em]">
+          {token.slice(1, -1)}
+        </code>,
+      )
+    } else {
+      nodes.push(
+        <strong key={`${match.index}-strong`} className="font-semibold">
+          {token.slice(2, -2)}
+        </strong>,
+      )
+    }
+    cursor = match.index + token.length
+  }
+
+  if (cursor < text.length) {
+    nodes.push(text.slice(cursor))
+  }
+
+  return nodes
+}
+
+function trimCodeBlock(value: string) {
+  return value.replace(/^\r?\n/, "").replace(/\r?\n$/, "")
+}
+
 function formatError(error: unknown) {
   if (error instanceof Error) {
     return error.message
   }
   return String(error)
+}
+
+function withNextAction(message: string) {
+  return `${message}\n次の操作: 入力に戻す、セッション一覧更新、または新規チャットを選べます。`
 }
 
 function formatDateTime(value: string) {
@@ -469,6 +786,39 @@ function formatDateTime(value: string) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date)
+}
+
+function createRequestId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID()
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+async function copyText(text: string) {
+  try {
+    if (navigator.clipboard) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // Fall through to the textarea fallback.
+  }
+
+  try {
+    const textarea = document.createElement("textarea")
+    textarea.value = text
+    textarea.setAttribute("readonly", "")
+    textarea.style.position = "fixed"
+    textarea.style.left = "-9999px"
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand("copy")
+    document.body.removeChild(textarea)
+    return ok
+  } catch {
+    return false
+  }
 }
 
 export default App

@@ -6,7 +6,7 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from codex_conversation import generate_assistant_reply
 from finalize_live_chat import finalize_live_chat
@@ -14,6 +14,10 @@ from live_session import ROOT, LiveMessage, LiveSession, create_live_message, cr
 from session_store import cleanup_expired_sessions, get_session_organization, list_resumable_sessions, load_resume_session, save_session
 
 GUI_LOG_ENV = "AI_LIFEOS_GUI_LOG"
+
+
+class AssistantGenerationCancelled(RuntimeError):
+    pass
 
 
 def handle_start_session(payload: dict[str, Any]) -> dict[str, Any]:
@@ -33,7 +37,15 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("送信するメッセージが空です。")
 
     session_file = _resolve_or_create_session(root=root, value=payload.get("session_file"))
-    _gui_log(root, f"send_message.start session={session_file.stem} no_ai={bool(payload.get('no_ai', False))}")
+    request_id = _optional_request_id(payload.get("request_id"))
+    cancel_file = _cancel_file_path(root, request_id) if request_id else None
+    if cancel_file:
+        _clear_cancel_file(cancel_file)
+    _gui_log(
+        root,
+        f"send_message.start session={session_file.stem} request_id={request_id or '-'} no_ai={bool(payload.get('no_ai', False))}",
+    )
+
     session = LiveSession(path=session_file, started_at=_session_started_at(session_file))
     messages = _read_live_messages(session_file)
 
@@ -44,8 +56,10 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
 
     assistant_message = None
     error = None
+    cancelled = False
     if not bool(payload.get("no_ai", False)):
         try:
+            run_command = _cancelable_run_command(root=root, cancel_file=cancel_file) if cancel_file else subprocess.run
             reply = generate_assistant_reply(
                 root=root,
                 messages=messages,
@@ -53,26 +67,51 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
                 sandbox=str(payload.get("codex_sandbox") or "read-only"),
                 approval=str(payload.get("codex_approval") or "never"),
                 max_context_messages=int(payload.get("max_context_messages") or 20),
-                run_command=subprocess.run,
+                run_command=run_command,
             )
+            if cancel_file and cancel_file.exists():
+                raise AssistantGenerationCancelled("返答生成を停止しました。")
             saved_assistant = create_live_message("assistant", reply)
             session.append_message(saved_assistant.role, saved_assistant.content, saved_assistant.timestamp)
             messages.append(saved_assistant)
             assistant_message = saved_assistant
             _save_session_metadata(root=root, session_file=session_file, status="saved")
+        except AssistantGenerationCancelled as exc:
+            cancelled = True
+            _gui_log(
+                root,
+                f"send_message.cancelled session={session_file.stem} request_id={request_id or '-'} message={_safe_log_text(str(exc))}",
+            )
         except Exception as exc:  # Keep the already-saved user message visible to the GUI.
             error = f"{type(exc).__name__}: {exc}"
             _gui_log(root, f"send_message.assistant_error session={session_file.stem} {_format_exception(exc)}")
+        finally:
+            if cancel_file:
+                _clear_cancel_file(cancel_file)
 
     _gui_log(
         root,
-        f"send_message.done session={session_file.stem} messages={len(messages)} assistant_saved={assistant_message is not None}",
+        f"send_message.done session={session_file.stem} messages={len(messages)} assistant_saved={assistant_message is not None} cancelled={cancelled}",
     )
     return {
         "session": _serialize_session_file(session_file, root),
         "messages": [_serialize_message(message) for message in messages],
         "assistant": _serialize_message(assistant_message) if assistant_message else None,
         "error": error,
+        "cancelled": cancelled,
+    }
+
+
+def handle_cancel_message(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    request_id = _required_request_id(payload.get("request_id"))
+    cancel_file = _cancel_file_path(root, request_id)
+    cancel_file.parent.mkdir(parents=True, exist_ok=True)
+    cancel_file.write_text(datetime.now().astimezone().isoformat(timespec="seconds"), encoding="utf-8")
+    _gui_log(root, f"cancel_message.requested request_id={request_id}")
+    return {
+        "request_id": request_id,
+        "cancelled": True,
     }
 
 
@@ -169,6 +208,7 @@ def handle_cleanup_expired(payload: dict[str, Any]) -> dict[str, Any]:
 COMMANDS = {
     "start-session": handle_start_session,
     "send-message": handle_send_message,
+    "cancel-message": handle_cancel_message,
     "save-session": handle_save_session,
     "list-resumable": handle_list_resumable,
     "resume-session": handle_resume_session,
@@ -259,6 +299,8 @@ def _payload_log_summary(payload: dict[str, Any]) -> str:
         parts.append(f"session_file={Path(str(payload['session_file'])).name}")
     if payload.get("session_ref"):
         parts.append(f"session_ref={_safe_log_text(str(payload['session_ref']))}")
+    if payload.get("request_id"):
+        parts.append(f"request_id={_safe_log_text(str(payload['request_id']))}")
     if "content" in payload:
         parts.append(f"content_chars={len(str(payload.get('content') or ''))}")
     if "no_ai" in payload:
@@ -274,6 +316,8 @@ def _result_log_summary(result: dict[str, Any]) -> str:
         return f"session={session.get('session_id', '-')}"
     if "sessions" in result and isinstance(result["sessions"], list):
         return f"sessions={len(result['sessions'])}"
+    if "request_id" in result:
+        return f"request_id={result['request_id']}"
     if "raw_file" in result:
         return f"raw_file={result['raw_file']}"
     return "-"
@@ -282,6 +326,117 @@ def _result_log_summary(result: dict[str, Any]) -> str:
 def _payload_root(payload: dict[str, Any]) -> Path:
     root = payload.get("root")
     return Path(root) if root else ROOT
+
+
+def _optional_request_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return _sanitize_request_id(text)
+
+
+def _required_request_id(value: Any) -> str:
+    request_id = _optional_request_id(value)
+    if not request_id:
+        raise ValueError("request_id is required.")
+    return request_id
+
+
+def _sanitize_request_id(value: str) -> str:
+    if len(value) > 128:
+        raise ValueError("request_id is too long.")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+    if any(char not in allowed for char in value):
+        raise ValueError("request_id contains invalid characters.")
+    return value
+
+
+def _cancel_file_path(root: Path, request_id: str) -> Path:
+    return root / "logs" / "chat_gui_cancel" / f"{request_id}.cancel"
+
+
+def _clear_cancel_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _cancelable_run_command(root: Path, cancel_file: Path) -> Callable[..., subprocess.CompletedProcess[str]]:
+    def run_command(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cancel_file.exists():
+            raise AssistantGenerationCancelled("返答生成を停止しました。")
+
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+        process = subprocess.Popen(
+            command,
+            cwd=kwargs.get("cwd", root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=bool(kwargs.get("text", False)),
+            encoding=kwargs.get("encoding"),
+            creationflags=creationflags,
+        )
+
+        input_text = kwargs.get("input")
+        try:
+            try:
+                stdout, stderr = process.communicate(input=input_text, timeout=0.25)
+            except subprocess.TimeoutExpired:
+                while True:
+                    if cancel_file.exists():
+                        _terminate_process_tree(process)
+                        _drain_cancelled_process(process)
+                        raise AssistantGenerationCancelled("返答生成を停止しました。")
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.25)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+        except FileNotFoundError:
+            raise
+
+        if cancel_file.exists():
+            raise AssistantGenerationCancelled("返答生成を停止しました。")
+
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+    return run_command
+
+
+def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return
+        except OSError:
+            pass
+
+    process.kill()
+
+
+def _drain_cancelled_process(process: subprocess.Popen[Any]) -> None:
+    try:
+        process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
 
 
 def _resolve_or_create_session(root: Path, value: Any) -> Path:
@@ -359,7 +514,6 @@ def _save_session_metadata(root: Path, session_file: Path, status: str) -> None:
         save_session(root=root, session_file=session_file, status=status)
     except Exception as exc:
         _gui_log(root, f"save_session_metadata.error session={session_file.stem} {_format_exception(exc)}")
-        pass
 
 
 def _serialize_session_file(path: Path, root: Path) -> dict[str, Any]:
