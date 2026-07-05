@@ -45,6 +45,7 @@ Tauri 2
 * ベクトル検索
 * MCP連携
 * 複雑な履歴管理
+* ChatGPT風のメッセージ編集、回答再生成、会話分岐
 * 10日超セッションの自動削除
 * 会話中の memory / journal 自動編集
 * 自動Git commit
@@ -114,6 +115,7 @@ npm run bundle
 * memory / journal / summary 更新は「会話を整理して保存」操作で既存finalize処理に接続する
 * memory / journal / summary 更新は `gpt-5.5` / `model_reasoning_effort="xhigh"` を使う
 * Git commitはGUIから自動連発しない
+* メッセージ編集、回答再生成、会話分岐を入れる場合は、`docs/conversation_branching.md` の派生セッション方針に従い、既存JSONLを直接書き換えない
 
 ## ログ
 
