@@ -17,6 +17,11 @@ async fn send_message(payload: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn cancel_message(payload: Value) -> Result<Value, String> {
+    run_bridge("cancel-message", payload)
+}
+
+#[tauri::command]
 async fn save_session(payload: Value) -> Result<Value, String> {
     run_bridge("save-session", payload)
 }
@@ -46,6 +51,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_session,
             send_message,
+            cancel_message,
             save_session,
             list_resumable_sessions,
             resume_session,

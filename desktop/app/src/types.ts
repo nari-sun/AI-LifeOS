@@ -61,6 +61,13 @@ export interface SendMessageResult {
   messages: ChatMessage[]
   assistant: ChatMessage | null
   error: string | null
+  cancelled: boolean
+}
+
+export interface CancelMessageResult {
+  ok: boolean
+  request_id: string
+  cancelled: boolean
 }
 
 export interface ListResumableResult {
