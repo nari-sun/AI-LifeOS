@@ -1,5 +1,23 @@
 # AI-LifeOS
 
+## Privacy Check
+
+Commit前チェック:
+
+```powershell
+python scripts\privacy_check.py --staged
+```
+
+PublicEdition公開前チェック:
+
+```powershell
+python scripts\privacy_check.py --publish
+```
+
+`--publish` は tracked files と未追跡の公開候補ファイルを対象に、通常の secret/email/phone 検出に加えて URL query secret、長いランダム文字列、`.env` 形式の秘密値、住所らしき文字列、個人データディレクトリの誤追加を強めに確認します。
+
+誤検出の場合は、該当行に `privacy-check: allow` と理由をコメントで残してください。inline allowlist は住所・メールアドレス・長いランダム文字列など偽陽性が起きやすい検出だけに効きます。API key、token、bearer、URL query secret などの高確度secretは allowlist では通さず、公開前に除去してください。`conversations`、`journal`、`memory`、`inbox`、`tasks`、`renovationTickets` 配下の個人データも allowlist では通さず、PublicEditionに含めないでください。
+
 AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、後から検索・要約・日記・長期メモリとして活用するための個人用AI記憶システムです。
 
 現在は Phase3 Searchable Memory までの実装が入っています。Phase2.6 の live conversation、Phase2.65 の Session Save / Resume、Phase2.7 の Tauri 2 + React GUI、Phase3 の検索・SQLite index・回答用記憶コンテキストを、OpenAI API 直叩きや `.env` 前提なしで動かす方針です。
