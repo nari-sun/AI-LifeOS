@@ -44,6 +44,7 @@ Tauri 2
 * 過去ログ全文検索
 * ベクトル検索
 * MCP連携
+* モデル・応答設定UI
 * 複雑な履歴管理
 * 10日超セッションの自動削除
 * 会話中の memory / journal 自動編集
@@ -113,6 +114,8 @@ npm run bundle
 * GUI中に `memory/long_term.md` や `journal` を勝手に編集しない
 * memory / journal / summary 更新は「会話を整理して保存」操作で既存finalize処理に接続する
 * memory / journal / summary 更新は `gpt-5.5` / `model_reasoning_effort="xhigh"` を使う
+* モデル・応答設定UIは RT-0015 として保留し、方針は `docs/response_settings_ui.md` に分ける
+* 未実装の設定をGUIに出さない
 * Git commitはGUIから自動連発しない
 
 ## ログ
