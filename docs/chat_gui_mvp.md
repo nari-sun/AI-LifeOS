@@ -46,6 +46,7 @@ Tauri 2
 * MCP連携
 * モデル・応答設定UI
 * 複雑な履歴管理
+* ChatGPT風のメッセージ編集、回答再生成、会話分岐
 * 10日超セッションの自動削除
 * 会話中の memory / journal 自動編集
 * 自動Git commit
@@ -117,6 +118,7 @@ npm run bundle
 * モデル・応答設定UIは RT-0015 として保留し、方針は `docs/response_settings_ui.md` に分ける
 * 未実装の設定をGUIに出さない
 * Git commitはGUIから自動連発しない
+* メッセージ編集、回答再生成、会話分岐を入れる場合は、`docs/conversation_branching.md` の派生セッション方針に従い、既存JSONLを直接書き換えない
 
 ## ログ
 

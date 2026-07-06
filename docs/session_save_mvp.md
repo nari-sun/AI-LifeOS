@@ -127,6 +127,12 @@ Phase2.7 のGUIでは、会話終了時または「セッションを保存」�
 
 GUIは最初から検索や複雑な履歴管理を持たず、保存済みセッションのメタデータ表示と、10日以内セッションの再開に留めます。
 
+## RT-0016 分岐機能との関係
+
+ChatGPT風のメッセージ編集、回答再生成、会話分岐は `docs/conversation_branching.md` で検討中です。
+
+現時点の方針では、分岐は既存JSONLを書き換えず、親セッションから派生した新しい live JSONL と `.session.json` として扱います。現在のSession Save / Resume MVPには分岐metadataを実装しません。
+
 ## 完了条件
 
 * `python scripts\session_store.py save` で最新live JSONLの `.session.json` を作れる
