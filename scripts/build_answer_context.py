@@ -5,11 +5,60 @@ from pathlib import Path
 from memory_index import ROOT, MemorySearchResult, search_memory
 
 
-PRIVATE_KEYWORDS = (
-    "俺",
-    "私",
-    "僕",
-    "自分",
+MEMORY_SCORE_THRESHOLD = 3
+
+
+@dataclass(frozen=True)
+class MemoryNeedSignal:
+    text: str
+    score: int
+    reason: str
+
+
+MEMORY_NEED_SIGNALS = (
+    MemoryNeedSignal("覚えて", 4, "explicit-memory"),
+    MemoryNeedSignal("記憶", 4, "explicit-memory"),
+    MemoryNeedSignal("memory context", 4, "explicit-memory"),
+    MemoryNeedSignal("前回", 4, "past-conversation"),
+    MemoryNeedSignal("前に", 3, "past-conversation"),
+    MemoryNeedSignal("以前", 3, "past-conversation"),
+    MemoryNeedSignal("過去", 3, "past-conversation"),
+    MemoryNeedSignal("昔", 2, "past-conversation"),
+    MemoryNeedSignal("話した", 3, "past-conversation"),
+    MemoryNeedSignal("決めた", 3, "past-decision"),
+    MemoryNeedSignal("ログ", 3, "past-conversation"),
+    MemoryNeedSignal("履歴", 3, "past-conversation"),
+    MemoryNeedSignal("俺", 2, "self-reference"),
+    MemoryNeedSignal("私", 2, "self-reference"),
+    MemoryNeedSignal("僕", 2, "self-reference"),
+    MemoryNeedSignal("自分", 2, "self-reference"),
+    MemoryNeedSignal("わたし", 2, "self-reference"),
+    MemoryNeedSignal("好み", 3, "preference"),
+    MemoryNeedSignal("好き", 2, "preference"),
+    MemoryNeedSignal("嫌い", 2, "preference"),
+    MemoryNeedSignal("生活", 2, "personal-topic"),
+    MemoryNeedSignal("学習", 2, "personal-topic"),
+    MemoryNeedSignal("進捗", 2, "personal-topic"),
+    MemoryNeedSignal("日記", 3, "personal-record"),
+    MemoryNeedSignal("習慣", 2, "personal-topic"),
+    MemoryNeedSignal("ルーティン", 2, "personal-topic"),
+    MemoryNeedSignal("AI-LifeOS", 4, "project"),
+    MemoryNeedSignal("プロジェクト", 2, "project"),
+    MemoryNeedSignal("Phase", 2, "project"),
+    MemoryNeedSignal("フェーズ", 2, "project"),
+    MemoryNeedSignal("方針", 2, "project-decision"),
+    MemoryNeedSignal("会話", 2, "conversation"),
+    MemoryNeedSignal("journal", 2, "project-memory"),
+    MemoryNeedSignal("memory", 2, "project-memory"),
+    MemoryNeedSignal("この辺", 1, "local-context"),
+    MemoryNeedSignal("近く", 1, "local-context"),
+    MemoryNeedSignal("ご飯", 1, "personal-topic"),
+    MemoryNeedSignal("店", 1, "personal-topic"),
+    MemoryNeedSignal("おすすめ", 1, "recommendation"),
+)
+
+SELF_REFERENCES = ("俺", "私", "僕", "自分", "わたし")
+PERSONAL_TOPIC_SIGNALS = (
     "好み",
     "好き",
     "嫌い",
@@ -17,28 +66,32 @@ PRIVATE_KEYWORDS = (
     "学習",
     "進捗",
     "日記",
-    "前に",
-    "以前",
-    "過去",
-    "昔",
-    "話した",
-    "決めた",
-    "方針",
-    "記憶",
-    "ログ",
-    "会話",
-    "プロジェクト",
-    "AI-LifeOS",
-    "Phase",
-    "memory",
-    "journal",
-    "覚えて",
-    "この辺",
-    "近く",
+    "習慣",
+    "ルーティン",
     "ご飯",
     "店",
     "おすすめ",
 )
+PAST_SIGNALS = ("前回", "前に", "以前", "過去", "昔", "話した", "決めた", "ログ", "履歴")
+PROJECT_SIGNALS = ("AI-LifeOS", "プロジェクト", "Phase", "フェーズ", "方針", "journal", "memory")
+
+
+@dataclass(frozen=True)
+class MemoryNeedAssessment:
+    should_use_memory: bool
+    score: int
+    threshold: int
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MemoryContextReference:
+    path: str
+    document_type: str
+    title: str
+    date: str | None
+    snippet: str
+    score: int
 
 
 @dataclass(frozen=True)
@@ -46,13 +99,53 @@ class AnswerContext:
     should_use_memory: bool
     text: str
     results: tuple[MemorySearchResult, ...]
+    references: tuple[MemoryContextReference, ...] = ()
+    score: int = 0
+    threshold: int = MEMORY_SCORE_THRESHOLD
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def used_memory(self) -> bool:
+        return bool(self.text.strip() and self.references)
 
 
 def should_use_memory(question: str) -> bool:
+    return assess_memory_need(question).should_use_memory
+
+
+def assess_memory_need(question: str) -> MemoryNeedAssessment:
     normalized = question.strip()
     if not normalized:
-        return False
-    return any(keyword in normalized for keyword in PRIVATE_KEYWORDS)
+        return MemoryNeedAssessment(
+            should_use_memory=False,
+            score=0,
+            threshold=MEMORY_SCORE_THRESHOLD,
+            reasons=(),
+        )
+
+    lowered = normalized.lower()
+    score = 0
+    reasons: list[str] = []
+    for signal in MEMORY_NEED_SIGNALS:
+        if signal.text.lower() in lowered:
+            score += signal.score
+            reasons.append(signal.reason)
+
+    if _has_any(normalized, SELF_REFERENCES) and _has_any(normalized, PERSONAL_TOPIC_SIGNALS):
+        score += 2
+        reasons.append("self-plus-personal-topic")
+
+    if _has_any(normalized, PAST_SIGNALS) and _has_any(normalized, PROJECT_SIGNALS):
+        score += 2
+        reasons.append("past-plus-project")
+
+    reasons_tuple = tuple(_dedupe(reasons))
+    return MemoryNeedAssessment(
+        should_use_memory=score >= MEMORY_SCORE_THRESHOLD,
+        score=score,
+        threshold=MEMORY_SCORE_THRESHOLD,
+        reasons=reasons_tuple,
+    )
 
 
 def build_answer_context(
@@ -63,10 +156,18 @@ def build_answer_context(
     use_index: bool = True,
 ) -> AnswerContext:
     root = Path(root)
-    if not should_use_memory(question):
-        return AnswerContext(should_use_memory=False, text="", results=())
+    assessment = assess_memory_need(question)
+    if not assessment.should_use_memory:
+        return AnswerContext(
+            should_use_memory=False,
+            text="",
+            results=(),
+            score=assessment.score,
+            threshold=assessment.threshold,
+            reasons=assessment.reasons,
+        )
 
-    memory_sections = _read_priority_memory(root=root, max_chars=max_memory_chars)
+    memory_sections, priority_references = _read_priority_memory(root=root, max_chars=max_memory_chars)
     journal_results = search_memory(
         root=root,
         query=question,
@@ -108,15 +209,29 @@ def build_answer_context(
             lines.extend(_format_result(result, root))
         lines.append("")
 
+    references = _dedupe_references(
+        [
+            *priority_references,
+            *(_reference_from_result(result, root) for result in journal_results),
+            *(_reference_from_result(result, root) for result in conversation_results),
+        ]
+    )
+    context_text = "\n".join(lines).rstrip() if references else ""
+
     return AnswerContext(
         should_use_memory=True,
-        text="\n".join(lines).rstrip(),
+        text=context_text,
         results=tuple([*journal_results, *conversation_results]),
+        references=tuple(references),
+        score=assessment.score,
+        threshold=assessment.threshold,
+        reasons=assessment.reasons,
     )
 
 
-def _read_priority_memory(root: Path, max_chars: int) -> list[str]:
+def _read_priority_memory(root: Path, max_chars: int) -> tuple[list[str], list[MemoryContextReference]]:
     sections: list[str] = []
+    references: list[MemoryContextReference] = []
     remaining = max(max_chars, 1)
     for relative in (Path("memory") / "long_term.md", Path("memory") / "preferences.md"):
         path = root / relative
@@ -128,10 +243,20 @@ def _read_priority_memory(root: Path, max_chars: int) -> list[str]:
         if len(content) > remaining:
             content = content[:remaining].rstrip() + "\n...[truncated]"
         sections.extend([f"### {relative.as_posix()}", content, ""])
+        references.append(
+            MemoryContextReference(
+                path=relative.as_posix(),
+                document_type="memory",
+                title=path.stem,
+                date=None,
+                snippet=_short_snippet(content),
+                score=0,
+            )
+        )
         remaining -= len(content)
         if remaining <= 0:
             break
-    return sections
+    return sections, references
 
 
 def _display_path(path: Path, root: Path) -> str:
@@ -148,6 +273,51 @@ def _format_result(result: MemorySearchResult, root: Path) -> list[str]:
         f"  Source: {_display_path(result.path, root)}",
         f"  Snippet: {result.snippet}",
     ]
+
+
+def _reference_from_result(result: MemorySearchResult, root: Path) -> MemoryContextReference:
+    return MemoryContextReference(
+        path=_display_path(result.path, root),
+        document_type=result.document_type,
+        title=result.title,
+        date=result.date,
+        snippet=result.snippet,
+        score=result.score,
+    )
+
+
+def _dedupe_references(references: list[MemoryContextReference]) -> list[MemoryContextReference]:
+    result: list[MemoryContextReference] = []
+    seen: set[str] = set()
+    for reference in references:
+        if reference.path in seen:
+            continue
+        seen.add(reference.path)
+        result.append(reference)
+    return result
+
+
+def _short_snippet(content: str, width: int = 120) -> str:
+    text = " ".join(line.strip() for line in content.splitlines() if line.strip())
+    if len(text) <= width:
+        return text
+    return text[:width].rstrip() + "..."
+
+
+def _has_any(text: str, values: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(value.lower() in lowered for value in values)
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -171,8 +341,15 @@ def main() -> int:
     )
     if context.text:
         print(context.text)
+        print("")
+        print(
+            f"Memory context used: yes ({len(context.references)} sources, "
+            f"score {context.score}/{context.threshold})"
+        )
+        for reference in context.references:
+            print(f"- {reference.path}")
     else:
-        print("No memory context needed.")
+        print(f"No memory context needed. score={context.score}/{context.threshold}")
     return 0
 
 

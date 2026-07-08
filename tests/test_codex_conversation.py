@@ -162,6 +162,29 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn("AI-LifeOS memory context", prompt)
         self.assertIn("静かな店を好む", prompt)
 
+    def test_generate_assistant_reply_with_context_returns_reference_metadata(self):
+        def fake_run(command, **kwargs):
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("参照しました。\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "memory").mkdir()
+            (root / "memory" / "long_term.md").write_text("# Long-Term Memory\n\n- ユーザーはAI-LifeOSを作っている。\n", encoding="utf-8")
+            (root / "memory" / "preferences.md").write_text("# Preferences\n\n- ユーザーは静かな店を好む。\n", encoding="utf-8")
+
+            result = codex_conversation.generate_assistant_reply_with_context(
+                root=root,
+                messages=[create_live_message("user", "俺の好みに合う店は？")],
+                run_command=fake_run,
+            )
+
+        self.assertEqual("参照しました。", result.reply)
+        self.assertIsNotNone(result.memory_context)
+        self.assertTrue(result.memory_context.used_memory)
+        self.assertTrue(any(reference.path == "memory/preferences.md" for reference in result.memory_context.references))
+
     def test_finish_session_finalizes_and_processes_new_messages(self):
         calls = []
         progress_events = []

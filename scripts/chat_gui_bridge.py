@@ -9,7 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from codex_conversation import generate_assistant_reply
+from build_answer_context import AnswerContext, MemoryContextReference
+from codex_conversation import generate_assistant_reply_with_context
 from finalize_live_chat import finalize_live_chat
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from session_store import cleanup_expired_sessions, get_session_organization, list_resumable_sessions, load_resume_session, save_session
@@ -57,12 +58,13 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
     _save_session_metadata(root=root, session_file=session_file, status="saved")
 
     assistant_message = None
+    memory_context = None
     error = None
     cancelled = False
     if not bool(payload.get("no_ai", False)):
         try:
             run_command = _cancelable_run_command(root=root, cancel_file=cancel_file) if cancel_file else subprocess.run
-            reply = generate_assistant_reply(
+            reply_result = generate_assistant_reply_with_context(
                 root=root,
                 messages=messages,
                 codex_command=str(payload.get("codex_command") or "codex.cmd"),
@@ -71,6 +73,8 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
                 max_context_messages=int(payload.get("max_context_messages") or 20),
                 run_command=run_command,
             )
+            reply = reply_result.reply
+            memory_context = reply_result.memory_context
             if cancel_file and cancel_file.exists():
                 raise AssistantGenerationCancelled("返答生成を停止しました。")
             saved_assistant = create_live_message("assistant", reply)
@@ -99,6 +103,7 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
         "session": _serialize_session_file(session_file, root),
         "messages": [_serialize_message(message) for message in messages],
         "assistant": _serialize_message(assistant_message) if assistant_message else None,
+        "memory_context": _serialize_memory_context(memory_context),
         "error": error,
         "cancelled": cancelled,
     }
@@ -530,6 +535,40 @@ def _serialize_message(message: LiveMessage) -> dict[str, str]:
         "role": message.role,
         "content": message.content,
         "timestamp": message.timestamp.isoformat(timespec="seconds"),
+    }
+
+
+def _serialize_memory_context(context: AnswerContext | None) -> dict[str, Any]:
+    if context is None:
+        return {
+            "used": False,
+            "should_use": False,
+            "score": 0,
+            "threshold": 0,
+            "reasons": [],
+            "reference_count": 0,
+            "references": [],
+        }
+
+    return {
+        "used": context.used_memory,
+        "should_use": context.should_use_memory,
+        "score": context.score,
+        "threshold": context.threshold,
+        "reasons": list(context.reasons),
+        "reference_count": len(context.references),
+        "references": [_serialize_memory_reference(reference) for reference in context.references],
+    }
+
+
+def _serialize_memory_reference(reference: MemoryContextReference) -> dict[str, Any]:
+    return {
+        "path": reference.path,
+        "document_type": reference.document_type,
+        "title": reference.title,
+        "date": reference.date,
+        "snippet": reference.snippet,
+        "score": reference.score,
     }
 
 

@@ -10,6 +10,8 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import chat_gui_bridge  # noqa: E402
+import build_answer_context  # noqa: E402
+import codex_conversation  # noqa: E402
 from live_session import create_live_session  # noqa: E402
 
 
@@ -66,6 +68,41 @@ class ChatGuiBridgeTests(unittest.TestCase):
             self.assertTrue(session_path.exists())
             records = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(records[0]["content"], "first message")
+
+    def test_send_message_returns_memory_context_metadata(self):
+        original_generate = chat_gui_bridge.generate_assistant_reply_with_context
+
+        def fake_generate(root, messages, **kwargs):
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question=messages[-1].content,
+                use_index=False,
+            )
+            return codex_conversation.AssistantReplyResult(reply="記憶を参照した返答です。", memory_context=context)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            memory = root / "memory"
+            memory.mkdir()
+            (memory / "long_term.md").write_text("# Long-Term Memory\n\n- ユーザーはAI-LifeOSを作っている。\n", encoding="utf-8")
+            (memory / "preferences.md").write_text("# Preferences\n\n- ユーザーは静かな店を好む。\n", encoding="utf-8")
+
+            chat_gui_bridge.generate_assistant_reply_with_context = fake_generate
+            try:
+                result = chat_gui_bridge.handle_send_message(
+                    {
+                        "root": str(root),
+                        "content": "俺の好みに合う店は？",
+                    }
+                )
+            finally:
+                chat_gui_bridge.generate_assistant_reply_with_context = original_generate
+
+            self.assertEqual("assistant", result["assistant"]["role"])
+            self.assertTrue(result["memory_context"]["used"])
+            self.assertGreaterEqual(result["memory_context"]["reference_count"], 1)
+            paths = {reference["path"] for reference in result["memory_context"]["references"]}
+            self.assertIn("memory/preferences.md", paths)
 
     def test_resume_session_returns_messages(self):
         with tempfile.TemporaryDirectory() as temp_dir:

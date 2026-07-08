@@ -151,6 +151,8 @@ RT-0008 では、日常的な ChatGPT 風利用に近づけるため、Chat GUI 
 制約:
 
 * user 発言は Codex 呼び出し前に live JSONL へ保存されるため、停止しても user 発言は残ります。
+* user 発言のGUI即時表示は、保存済みメッセージとの同期を含めて RT-0018 として `docs/optimistic_user_message_ui.md` で検討します。
+* assistant 返答の読み上げは、Kokoro TTS を任意依存として使う方針を RT-0019 として `docs/kokoro_tts_read_aloud.md` で検討します。
 * エラー時の「入力に戻す」は再送信ではありません。JSONLへの重複保存を避けるため、直前入力を下書きとして戻し、必要ならユーザーが修正して新規メッセージとして送信します。
 * Codex CLI や OS 側の都合でプロセス停止に時間がかかる場合、GUI は「停止中」と表示して bridge の終了を待ちます。
-* token 単位のストリーミング表示は、現行の `codex.cmd exec --output-last-message` 方式では未実装です。必要になった場合は Codex SDK または app-server への置き換えを別 RT で検討します。
+* token 単位のストリーミング表示は、現行の `codex.cmd exec --output-last-message` 方式では未実装です。必要になった場合は Codex SDK または app-server への置き換えを RT-0017 として `docs/streaming_response_ui.md` で検討します。

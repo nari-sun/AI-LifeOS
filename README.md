@@ -76,6 +76,8 @@ Phase5   : Life Improvement Agent
 Phase6   : Daily Automation
 ```
 
+フェーズごとの履歴と実装済み範囲は [docs/phases.md](docs/phases.md) に整理しています。
+
 ## Directory Layout
 
 ```text
@@ -398,6 +400,8 @@ python scripts\search_memory.py "検索語" --rebuild-index
 ```
 
 DBは `memory/search_index.sqlite3` に作成されます。このDBはMarkdownから再生成できる派生データで、Git管理しません。
+
+現時点の検索方式は `SQLite-backed index + Python ranking` のMVPです。SQLiteには全文とメタデータを保存し、検索時はPython側で日本語の部分一致ランキングを行います。FTS5は使える環境で補助テーブルを作成しますが、現在の検索結果ランキングの主経路ではありません。
 
 ### 回答用memory contextを作る
 

@@ -8,6 +8,7 @@ from typing import Any, Callable
 from process_chat import (
     DEFAULT_MEMORY_CODEX_MODEL,
     DEFAULT_MEMORY_CODEX_REASONING_EFFORT,
+    PHASE2_PROMPT_TEMPLATE,
     CodexRunResult,
     GitCommitResult,
     commit_changes,
@@ -455,7 +456,9 @@ def _format_raw_markdown(
 
 
 def _write_codex_task(root: Path, raw_file: Path) -> str:
-    prompt_template = root / "prompts" / "codex_phase2_prompt.md"
+    # This is the only runtime prompt source for Phase2.5 memory processing.
+    # See prompts/README.md before adding or editing prompt files.
+    prompt_template = root / PHASE2_PROMPT_TEMPLATE
     template_text = prompt_template.read_text(encoding="utf-8")
     prompt = template_text.replace("{RAW_FILE}", str(raw_file.relative_to(root)))
 

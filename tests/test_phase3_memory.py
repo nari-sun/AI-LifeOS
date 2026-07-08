@@ -123,6 +123,29 @@ class Phase3MemoryTests(unittest.TestCase):
             self.assertFalse(context.should_use_memory)
             self.assertEqual("", context.text)
 
+    def test_memory_need_scoring_combines_weak_signals(self):
+        personal = build_answer_context.assess_memory_need("俺におすすめの本は？")
+        generic = build_answer_context.assess_memory_need("おすすめの本は？")
+
+        self.assertTrue(personal.should_use_memory)
+        self.assertIn("self-plus-personal-topic", personal.reasons)
+        self.assertFalse(generic.should_use_memory)
+
+    def test_answer_context_records_reference_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="AI-LifeOSのPhase3で決めた方針は？",
+                use_index=False,
+            )
+
+            paths = {reference.path for reference in context.references}
+            self.assertTrue(context.used_memory)
+            self.assertIn("memory/long_term.md", paths)
+            self.assertTrue(any(path.endswith("summary.md") for path in paths))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   Archive,
   Bot,
+  Brain,
   CheckCircle2,
   Clipboard,
   ClipboardCheck,
@@ -29,7 +30,7 @@ import {
   sendMessage,
   startSession,
 } from "@/tauri"
-import type { ChatMessage, ResumeSession, SessionFile, SessionOrganization } from "@/types"
+import type { ChatMessage, MemoryContextSummary, ResumeSession, SessionFile, SessionOrganization } from "@/types"
 
 type BusyState = "idle" | "starting" | "generating" | "stopping" | "resuming" | "finalizing" | "refreshing"
 type ReplyState = "idle" | "generating" | "stopping" | "stopped" | "failed" | "completed"
@@ -62,6 +63,7 @@ function App() {
   const [replyState, setReplyState] = useState<ReplyState>("idle")
   const [notice, setNotice] = useState("AI-LifeOS Chat")
   const [error, setError] = useState<string | null>(null)
+  const [lastMemoryContext, setLastMemoryContext] = useState<MemoryContextSummary | null>(null)
   const [lastSubmittedText, setLastSubmittedText] = useState("")
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null)
   const viewportRef = useRef<HTMLDivElement | null>(null)
@@ -115,6 +117,7 @@ function App() {
       setSession(sessionResult.session)
       setMessages(sessionResult.messages)
       setSessions(listResult.sessions)
+      setLastMemoryContext(null)
       setNotice("新規セッションを開始しました。")
     } catch (err) {
       setReplyState("failed")
@@ -155,6 +158,7 @@ function App() {
       const result = await startSession()
       setSession(result.session)
       setMessages(result.messages)
+      setLastMemoryContext(null)
       setInput("")
       setNotice("新規セッションを開始しました。")
       await refreshSessionsAfterAction()
@@ -178,6 +182,7 @@ function App() {
     setBusy("generating")
     setReplyState("generating")
     setError(null)
+    setLastMemoryContext(null)
     setInput("")
     setLastSubmittedText(content)
     setNotice("返答を生成しています。停止ボタンで中断できます。")
@@ -189,7 +194,9 @@ function App() {
       }
 
       setSession(result.session)
-      setMessages(result.messages)
+      const memoryContext = result.assistant ? result.memory_context : null
+      setMessages(attachMemoryContextToLatestAssistant(result.messages, memoryContext))
+      setLastMemoryContext(memoryContext)
       if (result.cancelled) {
         setReplyState("stopped")
         setNotice("返答生成を停止しました。ユーザー発言は live JSONL に保存されています。")
@@ -257,6 +264,7 @@ function App() {
       const result = await resumeSession(sessionId)
       setSession(result.session)
       setMessages(result.messages)
+      setLastMemoryContext(null)
       setNotice("セッションを再開しました。")
     } catch (err) {
       setReplyState("failed")
@@ -414,6 +422,7 @@ function App() {
           {organization?.last_error && !error && (
             <div className="mt-1 break-words text-xs text-destructive">{organization.last_error}</div>
           )}
+          {lastMemoryContext && <MemoryContextDetails context={lastMemoryContext} className="mt-2" />}
         </div>
 
         <div ref={viewportRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
@@ -483,6 +492,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
             </div>
           )}
           {isUser ? <div className="whitespace-pre-wrap break-words">{message.content}</div> : <MarkdownContent content={message.content} />}
+          {!isUser && message.memory_context && <MemoryContextDetails context={message.memory_context} compact className="mt-3" />}
         </div>
         <div className={cn("mt-1 text-xs text-muted-foreground", isUser ? "text-right" : "text-left")}>
           {formatDateTime(message.timestamp)}
@@ -510,6 +520,54 @@ function GeneratingRow({ stopping }: { stopping: boolean }) {
         </div>
       </div>
     </div>
+  )
+}
+
+function MemoryContextDetails({
+  context,
+  compact = false,
+  className,
+}: {
+  context: MemoryContextSummary
+  compact?: boolean
+  className?: string
+}) {
+  const label = context.used ? `記憶参照: あり (${context.reference_count}件)` : "記憶参照: なし"
+  const scoreLabel = context.threshold > 0 ? `score ${context.score}/${context.threshold}` : "score -"
+  const references = context.references.slice(0, 5)
+
+  return (
+    <details
+      className={cn(
+        "rounded-md border border-border bg-muted/50 px-3 py-2 text-xs text-muted-foreground",
+        compact && "bg-background/60",
+        className,
+      )}
+    >
+      <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2">
+        <Brain className={cn("h-3.5 w-3.5", context.used ? "text-primary" : "text-muted-foreground")} />
+        <span className={cn("font-medium", context.used ? "text-foreground" : "text-muted-foreground")}>{label}</span>
+        <span>{scoreLabel}</span>
+      </summary>
+      <div className="mt-2 space-y-2">
+        {context.used ? (
+          references.map((reference) => (
+            <div key={reference.path} className="min-w-0">
+              <div className="break-all font-mono text-[11px] text-foreground">{reference.path}</div>
+              <div className="mt-1 flex flex-wrap gap-2">
+                <span>{reference.document_type}</span>
+                {reference.date && <span>{reference.date}</span>}
+                {reference.score > 0 && <span>match {reference.score}</span>}
+              </div>
+              {reference.snippet && <div className="mt-1 line-clamp-2 break-words">{reference.snippet}</div>}
+            </div>
+          ))
+        ) : (
+          <div>今回の回答では memory context を使っていません。</div>
+        )}
+        {context.references.length > references.length && <div>他{context.references.length - references.length}件</div>}
+      </div>
+    </details>
   )
 }
 
@@ -758,6 +816,21 @@ function renderInline(text: string) {
   }
 
   return nodes
+}
+
+function attachMemoryContextToLatestAssistant(messages: ChatMessage[], context: MemoryContextSummary | null) {
+  if (!context) {
+    return messages
+  }
+
+  const next = messages.map((message) => ({ ...message }))
+  for (let index = next.length - 1; index >= 0; index -= 1) {
+    if (next[index].role === "assistant") {
+      next[index].memory_context = context
+      break
+    }
+  }
+  return next
 }
 
 function trimCodeBlock(value: string) {

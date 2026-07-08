@@ -24,6 +24,7 @@ DEFAULT_COMMIT_PATHS = (
 )
 DEFAULT_MEMORY_CODEX_MODEL = "gpt-5.5"
 DEFAULT_MEMORY_CODEX_REASONING_EFFORT = "xhigh"
+PHASE2_PROMPT_TEMPLATE = Path("prompts") / "codex_phase2_prompt.md"
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,9 @@ def process_chat(
 ) -> ProcessChatResult:
     root = Path(root)
     inbox = root / "inbox" / "chat.txt"
-    prompt_template = root / "prompts" / "codex_phase2_prompt.md"
+    # This is the only runtime prompt source for Phase2.5 memory processing.
+    # See prompts/README.md before adding or editing prompt files.
+    prompt_template = root / PHASE2_PROMPT_TEMPLATE
     now = _resolve_imported_at(date_text, imported_at)
 
     date = now.strftime("%Y-%m-%d")

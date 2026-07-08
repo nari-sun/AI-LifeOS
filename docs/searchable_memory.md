@@ -56,7 +56,7 @@ python scripts\search_memory.py "" --tag Phase3
 * tags
 * content
 
-### Phase3.3: SQLite Memory Index
+### Phase3.3: SQLite-backed Memory Index MVP
 
 `scripts/index_conversations.py` と `scripts/rebuild_index.py` でSQLite indexを作成・再構築できます。
 
@@ -77,9 +77,11 @@ SQLite schema:
 
 * `documents`: document type、path、title、date、tags_json、content を保持
 * `tags`: タグ検索用
-* `documents_fts`: FTS5 が使える環境では作成
+* `documents_fts`: FTS5 が使える環境では補助テーブルとして作成
 
-検索時はSQLiteに保存された文書を読み出し、Python側で日本語の部分一致ランキングを行います。FTS5は環境によって日本語トークン化が弱いため、MVPでは検索品質を優先してPython側の一致判定を使います。
+現時点の検索方式は `SQLite-backed index + Python ranking` です。SQLiteには全文とメタデータを保存し、検索時はSQLiteから対象文書を読み出して、Python側で日本語の部分一致ランキングを行います。
+
+FTS5は環境によって日本語トークン化が弱いため、MVPでは検索品質を優先してPython側の一致判定を使います。`documents_fts` が作成される環境でも、現在の検索結果ランキングの主経路はFTS5ではありません。
 
 `process_chat.py --run-codex` と `finalize_live_chat.py --run-codex` の完了後には、indexを自動再構築します。
 
@@ -94,6 +96,7 @@ python scripts\build_answer_context.py "俺の好みに合う店は？"
 動作:
 
 * 私的な質問、好み、生活、学習進捗、過去行動、AI-LifeOSの過去方針に関係する質問だけでmemoryを使う
+* memory context の要否は単一キーワード一致ではなく、自己参照、過去会話、好み・生活、AI-LifeOS/プロジェクト語などの重み付きスコアで判定する
 * まず `memory/long_term.md` と `memory/preferences.md` を読む
 * 追加情報が必要な場合は `journal` と `summary.md` / `raw.md` を検索する
 * 結果は短い抜粋と出典情報に絞る
@@ -106,6 +109,8 @@ python scripts\codex_conversation.py --no-memory-context
 ```
 
 現在性や外部情報が必要な質問では、ローカル記憶だけで断定せず、Web検索が必要なことを会話プロンプトに明示します。現時点のローカル実装自体はWeb検索クライアントを持ちません。
+
+CLI と GUI は回答生成後に `記憶参照: あり / なし` を表示します。参照ありの場合は、回答時に使った参照元ファイルパス、件数、短い抜粋を保持し、必要に応じて確認できます。通常の assistant 返答本文には出典パスを混ぜず、参照情報はメタデータとして表示します。
 
 ### Phase3.5: Vector Search Evaluation
 

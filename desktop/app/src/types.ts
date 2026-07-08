@@ -4,6 +4,26 @@ export interface ChatMessage {
   role: Role
   content: string
   timestamp: string
+  memory_context?: MemoryContextSummary | null
+}
+
+export interface MemoryContextReference {
+  path: string
+  document_type: string
+  title: string
+  date: string | null
+  snippet: string
+  score: number
+}
+
+export interface MemoryContextSummary {
+  used: boolean
+  should_use: boolean
+  score: number
+  threshold: number
+  reasons: string[]
+  reference_count: number
+  references: MemoryContextReference[]
 }
 
 export type OrganizeStageName = "raw" | "memory" | "index"
@@ -60,6 +80,7 @@ export interface SendMessageResult {
   session: SessionFile
   messages: ChatMessage[]
   assistant: ChatMessage | null
+  memory_context: MemoryContextSummary
   error: string | null
   cancelled: boolean
 }

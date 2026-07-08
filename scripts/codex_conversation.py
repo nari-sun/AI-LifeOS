@@ -8,12 +8,13 @@ import threading
 import textwrap
 import time
 import os
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from codex_cli_options import add_codex_model_options
-from build_answer_context import build_answer_context
+from build_answer_context import AnswerContext, build_answer_context
 from finalize_live_chat import FinalizeLiveChatResult, finalize_live_chat
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from session_store import ResumeSession, list_resumable_sessions, load_resume_session
@@ -23,6 +24,12 @@ DEFAULT_CHAT_CODEX_MODEL = "gpt-5.4-mini"
 DEFAULT_CHAT_CODEX_REASONING_EFFORT = "medium"
 DEFAULT_CHAT_CODEX_SERVICE_TIER = "fast"
 DEFAULT_CHAT_CODEX_FAST_MODE = True
+
+
+@dataclass(frozen=True)
+class AssistantReplyResult:
+    reply: str
+    memory_context: AnswerContext | None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -168,14 +175,51 @@ def generate_assistant_reply(
     include_memory_context: bool = True,
     run_command=subprocess.run,
 ) -> str:
+    return generate_assistant_reply_with_context(
+        root=root,
+        messages=messages,
+        codex_command=codex_command,
+        sandbox=sandbox,
+        approval=approval,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
+        fast_mode=fast_mode,
+        max_context_messages=max_context_messages,
+        include_memory_context=include_memory_context,
+        run_command=run_command,
+    ).reply
+
+
+def generate_assistant_reply_with_context(
+    root: Path | str,
+    messages: list[LiveMessage],
+    codex_command: str = "codex.cmd",
+    sandbox: str = "read-only",
+    approval: str = "never",
+    model: str | None = DEFAULT_CHAT_CODEX_MODEL,
+    reasoning_effort: str | None = DEFAULT_CHAT_CODEX_REASONING_EFFORT,
+    service_tier: str | None = DEFAULT_CHAT_CODEX_SERVICE_TIER,
+    fast_mode: bool | None = DEFAULT_CHAT_CODEX_FAST_MODE,
+    max_context_messages: int = 20,
+    include_memory_context: bool = True,
+    run_command=subprocess.run,
+) -> AssistantReplyResult:
     root = Path(root)
     _debug_log(root, f"assistant_reply.start messages={len(messages)} sandbox={sandbox}")
     memory_context = ""
+    memory_context_result: AnswerContext | None = None
     if include_memory_context:
         latest_user = _latest_user_content(messages)
-        context = build_answer_context(root=root, question=latest_user)
-        memory_context = context.text
-        _debug_log(root, f"assistant_reply.memory_context enabled={bool(memory_context)} results={len(context.results)}")
+        memory_context_result = build_answer_context(root=root, question=latest_user)
+        memory_context = memory_context_result.text
+        _debug_log(
+            root,
+            "assistant_reply.memory_context "
+            f"enabled={memory_context_result.used_memory} "
+            f"score={memory_context_result.score}/{memory_context_result.threshold} "
+            f"references={len(memory_context_result.references)} results={len(memory_context_result.results)}",
+        )
     prompt = build_codex_chat_prompt(
         messages,
         max_context_messages=max_context_messages,
@@ -243,7 +287,7 @@ def generate_assistant_reply(
         raise RuntimeError("Codex CLI completed but returned an empty assistant reply.")
 
     _debug_log(root, f"assistant_reply.success chars={len(reply)}")
-    return reply
+    return AssistantReplyResult(reply=reply, memory_context=memory_context_result)
 
 
 def _latest_user_content(messages: list[LiveMessage]) -> str:
@@ -258,6 +302,22 @@ def _display_path(path: Path, root: Path) -> str:
         return str(path.relative_to(root))
     except ValueError:
         return str(path)
+
+
+def _format_memory_context_status(context: AnswerContext | None) -> str:
+    if context is None or not context.used_memory:
+        if context is None:
+            return "記憶参照: なし"
+        return f"記憶参照: なし (score {context.score}/{context.threshold})"
+
+    paths = [reference.path for reference in context.references]
+    preview = ", ".join(paths[:3])
+    if len(paths) > 3:
+        preview += f", 他{len(paths) - 3}件"
+    return (
+        f"記憶参照: あり ({len(paths)}件, score {context.score}/{context.threshold})"
+        f"\n参照元: {preview}"
+    )
 
 
 def _terminal_size() -> tuple[int, int]:
@@ -796,7 +856,7 @@ def main() -> int:
             _render_screen(messages, session_display_path, status)
 
             try:
-                reply = generate_assistant_reply(
+                reply_result = generate_assistant_reply_with_context(
                     root=root,
                     messages=messages,
                     codex_command=args.codex_command,
@@ -809,6 +869,7 @@ def main() -> int:
                     max_context_messages=args.max_context_messages,
                     include_memory_context=not args.no_memory_context,
                 )
+                reply = reply_result.reply
             except RuntimeError as exc:
                 _debug_log(root, f"main.assistant_reply_failed type={type(exc).__name__} message={exc}")
                 status = f"Codex reply failed: {exc}"
@@ -818,7 +879,7 @@ def main() -> int:
             messages.append(create_live_message("assistant", reply))
             session.write_messages(messages)
             _debug_log(root, f"main.assistant_saved messages={len(messages)} path={session.path}")
-            status = "Saved assistant reply."
+            status = "Saved assistant reply.\n" + _format_memory_context_status(reply_result.memory_context)
             _render_screen(messages, session_display_path, status)
     except (KeyboardInterrupt, EOFError):
         _debug_log(root, f"main.input_interrupted type={sys.exc_info()[0].__name__ if sys.exc_info()[0] else 'unknown'}")
