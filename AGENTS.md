@@ -32,7 +32,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 * `memory/long_term.md` は長期的に重要な情報だけ扱い、既存情報を勝手に削除しない。
 * journal は事実ベースで、AIがどう答えたか、その結果どうなったかを400文字程度で書く。結果が会話内で未確定なら未確定と書く。
 * live会話中、GUI操作中、検索処理中に `memory` / `journal` / `conversations` を勝手に編集しない。
-* 10日超セッションは自動削除しない。削除は `python scripts\session_store.py prune --delete` のような明示操作に限定する。
+* 10日超セッションは resume 候補から外し、削除候補として扱う。削除や自動整理は未整理・失敗状態を保護する実装ルールに従う。
 * `memory/search_index.sqlite3` はMarkdownから再生成できる派生データとして扱い、Git管理しない。
 * ベクトルDBは本番導入しない。Markdown検索 + SQLite-backed index + Python ranking で足りない理由が明確になった場合に再評価する。
 
