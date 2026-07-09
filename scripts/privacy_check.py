@@ -29,6 +29,8 @@ PRIVATE_DATA_ROOTS = {
     "memory",
     "inbox",
     "tasks",
+    "imports",
+    "logs",
     "renovationTickets",
 }
 ALLOWED_PRIVATE_DATA_FILES = {
@@ -37,6 +39,8 @@ ALLOWED_PRIVATE_DATA_FILES = {
     "memory/.gitkeep",
     "inbox/.gitkeep",
     "tasks/.gitkeep",
+    "imports/.gitkeep",
+    "logs/.gitkeep",
     "renovationTickets/.gitkeep",
 }
 

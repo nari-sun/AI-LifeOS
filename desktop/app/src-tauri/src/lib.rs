@@ -42,8 +42,33 @@ async fn finalize_session(payload: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn start_finalize_job(payload: Value) -> Result<Value, String> {
+    run_bridge("start-finalize-job", payload)
+}
+
+#[tauri::command]
+async fn get_finalize_job(payload: Value) -> Result<Value, String> {
+    run_bridge("get-finalize-job", payload)
+}
+
+#[tauri::command]
+async fn cancel_finalize_job(payload: Value) -> Result<Value, String> {
+    run_bridge("cancel-finalize-job", payload)
+}
+
+#[tauri::command]
 async fn cleanup_expired_sessions(payload: Value) -> Result<Value, String> {
     run_bridge("cleanup-expired", payload)
+}
+
+#[tauri::command]
+async fn local_data_report(payload: Value) -> Result<Value, String> {
+    run_bridge("local-data-report", payload)
+}
+
+#[tauri::command]
+async fn open_local_data_folder(payload: Value) -> Result<Value, String> {
+    run_bridge("open-local-data-folder", payload)
 }
 
 pub fn run() {
@@ -56,7 +81,12 @@ pub fn run() {
             list_resumable_sessions,
             resume_session,
             finalize_session,
-            cleanup_expired_sessions
+            start_finalize_job,
+            get_finalize_job,
+            cancel_finalize_job,
+            cleanup_expired_sessions,
+            local_data_report,
+            open_local_data_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI-LifeOS desktop app");

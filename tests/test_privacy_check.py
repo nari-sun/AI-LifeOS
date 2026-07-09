@@ -82,6 +82,18 @@ class PrivacyCheckTests(unittest.TestCase):
         self.assertEqual(1, len(findings))
         self.assertEqual("personal data path", findings[0].label)
 
+    def test_scan_path_detects_imports_directory(self):
+        findings = privacy_check.scan_path("imports/chatgpt_export/messages.json")
+
+        self.assertEqual(1, len(findings))
+        self.assertEqual("personal data path", findings[0].label)
+
+    def test_scan_path_detects_logs_directory(self):
+        findings = privacy_check.scan_path("logs/chat_gui_jobs/example.json")
+
+        self.assertEqual(1, len(findings))
+        self.assertEqual("personal data path", findings[0].label)
+
     def test_scan_path_allows_gitkeep_placeholders(self):
         findings = privacy_check.scan_path("memory/.gitkeep")
 

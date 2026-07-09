@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -104,6 +105,59 @@ class ChatGuiBridgeTests(unittest.TestCase):
             paths = {reference["path"] for reference in result["memory_context"]["references"]}
             self.assertIn("memory/preferences.md", paths)
 
+    def test_send_message_uses_attachment_context_without_saving_body(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            attachment_text = "PRIVATE_ATTACHMENT_BODY"
+
+            result = chat_gui_bridge.handle_send_message(
+                {
+                    "root": str(root),
+                    "content": "添付を確認して",
+                    "no_ai": True,
+                    "attachments": [
+                        {
+                            "name": "notes.md",
+                            "extension": "md",
+                            "size_bytes": len(attachment_text.encode("utf-8")),
+                            "text": attachment_text,
+                        }
+                    ],
+                }
+            )
+
+            session_path = root / result["session"]["jsonl_file"]
+            records = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines()]
+
+            self.assertEqual("extracted", result["attachments"][0]["status"])
+            self.assertIn("[Attachments]", records[0]["content"])
+            self.assertIn("notes.md", records[0]["content"])
+            self.assertNotIn(attachment_text, records[0]["content"])
+
+    def test_send_message_returns_pdf_attachment_error_when_extraction_unavailable_or_invalid(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            result = chat_gui_bridge.handle_send_message(
+                {
+                    "root": str(root),
+                    "content": "PDFを確認して",
+                    "no_ai": True,
+                    "attachments": [
+                        {
+                            "name": "sample.pdf",
+                            "extension": "pdf",
+                            "size_bytes": 12,
+                            "data_base64": "bm90IGEgcGRm",
+                        }
+                    ],
+                }
+            )
+
+            attachment = result["attachments"][0]
+            self.assertEqual("error", attachment["status"])
+            self.assertTrue(attachment["error"])
+
     def test_resume_session_returns_messages(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -122,6 +176,55 @@ class ChatGuiBridgeTests(unittest.TestCase):
 
             self.assertEqual(result["session"]["session_id"], session.path.stem)
             self.assertEqual([message["role"] for message in result["messages"]], ["user", "assistant"])
+
+    def test_cleanup_expired_is_dry_run_by_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            old = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+            session = create_live_session(root=root, started_at=old)
+            session.append_message("user", "old message", old)
+
+            result = chat_gui_bridge.handle_cleanup_expired(
+                {
+                    "root": str(root),
+                    "retention_days": 10,
+                }
+            )
+
+            self.assertTrue(session.path.exists())
+            self.assertEqual(1, len(result["results"]))
+            self.assertNotEqual("削除済み", result["results"][0]["status"])
+
+    def test_finalize_job_runs_in_background_and_returns_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir()
+            (prompt_dir / "codex_phase2_prompt.md").write_text("Process {RAW_FILE}", encoding="utf-8")
+            session = create_live_session(root=root, started_at=datetime(2026, 7, 3, 12, 0, tzinfo=timezone.utc))
+            session.append_message("user", "finalize me", session.started_at)
+
+            started = chat_gui_bridge.handle_start_finalize_job(
+                {
+                    "root": str(root),
+                    "session_file": str(session.path),
+                    "run_codex": False,
+                }
+            )
+            job_id = started["job"]["job_id"]
+
+            status = None
+            for _ in range(50):
+                status = chat_gui_bridge.handle_get_finalize_job({"root": str(root), "job_id": job_id})["job"]
+                if status["status"] in {"succeeded", "failed", "cancelled"}:
+                    break
+                time.sleep(0.1)
+
+            self.assertIsNotNone(status)
+            self.assertEqual("succeeded", status["status"])
+            self.assertTrue((root / status["result"]["raw_file"]).exists())
+            for process in chat_gui_bridge.BACKGROUND_PROCESSES:
+                process.wait(timeout=5)
 
 
 if __name__ == "__main__":

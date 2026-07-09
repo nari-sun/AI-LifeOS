@@ -561,6 +561,13 @@ def _resolve_session_file(root: Path, session_file: Path | str | None) -> Path:
     path = Path(session_file)
     if not path.is_absolute():
         path = root / path
+    path = path.resolve()
+    root_resolved = root.resolve()
+
+    try:
+        path.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError("セッションファイルはAI-LifeOSルート内を指定してください。") from exc
 
     if not path.exists():
         raise FileNotFoundError(f"セッションJSONLが見つかりません: {path}")

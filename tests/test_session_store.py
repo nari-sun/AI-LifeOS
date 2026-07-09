@@ -83,6 +83,26 @@ class SessionStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 session_store.save_session(root=root, session_file=path)
 
+    def test_save_session_rejects_jsonl_outside_root(self):
+        with tempfile.TemporaryDirectory() as root_dir, tempfile.TemporaryDirectory() as outside_dir:
+            root = Path(root_dir)
+            outside = Path(outside_dir) / "outside.jsonl"
+            outside.write_text(
+                json.dumps(
+                    {
+                        "role": "user",
+                        "timestamp": "2026-07-01T22:30:00+09:00",
+                        "content": "outside",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                session_store.save_session(root=root, session_file=outside)
+
     def test_list_saved_sessions_returns_newest_first(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

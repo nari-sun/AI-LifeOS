@@ -113,6 +113,7 @@ logs/chat_gui_stream/YYYY-MM-DD_HHMMSS_<request_id>.jsonl
 ```
 
 この派生ログは `raw.md` 化や memory 更新の根拠には使いません。
+`logs/` 配下はGit管理外であることを前提にし、実装時は `.gitignore` で `logs/chat_gui_stream/` が除外されることを確認します。保持期間や削除方法は、通常の会話ログとは別に定義します。
 
 ## UI Requirements
 

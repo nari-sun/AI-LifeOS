@@ -26,6 +26,25 @@ export interface MemoryContextSummary {
   references: MemoryContextReference[]
 }
 
+export interface AttachmentPayload {
+  name: string
+  extension: string
+  size_bytes: number
+  text?: string
+  data_base64?: string
+  truncated?: boolean
+}
+
+export interface AttachmentResult {
+  file_name: string
+  extension: string
+  size_bytes: number
+  status: "extracted" | "error"
+  error: string | null
+  extracted_chars: number
+  truncated: boolean
+}
+
 export type OrganizeStageName = "raw" | "memory" | "index"
 export type OrganizeStageStatus = "pending" | "done" | "failed"
 
@@ -81,6 +100,7 @@ export interface SendMessageResult {
   messages: ChatMessage[]
   assistant: ChatMessage | null
   memory_context: MemoryContextSummary
+  attachments: AttachmentResult[]
   error: string | null
   cancelled: boolean
 }
@@ -130,6 +150,28 @@ export interface FinalizeSessionResult {
   organization: SessionOrganization
 }
 
+export interface FinalizeJob {
+  job_id: string
+  name: string
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled"
+  stage: string | null
+  message: string | null
+  error: string | null
+  percent: number
+  session_file: string
+  log_path: string
+  cancel_file: string
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  result: FinalizeSessionResult | null
+}
+
+export interface FinalizeJobResult {
+  ok: boolean
+  job: FinalizeJob
+}
+
 export interface CleanupExpiredResult {
   ok: boolean
   results: Array<{
@@ -139,4 +181,40 @@ export interface CleanupExpiredResult {
     raw_file: string | null
     error: string | null
   }>
+}
+
+export interface LocalDataDirectoryReport {
+  path: string
+  exists: boolean
+  file_count: number
+  directory_count: number
+  total_bytes: number
+  newest_file: string | null
+  newest_modified_at: string | null
+  errors: string[]
+}
+
+export interface LocalDataFileReport {
+  path: string
+  exists: boolean
+  size_bytes: number
+  modified_at: string | null
+  error?: string
+}
+
+export interface LocalDataReport {
+  root: string
+  read_only: boolean
+  directories: Record<string, LocalDataDirectoryReport>
+  search_index: LocalDataFileReport
+  totals: {
+    existing_directories: number
+    file_count: number
+    total_bytes: number
+  }
+}
+
+export interface LocalDataReportResult {
+  ok: boolean
+  report: LocalDataReport
 }

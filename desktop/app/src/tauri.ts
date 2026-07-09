@@ -3,8 +3,11 @@ import { invoke } from "@tauri-apps/api/core"
 import type {
   CancelMessageResult,
   CleanupExpiredResult,
+  FinalizeJobResult,
   FinalizeSessionResult,
   ListResumableResult,
+  LocalDataReportResult,
+  AttachmentPayload,
   ResumeSessionResult,
   SaveSessionResult,
   SendMessageResult,
@@ -23,13 +26,19 @@ export async function startSession() {
   return invoke<StartSessionResult>("start_session", { payload: defaultPayload })
 }
 
-export async function sendMessage(sessionFile: string | null, content: string, requestId: string) {
+export async function sendMessage(
+  sessionFile: string | null,
+  content: string,
+  requestId: string,
+  attachments: AttachmentPayload[] = [],
+) {
   return invoke<SendMessageResult>("send_message", {
     payload: {
       ...defaultPayload,
       session_file: sessionFile,
       content,
       request_id: requestId,
+      attachments,
     },
   })
 }
@@ -72,6 +81,43 @@ export async function finalizeSession(sessionFile: string) {
   })
 }
 
+export async function startFinalizeJob(sessionFile: string) {
+  return invoke<FinalizeJobResult>("start_finalize_job", {
+    payload: {
+      session_file: sessionFile,
+      run_codex: true,
+    },
+  })
+}
+
+export async function getFinalizeJob(jobId: string) {
+  return invoke<FinalizeJobResult>("get_finalize_job", {
+    payload: {
+      job_id: jobId,
+    },
+  })
+}
+
+export async function cancelFinalizeJob(jobId: string) {
+  return invoke<FinalizeJobResult>("cancel_finalize_job", {
+    payload: {
+      job_id: jobId,
+    },
+  })
+}
+
 export async function cleanupExpiredSessions() {
   return invoke<CleanupExpiredResult>("cleanup_expired_sessions", { payload: defaultPayload })
+}
+
+export async function getLocalDataReport() {
+  return invoke<LocalDataReportResult>("local_data_report", { payload: defaultPayload })
+}
+
+export async function openLocalDataFolder(folder: string) {
+  return invoke<{ ok: boolean; folder: string; path: string }>("open_local_data_folder", {
+    payload: {
+      folder,
+    },
+  })
 }

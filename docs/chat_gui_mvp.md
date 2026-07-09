@@ -36,7 +36,10 @@ Tauri 2
 * 10日以内の再開可能セッション一覧表示
 * セッション再開
 * セッションメタデータ保存
-* 「会話を整理して保存」ボタンから `finalize_live_chat.py` 相当の処理を実行
+* 「会話を整理して保存」ボタンから `finalize_live_chat.py` 相当の処理をバックグラウンドジョブとして実行
+* 送信直後のuser発言をUI一時状態として表示
+* `.txt` / `.md` / `.pdf` 添付MVP
+* ローカル個人データの読み取り専用管理画面
 * エラー表示
 
 最初のGUIで扱わないこと:
@@ -45,7 +48,6 @@ Tauri 2
 * ベクトル検索
 * MCP連携
 * モデル・応答設定UI
-* 複雑な履歴管理
 * ChatGPT風のメッセージ編集、回答再生成、会話分岐
 * 10日超セッションの自動削除
 * 会話中の memory / journal 自動編集
@@ -128,6 +130,8 @@ GUIのエラー確認用ログ:
 logs/chat_gui_task.log
 logs/chat_gui_tauri.log
 logs/chat_gui_bridge.log
+logs/chat_gui_jobs/*.json
+logs/chat_gui_jobs/*.log
 ```
 
 `chat_gui_task.log` は VS Code task、npm install、Vite、Tauri dev/build の標準出力とエラーを記録します。起動前に落ちるエラーはまずこのファイルを確認します。
@@ -151,8 +155,67 @@ RT-0008 では、日常的な ChatGPT 風利用に近づけるため、Chat GUI 
 制約:
 
 * user 発言は Codex 呼び出し前に live JSONL へ保存されるため、停止しても user 発言は残ります。
-* user 発言のGUI即時表示は、保存済みメッセージとの同期を含めて RT-0018 として `docs/optimistic_user_message_ui.md` で検討します。
+* user 発言のGUI即時表示は、RT-0018 の方針通り、保存済みメッセージではなくUI一時状態として扱います。bridge応答後は保存済み `messages` を正として置き換えます。
 * assistant 返答の読み上げは、Kokoro TTS を任意依存として使う方針を RT-0019 として `docs/kokoro_tts_read_aloud.md` で検討します。
 * エラー時の「入力に戻す」は再送信ではありません。JSONLへの重複保存を避けるため、直前入力を下書きとして戻し、必要ならユーザーが修正して新規メッセージとして送信します。
 * Codex CLI や OS 側の都合でプロセス停止に時間がかかる場合、GUI は「停止中」と表示して bridge の終了を待ちます。
 * token 単位のストリーミング表示は、現行の `codex.cmd exec --output-last-message` 方式では未実装です。必要になった場合は Codex SDK または app-server への置き換えを RT-0017 として `docs/streaming_response_ui.md` で検討します。
+
+## RT-0009 Conversation History Sidebar
+
+左サイドバーには、Phase2.65 の resume 対象である「最後のuser入力から10日以内」の live session を表示します。
+
+表示する情報:
+
+* セッションタイトル
+* セッションID
+* メッセージ数
+* 最終user入力日時
+* 整理状態
+
+GUIから新規チャット開始と既存セッション再開を選べます。10日超の全履歴検索、ピン留め、長期スレッド管理は別チケットで扱います。
+
+## RT-0011 File Attachments MVP
+
+GUIではファイル選択から `.txt`、`.md`、`.pdf` を添付できます。
+
+MVP制限:
+
+* 最大3ファイル
+* 1ファイル最大1 MiB
+* 抽出テキストは1ファイル最大12,000文字
+* `.txt` / `.md` はGUIでテキスト抽出する
+* `.pdf` はbridge側で `pypdf` が利用できる場合だけテキスト抽出する
+
+添付本文は回答生成の一時コンテキストとして使います。live JSONL には本文全文を保存せず、ファイル名、形式、抽出状態、文字数、切り詰め有無だけをuser発言のメタデータとして残します。詳細方針は `docs/file_attachments_mvp.md` に整理しています。
+
+## RT-0013 Background Finalize Jobs
+
+「整理して保存」は同期実行ではなく、`logs/chat_gui_jobs/*.json` を状態ファイルとするバックグラウンドジョブとして起動します。
+
+ジョブ状態:
+
+* `queued`
+* `running`
+* `succeeded`
+* `failed`
+* `cancelled`
+
+GUIはジョブIDをpollして、進捗、現在段階、完了結果、エラー、ログパスを表示します。ジョブ中も画面は応答しますが、同じセッションへの新規送信は競合防止のため無効化します。詳細は `docs/background_jobs.md` に整理しています。
+
+## RT-0014 Local Data Management
+
+GUIに読み取り専用のローカルデータ管理画面を追加します。
+
+表示対象:
+
+* `conversations/`
+* `journal/`
+* `memory/`
+* `inbox/`
+* `tasks/`
+* `imports/`
+* `logs/`
+* `memory/search_index.sqlite3`
+
+MVPでは削除、移動、編集、index再構築、memory更新、Git操作を行いません。保存先フォルダを開く導線と privacy check コマンドの確認導線だけを提供します。詳細方針は `docs/local_data_management.md` に整理しています。

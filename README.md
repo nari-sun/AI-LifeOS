@@ -16,7 +16,7 @@ python scripts\privacy_check.py --publish
 
 `--publish` は tracked files と未追跡の公開候補ファイルを対象に、通常の secret/email/phone 検出に加えて URL query secret、長いランダム文字列、`.env` 形式の秘密値、住所らしき文字列、個人データディレクトリの誤追加を強めに確認します。
 
-誤検出の場合は、該当行に `privacy-check: allow` と理由をコメントで残してください。inline allowlist は住所・メールアドレス・長いランダム文字列など偽陽性が起きやすい検出だけに効きます。API key、token、bearer、URL query secret などの高確度secretは allowlist では通さず、公開前に除去してください。`conversations`、`journal`、`memory`、`inbox`、`tasks`、`renovationTickets` 配下の個人データも allowlist では通さず、PublicEditionに含めないでください。
+誤検出の場合は、該当行に `privacy-check: allow` と理由をコメントで残してください。inline allowlist は住所・メールアドレス・長いランダム文字列など偽陽性が起きやすい検出だけに効きます。API key、token、bearer、URL query secret などの高確度secretは allowlist では通さず、公開前に除去してください。`conversations`、`journal`、`memory`、`inbox`、`tasks`、`imports`、`renovationTickets` 配下の個人データも allowlist では通さず、PublicEditionに含めないでください。
 
 AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、後から検索・要約・日記・長期メモリとして活用するための個人用AI記憶システムです。
 
@@ -49,7 +49,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - PowerShell上で live 会話を行い、`inbox/live/*.jsonl` に user / assistant 発言を逐次保存する
 - live JSONLを raw.md に変換し、既存の Phase2.5 記憶整理へ接続する
 - live 会話セッションを `.session.json` として保存し、最後のuser入力から10日以内のセッションを再開する
-- Tauri GUIから新規チャット、送信、保存、セッション再開、整理して保存を実行する
+- Tauri GUIから新規チャット、送信、履歴再開、添付、ローカルデータ確認、バックグラウンド整理を実行する
 - 保存済みの raw.md / summary.md / journal / memory を検索する
 - `memory/search_index.sqlite3` を再構築可能な検索indexとして生成する
 - 私的な質問や好みに関係する会話では、`memory/long_term.md` と `memory/preferences.md` を読み取り専用コンテキストとして回答に渡す
@@ -128,6 +128,10 @@ AI-LifeOS/
 │  ├─ codex_conversation_mvp.md
 │  ├─ session_save_mvp.md
 │  ├─ chat_gui_mvp.md
+│  ├─ background_jobs.md
+│  ├─ file_attachments_mvp.md
+│  ├─ local_data_management.md
+│  ├─ phase4_tool_integration_design.md
 │  ├─ searchable_memory.md
 │  ├─ response_settings_ui.md
 │  ├─ vector_search_evaluation.md
@@ -455,10 +459,12 @@ GUIでできること:
 - 新規チャット作成
 - メッセージ送信
 - user / assistant 発言の表示
-- セッション保存
+- 送信直後のuser発言の一時表示
+- `.txt` / `.md` / `.pdf` 添付MVP
 - 10日以内の再開可能セッション一覧表示
 - セッション再開
-- 「整理して保存」による raw.md 化と summary / journal / memory 更新
+- 「整理して保存」による raw.md 化と summary / journal / memory 更新のバックグラウンド実行
+- ローカル個人データ状況の読み取り専用表示
 - エラー表示
 
 GUIでまだやらないこと:
@@ -488,6 +494,11 @@ save-session
 list-resumable
 resume-session
 finalize-session
+start-finalize-job
+get-finalize-job
+cancel-finalize-job
+local-data-report
+open-local-data-folder
 ```
 
 ## Logs
@@ -498,6 +509,8 @@ GUI関連ログ:
 logs/chat_gui_task.log
 logs/chat_gui_tauri.log
 logs/chat_gui_bridge.log
+logs/chat_gui_jobs/*.json
+logs/chat_gui_jobs/*.log
 ```
 
 `chat_gui_task.log` は PowerShellタスク、npm、Vite、Tauri dev/build の出力を残します。`chat_gui_tauri.log` は Tauri から Python ブリッジを呼ぶ前後の状態を残します。`chat_gui_bridge.log` は Python ブリッジのコマンド開始・完了・エラー種別を残します。

@@ -101,6 +101,7 @@ logs/tts/
 ```
 
 ただし PublicEdition では、これらは `.gitignore` 対象にします。
+実装前に、Kokoro のPython package、モデル配布元、model card、ライセンス、voiceごとの利用条件、Windowsセットアップ手順を具体名で確認します。確認結果をREADMEまたはdocsへ記録するまで、GUI本体の必須依存にはしません。
 
 ## UI Requirements
 
@@ -161,6 +162,8 @@ Kokoro は軽量寄りですが、初回ロードには時間がかかります�
 - 日本語 G2P 用依存の確認
 - Tauri からローカル wav を再生する方式の確認
 - `.gitignore` のキャッシュ・生成物除外確認
+- `cache/tts/` と `logs/tts/` がPublicEditionのGit管理対象外であることの確認
+- Kokoro package / model / voice の取得元、バージョン、ライセンス、Windows導入コマンドの確認
 
 ## Risks
 

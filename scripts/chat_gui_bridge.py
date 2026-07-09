@@ -1,4 +1,6 @@
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
@@ -8,15 +10,25 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from build_answer_context import AnswerContext, MemoryContextReference
 from codex_conversation import generate_assistant_reply_with_context
 from finalize_live_chat import finalize_live_chat
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
+from local_data_report import build_local_data_report
 from session_store import cleanup_expired_sessions, get_session_organization, list_resumable_sessions, load_resume_session, save_session
 
 GUI_LOG_ENV = "AI_LIFEOS_GUI_LOG"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+MAX_ATTACHMENTS = 3
+MAX_ATTACHMENT_BYTES = 1024 * 1024
+MAX_ATTACHMENT_TEXT_CHARS = 12_000
+ALLOWED_ATTACHMENT_EXTENSIONS = {".txt", ".md", ".pdf"}
+TEXT_ATTACHMENT_EXTENSIONS = {".txt", ".md"}
+JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+LOCAL_DATA_FOLDERS = {"conversations", "journal", "memory", "inbox", "tasks", "imports", "logs"}
+BACKGROUND_PROCESSES: list[subprocess.Popen[str]] = []
 
 
 class AssistantGenerationCancelled(RuntimeError):
@@ -51,8 +63,12 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
 
     session = LiveSession(path=session_file, started_at=_session_started_at(session_file))
     messages = _read_live_messages(session_file)
+    attachments = _normalize_attachments(payload.get("attachments"))
+    attachment_metadata = _format_attachment_metadata_for_saved_message(attachments)
+    saved_user_content = content + attachment_metadata
+    prompt_user_content = _format_user_content_for_generation(content, attachments)
 
-    user_message = create_live_message("user", content)
+    user_message = create_live_message("user", saved_user_content)
     session.append_message(user_message.role, user_message.content, user_message.timestamp)
     messages.append(user_message)
     _save_session_metadata(root=root, session_file=session_file, status="saved")
@@ -64,9 +80,10 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
     if not bool(payload.get("no_ai", False)):
         try:
             run_command = _cancelable_run_command(root=root, cancel_file=cancel_file) if cancel_file else subprocess.run
+            generation_messages = _messages_for_generation(messages, user_message, prompt_user_content)
             reply_result = generate_assistant_reply_with_context(
                 root=root,
-                messages=messages,
+                messages=generation_messages,
                 codex_command=str(payload.get("codex_command") or "codex.cmd"),
                 sandbox=str(payload.get("codex_sandbox") or "read-only"),
                 approval=str(payload.get("codex_approval") or "never"),
@@ -104,6 +121,7 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
         "messages": [_serialize_message(message) for message in messages],
         "assistant": _serialize_message(assistant_message) if assistant_message else None,
         "memory_context": _serialize_memory_context(memory_context),
+        "attachments": [_serialize_attachment_report(attachment) for attachment in attachments],
         "error": error,
         "cancelled": cancelled,
     }
@@ -190,12 +208,14 @@ def handle_finalize_session(payload: dict[str, Any]) -> dict[str, Any]:
 def handle_cleanup_expired(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
     retention_days = int(payload.get("retention_days") or 10)
-    _gui_log(root, f"cleanup_expired.start days={retention_days}")
+    delete = bool(payload.get("delete", False))
+    auto_finalize = bool(payload.get("auto_finalize", False))
+    _gui_log(root, f"cleanup_expired.start days={retention_days} delete={delete} auto_finalize={auto_finalize}")
     results = cleanup_expired_sessions(
         root=root,
         retention_days=retention_days,
-        delete=True,
-        auto_finalize=True,
+        delete=delete,
+        auto_finalize=auto_finalize,
     )
     _gui_log(root, f"cleanup_expired.done count={len(results)}")
     return {
@@ -212,6 +232,107 @@ def handle_cleanup_expired(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def handle_local_data_report(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    _gui_log(root, "local_data_report.start")
+    report = build_local_data_report(root=root)
+    _gui_log(root, "local_data_report.done")
+    return {"report": report}
+
+
+def handle_open_local_data_folder(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    folder = str(payload.get("folder") or "").strip()
+    if folder not in LOCAL_DATA_FOLDERS:
+        raise ValueError("開けるフォルダはローカルデータ管理対象に限定されています。")
+
+    path = (root / folder).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as exc:
+        raise ValueError("フォルダはAI-LifeOSルート内を指定してください。") from exc
+    if not path.exists() or not path.is_dir():
+        raise FileNotFoundError(f"フォルダが見つかりません: {folder}")
+
+    _open_folder(path)
+    _gui_log(root, f"open_local_data_folder.done folder={folder}")
+    return {"folder": folder, "path": _display_path(path, root)}
+
+
+def handle_start_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    session_file = _resolve_existing_session(root=root, value=payload.get("session_file"))
+    job_id = _new_job_id()
+    log_path = _job_log_path(root, job_id)
+    cancel_file = _job_cancel_file(root, job_id)
+    _write_job_status(
+        root,
+        job_id,
+        {
+            "job_id": job_id,
+            "name": "finalize-session",
+            "status": "queued",
+            "stage": "queued",
+            "message": "整理ジョブを開始待ちです。",
+            "error": None,
+            "percent": 0,
+            "session_file": _display_path(session_file, root),
+            "log_path": _display_path(log_path, root),
+            "cancel_file": _display_path(cancel_file, root),
+            "created_at": _now_iso(),
+            "started_at": None,
+            "finished_at": None,
+            "result": None,
+        },
+    )
+
+    worker_payload = {
+        "root": str(root),
+        "job_id": job_id,
+        "session_file": _display_path(session_file, root),
+        "run_codex": bool(payload.get("run_codex", True)),
+        "codex_command": str(payload.get("codex_command") or "codex.cmd"),
+        "codex_approval": str(payload.get("codex_approval") or "never"),
+    }
+    _spawn_finalize_worker(root=root, payload=worker_payload, log_path=log_path)
+    _gui_log(root, f"finalize_job.started job_id={job_id} session={session_file.stem}")
+    return {"job": _read_job_status(root, job_id)}
+
+
+def handle_get_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    job_id = _required_job_id(payload.get("job_id"))
+    return {"job": _read_job_status(root, job_id)}
+
+
+def handle_cancel_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    job_id = _required_job_id(payload.get("job_id"))
+    status = _read_job_status(root, job_id)
+    if status.get("status") not in {"succeeded", "failed", "cancelled"}:
+        cancel_file = _job_cancel_file(root, job_id)
+        cancel_file.parent.mkdir(parents=True, exist_ok=True)
+        cancel_file.write_text(_now_iso(), encoding="utf-8")
+        status = _write_job_status(
+            root,
+            job_id,
+            {
+                "status": status.get("status", "running"),
+                "message": "キャンセル要求を送信しました。",
+                "cancel_requested_at": _now_iso(),
+            },
+        )
+        _gui_log(root, f"finalize_job.cancel_requested job_id={job_id}")
+    return {"job": status}
+
+
+def handle_run_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    job_id = _required_job_id(payload.get("job_id"))
+    _run_finalize_job(root=root, payload=payload, job_id=job_id)
+    return {"job": _read_job_status(root, job_id)}
+
+
 COMMANDS = {
     "start-session": handle_start_session,
     "send-message": handle_send_message,
@@ -221,6 +342,12 @@ COMMANDS = {
     "resume-session": handle_resume_session,
     "finalize-session": handle_finalize_session,
     "cleanup-expired": handle_cleanup_expired,
+    "local-data-report": handle_local_data_report,
+    "open-local-data-folder": handle_open_local_data_folder,
+    "start-finalize-job": handle_start_finalize_job,
+    "get-finalize-job": handle_get_finalize_job,
+    "cancel-finalize-job": handle_cancel_finalize_job,
+    "run-finalize-job": handle_run_finalize_job,
 }
 
 
@@ -328,6 +455,207 @@ def _result_log_summary(result: dict[str, Any]) -> str:
     if "raw_file" in result:
         return f"raw_file={result['raw_file']}"
     return "-"
+
+
+def _open_folder(path: Path) -> None:
+    if os.name == "nt":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+        return
+
+    command = ["open", str(path)] if sys.platform == "darwin" else ["xdg-open", str(path)]
+    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _new_job_id() -> str:
+    return uuid4().hex
+
+
+def _required_job_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if not JOB_ID_PATTERN.fullmatch(text):
+        raise ValueError("job_id が不正です。")
+    return text
+
+
+def _job_dir(root: Path) -> Path:
+    return root / "logs" / "chat_gui_jobs"
+
+
+def _job_status_path(root: Path, job_id: str) -> Path:
+    return _job_dir(root) / f"{job_id}.json"
+
+
+def _job_log_path(root: Path, job_id: str) -> Path:
+    return _job_dir(root) / f"{job_id}.log"
+
+
+def _job_cancel_file(root: Path, job_id: str) -> Path:
+    return _job_dir(root) / f"{job_id}.cancel"
+
+
+def _read_job_status(root: Path, job_id: str) -> dict[str, Any]:
+    path = _job_status_path(root, job_id)
+    if not path.exists():
+        raise FileNotFoundError(f"ジョブが見つかりません: {job_id}")
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"ジョブ状態ファイルが壊れています: {job_id}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"ジョブ状態ファイルが不正です: {job_id}")
+    return value
+
+
+def _write_job_status(root: Path, job_id: str, update: dict[str, Any]) -> dict[str, Any]:
+    path = _job_status_path(root, job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            current = loaded if isinstance(loaded, dict) else {}
+        except json.JSONDecodeError:
+            current = {}
+    current.update(update)
+    temp_path = path.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp_path.replace(path)
+    return current
+
+
+def _spawn_finalize_worker(root: Path, payload: dict[str, Any], log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("a", encoding="utf-8")
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "run-finalize-job"],
+            cwd=root,
+            env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            stdin=subprocess.PIPE,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            creationflags=creationflags,
+        )
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(payload, ensure_ascii=False))
+        process.stdin.close()
+        BACKGROUND_PROCESSES.append(process)
+        log_handle.close()
+    except Exception:
+        log_handle.close()
+        raise
+
+
+def _run_finalize_job(root: Path, payload: dict[str, Any], job_id: str) -> None:
+    session_file = _resolve_existing_session(root=root, value=payload.get("session_file"))
+    cancel_file = _job_cancel_file(root, job_id)
+    _write_job_status(
+        root,
+        job_id,
+        {
+            "status": "running",
+            "stage": "starting",
+            "message": "整理処理を開始しました。",
+            "percent": 5,
+            "started_at": _now_iso(),
+        },
+    )
+
+    def progress(percent: int, message: str) -> None:
+        if cancel_file.exists():
+            raise AssistantGenerationCancelled("整理ジョブをキャンセルしました。")
+        _write_job_status(
+            root,
+            job_id,
+            {
+                "status": "running",
+                "stage": _stage_from_progress_message(message),
+                "message": message,
+                "percent": percent,
+            },
+        )
+
+    try:
+        run_command = _cancelable_run_command(root=root, cancel_file=cancel_file)
+        result = finalize_live_chat(
+            root=root,
+            session_file=session_file,
+            run_codex=bool(payload.get("run_codex", True)),
+            commit=False,
+            force=True,
+            codex_command=str(payload.get("codex_command") or "codex.cmd"),
+            codex_sandbox="workspace-write",
+            codex_approval=str(payload.get("codex_approval") or "never"),
+            progress=progress,
+            run_command=run_command,
+        )
+        _write_job_status(
+            root,
+            job_id,
+            {
+                "status": "succeeded",
+                "stage": "done",
+                "message": "整理処理が完了しました。",
+                "percent": 100,
+                "finished_at": _now_iso(),
+                "result": {
+                    "ok": True,
+                    "session": _serialize_session_file(result.jsonl_file, root),
+                    "jsonl_file": _display_path(result.jsonl_file, root),
+                    "raw_file": _display_path(result.raw_file, root),
+                    "task_file": _display_path(result.task_file, root),
+                    "imported_at": result.imported_at.isoformat(timespec="seconds"),
+                    "codex_updated": bool(result.codex),
+                    "git_committed": bool(result.git and result.git.committed),
+                    "organization": result.organization,
+                },
+            },
+        )
+    except AssistantGenerationCancelled as exc:
+        _write_job_status(
+            root,
+            job_id,
+            {
+                "status": "cancelled",
+                "stage": "cancelled",
+                "message": str(exc),
+                "finished_at": _now_iso(),
+            },
+        )
+    except Exception as exc:
+        _write_job_status(
+            root,
+            job_id,
+            {
+                "status": "failed",
+                "stage": "failed",
+                "message": "整理処理に失敗しました。",
+                "error": f"{type(exc).__name__}: {exc}",
+                "finished_at": _now_iso(),
+            },
+        )
+        raise
+
+
+def _stage_from_progress_message(message: str) -> str:
+    lowered = message.lower()
+    if "raw" in lowered:
+        return "raw"
+    if "memory" in lowered or "journal" in lowered or "summary" in lowered:
+        return "memory"
+    if "index" in lowered:
+        return "index"
+    return "running"
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _payload_root(payload: dict[str, Any]) -> Path:
@@ -570,6 +898,218 @@ def _serialize_memory_reference(reference: MemoryContextReference) -> dict[str, 
         "snippet": reference.snippet,
         "score": reference.score,
     }
+
+
+def _normalize_attachments(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("attachments must be a list.")
+    if len(value) > MAX_ATTACHMENTS:
+        raise ValueError(f"添付ファイルは1回の送信で最大{MAX_ATTACHMENTS}件までです。")
+
+    reports = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("attachment must be an object.")
+        reports.append(_normalize_attachment(item))
+    return reports
+
+
+def _normalize_attachment(item: dict[str, Any]) -> dict[str, Any]:
+    file_name = _safe_attachment_name(str(item.get("name") or item.get("file_name") or "attachment"))
+    extension = Path(file_name).suffix.lower()
+    size_bytes = _optional_int_value(item.get("size_bytes")) or 0
+    report: dict[str, Any] = {
+        "file_name": file_name,
+        "extension": extension.lstrip(".") or "unknown",
+        "size_bytes": size_bytes,
+        "status": "error",
+        "error": None,
+        "extracted_chars": 0,
+        "truncated": bool(item.get("truncated", False)),
+        "_text": "",
+    }
+
+    if extension not in ALLOWED_ATTACHMENT_EXTENSIONS:
+        report["error"] = "未対応のファイル形式です。"
+        return report
+    if size_bytes > MAX_ATTACHMENT_BYTES:
+        report["error"] = f"ファイルサイズが上限({MAX_ATTACHMENT_BYTES} bytes)を超えています。"
+        return report
+
+    try:
+        if extension in TEXT_ATTACHMENT_EXTENSIONS:
+            text = _attachment_text(item)
+        elif extension == ".pdf":
+            text = _extract_pdf_text_from_attachment(item)
+        else:
+            text = ""
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        return report
+
+    text = _normalize_attachment_text(text)
+    truncated = bool(report["truncated"]) or len(text) > MAX_ATTACHMENT_TEXT_CHARS
+    if truncated:
+        text = text[:MAX_ATTACHMENT_TEXT_CHARS]
+
+    if not text.strip():
+        report["error"] = "抽出できる本文がありません。"
+        return report
+
+    report.update(
+        {
+            "status": "extracted",
+            "error": None,
+            "extracted_chars": len(text),
+            "truncated": truncated,
+            "_text": text,
+        }
+    )
+    return report
+
+
+def _attachment_text(item: dict[str, Any]) -> str:
+    text = item.get("text")
+    if isinstance(text, str):
+        return text
+
+    raw = _attachment_bytes(item)
+    return raw.decode("utf-8", errors="replace")
+
+
+def _attachment_bytes(item: dict[str, Any]) -> bytes:
+    data_base64 = item.get("data_base64")
+    if not isinstance(data_base64, str) or not data_base64:
+        raise ValueError("添付ファイル本文がありません。")
+    try:
+        data = base64.b64decode(data_base64, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("添付ファイルのbase64が不正です。") from exc
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise ValueError(f"ファイルサイズが上限({MAX_ATTACHMENT_BYTES} bytes)を超えています。")
+    return data
+
+
+def _extract_pdf_text_from_attachment(item: dict[str, Any]) -> str:
+    raw = _attachment_bytes(item)
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise RuntimeError("PDF抽出には pypdf が必要です。") from exc
+
+    import io
+
+    reader = PdfReader(io.BytesIO(raw))
+    texts = []
+    for page in reader.pages[:20]:
+        texts.append(page.extract_text() or "")
+    return "\n\n".join(texts)
+
+
+def _normalize_attachment_text(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _safe_attachment_name(value: str) -> str:
+    name = Path(value.replace("\\", "/")).name.strip() or "attachment"
+    name = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    if not name:
+        name = "attachment"
+    if len(name) > 120:
+        suffix = Path(name).suffix
+        stem_limit = max(1, 120 - len(suffix) - 3)
+        name = f"{Path(name).stem[:stem_limit]}...{suffix}"
+    return name
+
+
+def _format_attachment_metadata_for_saved_message(attachments: list[dict[str, Any]]) -> str:
+    if not attachments:
+        return ""
+
+    lines = ["", "", "[Attachments]"]
+    for attachment in attachments:
+        parts = [
+            f"name={attachment['file_name']}",
+            f"type={attachment['extension']}",
+            f"status={attachment['status']}",
+            f"chars={attachment['extracted_chars']}",
+            f"truncated={'yes' if attachment['truncated'] else 'no'}",
+        ]
+        if attachment.get("error"):
+            parts.append(f"error={_safe_log_text(str(attachment['error']), max_length=160)}")
+        lines.append("- " + "; ".join(parts))
+    return "\n".join(lines)
+
+
+def _format_user_content_for_generation(content: str, attachments: list[dict[str, Any]]) -> str:
+    context = _attachment_context_text(attachments)
+    if not context:
+        return content
+    return "\n\n".join(
+        [
+            content,
+            "---",
+            "添付ファイルの一時コンテキストです。本文はlive JSONLには保存せず、この回答生成だけに使います。",
+            context,
+        ]
+    )
+
+
+def _attachment_context_text(attachments: list[dict[str, Any]]) -> str:
+    sections = []
+    for attachment in attachments:
+        if attachment.get("status") != "extracted":
+            continue
+        sections.extend(
+            [
+                f"## {attachment['file_name']}",
+                f"type: {attachment['extension']}, chars: {attachment['extracted_chars']}, truncated: {attachment['truncated']}",
+                "",
+                str(attachment.get("_text") or ""),
+            ]
+        )
+    return "\n".join(sections).strip()
+
+
+def _messages_for_generation(
+    messages: list[LiveMessage],
+    saved_user_message: LiveMessage,
+    prompt_user_content: str,
+) -> list[LiveMessage]:
+    if prompt_user_content == saved_user_message.content:
+        return messages
+
+    generation_messages = list(messages)
+    generation_messages[-1] = LiveMessage(
+        role=saved_user_message.role,
+        content=prompt_user_content,
+        timestamp=saved_user_message.timestamp,
+    )
+    return generation_messages
+
+
+def _serialize_attachment_report(attachment: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "file_name": attachment["file_name"],
+        "extension": attachment["extension"],
+        "size_bytes": attachment["size_bytes"],
+        "status": attachment["status"],
+        "error": attachment["error"],
+        "extracted_chars": attachment["extracted_chars"],
+        "truncated": attachment["truncated"],
+    }
+
+
+def _optional_int_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _serialize_saved_session(session: Any, root: Path) -> dict[str, Any]:

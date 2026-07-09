@@ -35,12 +35,15 @@ memory/**
 tasks/**
 !tasks/
 !tasks/.gitkeep
-inbox/chat.txt
-inbox/live/**
+inbox/**
+!inbox/
+!inbox/.gitkeep
 
 imports/**
 !imports/
 !imports/.gitkeep
+
+cache/
 
 # Local questionnaires and private answers
 questionnaire/
