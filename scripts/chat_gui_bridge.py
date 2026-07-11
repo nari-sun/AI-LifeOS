@@ -7,13 +7,17 @@ import re
 import subprocess
 import sys
 import traceback
-from datetime import datetime
+from datetime import date, datetime, time as datetime_time
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
 from build_answer_context import AnswerContext, MemoryContextReference
-from codex_conversation import generate_assistant_reply_with_context
+from codex_conversation import (
+    AppServerStreamingUnavailable,
+    generate_assistant_reply_streaming_with_context,
+    generate_assistant_reply_with_context,
+)
 from finalize_live_chat import finalize_live_chat
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from local_data_report import build_local_data_report
@@ -24,7 +28,10 @@ REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 MAX_ATTACHMENTS = 3
 MAX_ATTACHMENT_BYTES = 1024 * 1024
 MAX_ATTACHMENT_TEXT_CHARS = 12_000
-ALLOWED_ATTACHMENT_EXTENSIONS = {".txt", ".md", ".pdf"}
+MAX_XLSX_SHEETS = 20
+MAX_XLSX_ROWS_PER_SHEET = 200
+MAX_XLSX_COLUMNS_PER_SHEET = 50
+ALLOWED_ATTACHMENT_EXTENSIONS = {".txt", ".md", ".pdf", ".xlsx"}
 TEXT_ATTACHMENT_EXTENSIONS = {".txt", ".md"}
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 LOCAL_DATA_FOLDERS = {"conversations", "journal", "memory", "inbox", "tasks", "imports", "logs"}
@@ -45,7 +52,10 @@ def handle_start_session(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
+def handle_send_message(
+    payload: dict[str, Any],
+    on_delta: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     root = _payload_root(payload)
     content = str(payload.get("content", "")).strip()
     if not content:
@@ -81,15 +91,36 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             run_command = _cancelable_run_command(root=root, cancel_file=cancel_file) if cancel_file else subprocess.run
             generation_messages = _messages_for_generation(messages, user_message, prompt_user_content)
-            reply_result = generate_assistant_reply_with_context(
-                root=root,
-                messages=generation_messages,
-                codex_command=str(payload.get("codex_command") or "codex.cmd"),
-                sandbox=str(payload.get("codex_sandbox") or "read-only"),
-                approval=str(payload.get("codex_approval") or "never"),
-                max_context_messages=int(payload.get("max_context_messages") or 20),
-                run_command=run_command,
-            )
+            generation_options = {
+                "root": root,
+                "messages": generation_messages,
+                "codex_command": str(payload.get("codex_command") or "codex.cmd"),
+                "sandbox": str(payload.get("codex_sandbox") or "read-only"),
+                "approval": str(payload.get("codex_approval") or "never"),
+                "max_context_messages": int(payload.get("max_context_messages") or 20),
+            }
+            if on_delta is None:
+                reply_result = generate_assistant_reply_with_context(
+                    **generation_options,
+                    run_command=run_command,
+                )
+            else:
+                try:
+                    reply_result = generate_assistant_reply_streaming_with_context(
+                        **generation_options,
+                        on_delta=on_delta,
+                        is_cancelled=(lambda: bool(cancel_file and cancel_file.exists())),
+                    )
+                except AppServerStreamingUnavailable as exc:
+                    _gui_log(
+                        root,
+                        "send_message.streaming_fallback "
+                        f"session={session_file.stem} request_id={request_id or '-'} message={_safe_log_text(str(exc))}",
+                    )
+                    reply_result = generate_assistant_reply_with_context(
+                        **generation_options,
+                        run_command=run_command,
+                    )
             reply = reply_result.reply
             memory_context = reply_result.memory_context
             if cancel_file and cancel_file.exists():
@@ -99,7 +130,7 @@ def handle_send_message(payload: dict[str, Any]) -> dict[str, Any]:
             messages.append(saved_assistant)
             assistant_message = saved_assistant
             _save_session_metadata(root=root, session_file=session_file, status="saved")
-        except AssistantGenerationCancelled as exc:
+        except (AssistantGenerationCancelled, InterruptedError) as exc:
             cancelled = True
             _gui_log(
                 root,
@@ -336,6 +367,7 @@ def handle_run_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
 COMMANDS = {
     "start-session": handle_start_session,
     "send-message": handle_send_message,
+    "send-message-stream": handle_send_message,
     "cancel-message": handle_cancel_message,
     "save-session": handle_save_session,
     "list-resumable": handle_list_resumable,
@@ -363,6 +395,10 @@ def main() -> int:
         payload = _read_payload()
         root = _payload_root(payload)
         _gui_log(root, f"command.start name={args.command} payload={_payload_log_summary(payload)}")
+        if args.command == "send-message-stream":
+            result = handle_send_message(payload, on_delta=_write_stream_delta)
+            _write_json({"type": "result", "data": {"ok": True, **result}})
+            return 0
         result = COMMANDS[args.command](payload)
         _gui_log(root, f"command.success name={args.command} result={_result_log_summary(result)}")
         _write_json({"ok": True, **result})
@@ -370,7 +406,11 @@ def main() -> int:
     except Exception as exc:
         _gui_log(root, f"command.error name={args.command} {_format_exception(exc)}")
         _gui_log(root, "command.traceback\n" + traceback.format_exc())
-        _write_json({"ok": False, "error": str(exc), "type": type(exc).__name__})
+        error_result = {"ok": False, "error": str(exc), "type": type(exc).__name__}
+        if args.command == "send-message-stream":
+            _write_json({"type": "result", "data": error_result})
+        else:
+            _write_json(error_result)
         return 1
 
 
@@ -394,6 +434,11 @@ def _read_payload() -> dict[str, Any]:
 def _write_json(value: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
     sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _write_stream_delta(delta: str) -> None:
+    _write_json({"type": "delta", "delta": delta})
 
 
 def _gui_log_path(root: Path | str | None = None) -> Path:
@@ -938,11 +983,14 @@ def _normalize_attachment(item: dict[str, Any]) -> dict[str, Any]:
         report["error"] = f"ファイルサイズが上限({MAX_ATTACHMENT_BYTES} bytes)を超えています。"
         return report
 
+    extractor_truncated = False
     try:
         if extension in TEXT_ATTACHMENT_EXTENSIONS:
             text = _attachment_text(item)
         elif extension == ".pdf":
             text = _extract_pdf_text_from_attachment(item)
+        elif extension == ".xlsx":
+            text, extractor_truncated = _extract_xlsx_text_from_attachment(item)
         else:
             text = ""
     except Exception as exc:
@@ -950,7 +998,7 @@ def _normalize_attachment(item: dict[str, Any]) -> dict[str, Any]:
         return report
 
     text = _normalize_attachment_text(text)
-    truncated = bool(report["truncated"]) or len(text) > MAX_ATTACHMENT_TEXT_CHARS
+    truncated = bool(report["truncated"]) or extractor_truncated or len(text) > MAX_ATTACHMENT_TEXT_CHARS
     if truncated:
         text = text[:MAX_ATTACHMENT_TEXT_CHARS]
 
@@ -1006,6 +1054,90 @@ def _extract_pdf_text_from_attachment(item: dict[str, Any]) -> str:
     for page in reader.pages[:20]:
         texts.append(page.extract_text() or "")
     return "\n\n".join(texts)
+
+
+def _extract_xlsx_text_from_attachment(item: dict[str, Any]) -> tuple[str, bool]:
+    raw = _attachment_bytes(item)
+    workbook = _load_xlsx_workbook(raw)
+    lines: list[str] = []
+    extracted_length = 0
+    truncated = False
+
+    try:
+        visible_sheets = [sheet for sheet in workbook.worksheets if sheet.sheet_state == "visible"]
+        if len(visible_sheets) > MAX_XLSX_SHEETS:
+            truncated = True
+
+        for sheet in visible_sheets[:MAX_XLSX_SHEETS]:
+            max_row = min(sheet.max_row or 1, MAX_XLSX_ROWS_PER_SHEET)
+            max_column = min(sheet.max_column or 1, MAX_XLSX_COLUMNS_PER_SHEET)
+            if (sheet.max_row or 0) > max_row or (sheet.max_column or 0) > max_column:
+                truncated = True
+
+            sheet_lines: list[str] = []
+            for row_number, row in enumerate(
+                sheet.iter_rows(
+                    min_row=1,
+                    max_row=max_row,
+                    min_col=1,
+                    max_col=max_column,
+                    values_only=True,
+                ),
+                start=1,
+            ):
+                values = [_xlsx_cell_text(value) for value in row]
+                while values and not values[-1]:
+                    values.pop()
+                if not values:
+                    continue
+
+                row_text = f"Row {row_number}: " + "\t".join(values)
+                remaining = MAX_ATTACHMENT_TEXT_CHARS + 1 - extracted_length
+                if len(row_text) > remaining:
+                    row_text = row_text[:remaining]
+                    truncated = True
+                sheet_lines.append(row_text)
+                extracted_length += len(row_text) + 1
+                if extracted_length > MAX_ATTACHMENT_TEXT_CHARS:
+                    truncated = True
+                    break
+
+            if sheet_lines:
+                header = f"# Sheet: {_xlsx_cell_text(sheet.title)}"
+                lines.extend([header, *sheet_lines, ""])
+                extracted_length += len(header) + 2
+            if extracted_length > MAX_ATTACHMENT_TEXT_CHARS:
+                break
+    finally:
+        workbook.close()
+
+    return "\n".join(lines).strip(), truncated
+
+
+def _load_xlsx_workbook(raw: bytes):
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("Excel抽出には openpyxl が必要です。") from exc
+
+    import io
+
+    try:
+        return load_workbook(io.BytesIO(raw), read_only=True, data_only=False, keep_links=False)
+    except Exception as exc:
+        raise ValueError(f"Excelファイルを開けませんでした: {exc}") from exc
+
+
+def _xlsx_cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, (date, datetime_time)):
+        return value.isoformat()
+    return re.sub(r"[\r\n\t]+", " ", str(value)).strip()
 
 
 def _normalize_attachment_text(text: str) -> str:

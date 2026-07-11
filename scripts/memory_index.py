@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+from memory_items import read_memory_item
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INDEX_PATH = Path("memory") / "search_index.sqlite3"
@@ -22,6 +24,12 @@ class MemoryDocument:
     date: str | None
     tags: tuple[str, ...]
     content: str
+    category: str | None = None
+    category_label: str | None = None
+    status: str | None = None
+    source: str | None = None
+    source_date: str | None = None
+    confidence: str | None = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +41,12 @@ class MemorySearchResult:
     tags: tuple[str, ...]
     snippet: str
     score: int
+    category: str | None = None
+    category_label: str | None = None
+    status: str | None = None
+    source: str | None = None
+    source_date: str | None = None
+    confidence: str | None = None
 
 
 def default_index_path(root: Path | str = ROOT) -> Path:
@@ -70,15 +84,28 @@ def collect_documents(root: Path | str = ROOT) -> list[MemoryDocument]:
             continue
 
         relative = _relative_path(path, root)
+        structured = None
+        if document_type == "memory_item":
+            try:
+                structured = read_memory_item(path)
+            except ValueError:
+                continue
+
         documents.append(
             MemoryDocument(
                 document_key=relative,
                 document_type=document_type,
                 path=path,
-                title=_extract_title(content, path),
-                date=_extract_date(content, path, root, document_type),
-                tags=tuple(_extract_tags(content)),
-                content=content,
+                title=structured.category_label if structured else _extract_title(content, path),
+                date=structured.source_date if structured else _extract_date(content, path, root, document_type),
+                tags=structured.tags if structured else tuple(_extract_tags(content)),
+                content=structured.content if structured else content,
+                category=structured.category if structured else None,
+                category_label=structured.category_label if structured else None,
+                status=structured.status if structured else None,
+                source=structured.source if structured else None,
+                source_date=structured.source_date if structured else None,
+                confidence=structured.confidence if structured else None,
             )
         )
 
@@ -109,6 +136,8 @@ def search_memory(
     limit: int = 10,
     document_types: Iterable[str] | None = None,
     tag: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
     use_index: bool = True,
 ) -> list[MemorySearchResult]:
     root = Path(root)
@@ -116,13 +145,24 @@ def search_memory(
     type_filter = tuple(document_types or ())
 
     if use_index and db_file.exists():
-        documents = _load_documents_from_index(root=root, db_path=db_file, document_types=type_filter, tag=tag)
+        documents = _load_documents_from_index(
+            root=root,
+            db_path=db_file,
+            document_types=type_filter,
+            tag=tag,
+            category=category,
+            status=status,
+        )
     else:
         documents = collect_documents(root)
         if type_filter:
             documents = [document for document in documents if document.document_type in type_filter]
         if tag:
             documents = [document for document in documents if tag in document.tags]
+        if category:
+            documents = [document for document in documents if document.category == category]
+        if status:
+            documents = [document for document in documents if document.status == status]
 
     return _rank_documents(documents, query=query, limit=limit)
 
@@ -140,6 +180,9 @@ def _candidate_paths(root: Path) -> list[Path]:
     memory = root / "memory"
     if memory.exists():
         paths.extend(path for path in memory.glob("*.md") if path.name in SUPPORTED_MEMORY_FILES)
+        items = memory / "items"
+        if items.exists():
+            paths.extend(path for path in items.glob("*.md") if path.is_file())
 
     return sorted(set(paths))
 
@@ -160,6 +203,8 @@ def _document_type(path: Path, root: Path) -> str | None:
     if parts[0] == "journal":
         return "journal"
     if parts[0] == "memory":
+        if len(parts) >= 3 and parts[1] == "items":
+            return "memory_item"
         return "memory"
     return None
 
@@ -241,6 +286,12 @@ def _rank_documents(documents: list[MemoryDocument], query: str, limit: int) -> 
                 tags=document.tags,
                 snippet=_snippet(document.content, terms),
                 score=score,
+                category=document.category,
+                category_label=document.category_label,
+                status=document.status,
+                source=document.source,
+                source_date=document.source_date,
+                confidence=document.confidence,
             )
         )
 
@@ -257,8 +308,10 @@ def _score(document: MemoryDocument, terms: list[str]) -> int:
     for term in terms:
         score += text.count(term.lower())
 
-    if document.document_type == "memory" and score:
+    if document.document_type in {"memory", "memory_item"} and score:
         score += 3
+    if document.document_type == "memory_item" and score:
+        score += 2
     if document.document_type == "summary" and score:
         score += 2
     return score
@@ -339,6 +392,12 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             title TEXT NOT NULL,
             date TEXT,
             tags_json TEXT NOT NULL,
+            category TEXT,
+            category_label TEXT,
+            status TEXT,
+            source TEXT,
+            source_date TEXT,
+            confidence TEXT,
             content TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -351,6 +410,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX idx_documents_type ON documents(document_type);
         CREATE INDEX idx_documents_date ON documents(date);
+        CREATE INDEX idx_documents_category ON documents(category);
+        CREATE INDEX idx_documents_status ON documents(status);
         CREATE INDEX idx_tags_tag ON tags(tag);
         """
     )
@@ -371,8 +432,12 @@ def _insert_documents(connection: sqlite3.Connection, root: Path, documents: lis
     for document in documents:
         cursor = connection.execute(
             """
-            INSERT INTO documents(document_key, document_type, path, title, date, tags_json, content, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO documents(
+                document_key, document_type, path, title, date, tags_json,
+                category, category_label, status, source, source_date, confidence,
+                content, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 document.document_key,
@@ -381,6 +446,12 @@ def _insert_documents(connection: sqlite3.Connection, root: Path, documents: lis
                 document.title,
                 document.date,
                 json.dumps(list(document.tags), ensure_ascii=False),
+                document.category,
+                document.category_label,
+                document.status,
+                document.source,
+                document.source_date,
+                document.confidence,
                 document.content,
                 now,
             ),
@@ -405,9 +476,24 @@ def _load_documents_from_index(
     db_path: Path,
     document_types: tuple[str, ...] = (),
     tag: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
 ) -> list[MemoryDocument]:
+    with closing(sqlite3.connect(db_path)) as connection:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(documents)").fetchall()}
+    structured_columns = {"category", "category_label", "status", "source", "source_date", "confidence"}
+    has_structured_columns = structured_columns.issubset(columns)
+    if (category or status) and not has_structured_columns:
+        return []
+
+    structured_select = (
+        "d.category, d.category_label, d.status, d.source, d.source_date, d.confidence"
+        if has_structured_columns
+        else "NULL, NULL, NULL, NULL, NULL, NULL"
+    )
     query = [
-        "SELECT d.document_key, d.document_type, d.path, d.title, d.date, d.tags_json, d.content",
+        "SELECT d.document_key, d.document_type, d.path, d.title, d.date, d.tags_json,",
+        f"       {structured_select}, d.content",
         "FROM documents d",
     ]
     params: list[object] = []
@@ -422,6 +508,12 @@ def _load_documents_from_index(
     if tag:
         where.append("t.tag = ?")
         params.append(tag)
+    if category:
+        where.append("d.category = ?")
+        params.append(category)
+    if status:
+        where.append("d.status = ?")
+        params.append(status)
     if where:
         query.append("WHERE " + " AND ".join(where))
     query.append("ORDER BY COALESCE(d.date, ''), d.path")
@@ -430,7 +522,21 @@ def _load_documents_from_index(
         rows = connection.execute("\n".join(query), params).fetchall()
 
     documents: list[MemoryDocument] = []
-    for document_key, document_type, path_text, title, date, tags_json, content in rows:
+    for (
+        document_key,
+        document_type,
+        path_text,
+        title,
+        date,
+        tags_json,
+        category_value,
+        category_label,
+        status_value,
+        source,
+        source_date,
+        confidence,
+        content,
+    ) in rows:
         tags = tuple(json.loads(tags_json))
         documents.append(
             MemoryDocument(
@@ -441,6 +547,12 @@ def _load_documents_from_index(
                 date=str(date) if date else None,
                 tags=tags,
                 content=str(content),
+                category=str(category_value) if category_value else None,
+                category_label=str(category_label) if category_label else None,
+                status=str(status_value) if status_value else None,
+                source=str(source) if source else None,
+                source_date=str(source_date) if source_date else None,
+                confidence=str(confidence) if confidence else None,
             )
         )
     return documents

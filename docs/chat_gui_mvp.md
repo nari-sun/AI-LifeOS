@@ -38,7 +38,7 @@ Tauri 2
 * セッションメタデータ保存
 * 「会話を整理して保存」ボタンから `finalize_live_chat.py` 相当の処理をバックグラウンドジョブとして実行
 * 送信直後のuser発言をUI一時状態として表示
-* `.txt` / `.md` / `.pdf` 添付MVP
+* `.txt` / `.md` / `.pdf` / `.xlsx` 添付MVP
 * ローカル個人データの読み取り専用管理画面
 * エラー表示
 
@@ -159,7 +159,7 @@ RT-0008 では、日常的な ChatGPT 風利用に近づけるため、Chat GUI 
 * assistant 返答の読み上げは、Kokoro TTS を任意依存として使う方針を RT-0019 として `docs/kokoro_tts_read_aloud.md` で検討します。
 * エラー時の「入力に戻す」は再送信ではありません。JSONLへの重複保存を避けるため、直前入力を下書きとして戻し、必要ならユーザーが修正して新規メッセージとして送信します。
 * Codex CLI や OS 側の都合でプロセス停止に時間がかかる場合、GUI は「停止中」と表示して bridge の終了を待ちます。
-* token 単位のストリーミング表示は、現行の `codex.cmd exec --output-last-message` 方式では未実装です。必要になった場合は Codex SDK または app-server への置き換えを RT-0017 として `docs/streaming_response_ui.md` で検討します。
+* RT-0017で `codex app-server` の `item/agentMessage/delta` をTauri Channel経由で表示するストリーミングを追加しました。完了したassistant本文だけをJSONLへ1回保存し、停止時の部分出力は保存しません。app-server非対応時は従来の `codex.cmd exec --output-last-message` へフォールバックします。詳細は `docs/streaming_response_ui.md` を参照してください。
 
 ## RT-0009 Conversation History Sidebar
 
@@ -177,7 +177,7 @@ GUIから新規チャット開始と既存セッション再開を選べます�
 
 ## RT-0011 File Attachments MVP
 
-GUIではファイル選択から `.txt`、`.md`、`.pdf` を添付できます。
+GUIではファイル選択から `.txt`、`.md`、`.pdf`、`.xlsx` を添付できます。
 
 MVP制限:
 
@@ -186,6 +186,8 @@ MVP制限:
 * 抽出テキストは1ファイル最大12,000文字
 * `.txt` / `.md` はGUIでテキスト抽出する
 * `.pdf` はbridge側で `pypdf` が利用できる場合だけテキスト抽出する
+* `.xlsx` はbridge側で `openpyxl` を使い、表示中シートのセル値と数式を行単位のテキストとして抽出する
+* `.xlsx` は最大20シート、各シート最大200行・50列まで読み込む
 
 添付本文は回答生成の一時コンテキストとして使います。live JSONL には本文全文を保存せず、ファイル名、形式、抽出状態、文字数、切り詰め有無だけをuser発言のメタデータとして残します。詳細方針は `docs/file_attachments_mvp.md` に整理しています。
 

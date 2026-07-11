@@ -15,6 +15,7 @@ journal/**/*.md
 memory/long_term.md
 memory/preferences.md
 memory/projects.md
+memory/items/*.md
 ```
 
 役割:
@@ -25,6 +26,7 @@ memory/projects.md
 * `memory/long_term.md`: 長期的に重要な事実・方針。
 * `memory/preferences.md`: ユーザーの好み、判断基準、回答スタイル、生活・学習・開発上の嗜好。
 * `memory/projects.md`: プロジェクト進捗。
+* `memory/items/*.md`: カテゴリ、状態、タグ、出典を持つ構造化メモリ項目。詳細は [structured_memory.md](structured_memory.md) を参照。
 
 ### Phase3.1: Markdown Search MVP
 
@@ -55,6 +57,7 @@ python scripts\search_memory.py "" --tag Phase3
 * date
 * tags
 * content
+* structured memory category / status / source / confidence
 
 ### Phase3.3: SQLite-backed Memory Index MVP
 
@@ -76,6 +79,7 @@ memory/search_index.sqlite3
 SQLite schema:
 
 * `documents`: document type、path、title、date、tags_json、content を保持
+  * 構造化メモリではcategory、category_label、status、source、source_date、confidenceも保持
 * `tags`: タグ検索用
 * `documents_fts`: FTS5 が使える環境では補助テーブルとして作成
 
@@ -98,6 +102,7 @@ python scripts\build_answer_context.py "俺の好みに合う店は？"
 * 私的な質問、好み、生活、学習進捗、過去行動、AI-LifeOSの過去方針に関係する質問だけでmemoryを使う
 * memory context の要否は単一キーワード一致ではなく、自己参照、過去会話、好み・生活、AI-LifeOS/プロジェクト語などの重み付きスコアで判定する
 * まず `memory/long_term.md` と `memory/preferences.md` を読む
+* 質問から構造化メモリのカテゴリを推定できる場合は、`memory/items/*.md` の該当カテゴリを優先取得する
 * 追加情報が必要な場合は `journal` と `summary.md` / `raw.md` を検索する
 * 結果は短い抜粋と出典情報に絞る
 * 会話中に `memory` / `journal` / `conversations` を編集しない
@@ -136,6 +141,7 @@ python scripts\search_memory.py "検索語" --rebuild-index
 python scripts\search_memory.py "検索語" --json
 python scripts\search_memory.py "検索語" --type journal
 python scripts\search_memory.py "" --tag Phase3
+python scripts\search_memory.py "" --type memory_item --category study_status --status active --tag 資格
 python scripts\index_conversations.py
 python scripts\rebuild_index.py
 python scripts\build_answer_context.py "質問"
@@ -147,5 +153,6 @@ python scripts\build_answer_context.py "質問"
 * SQLite index は再生成可能な派生データ。
 * `memory/search_index.sqlite3` はGit管理しない。
 * 会話中に `memory` / `journal` を勝手に編集しない。
+* 構造化メモリと動的カテゴリの更新は「整理して保存」時だけ行う。
 * 回答に使った記憶が不確かな場合は「見つかった範囲では」と扱う。
 * 出典パスは保持するが、通常回答では自然文に混ぜ、詳細を求められた場合だけ明示する。

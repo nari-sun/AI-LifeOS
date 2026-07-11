@@ -36,7 +36,7 @@ import {
   listResumableSessions,
   openLocalDataFolder,
   resumeSession,
-  sendMessage,
+  sendMessageStream,
   startFinalizeJob,
   startSession,
 } from "@/tauri"
@@ -95,7 +95,7 @@ const replyStateLabel: Record<ReplyState, string> = {
 const MAX_ATTACHMENTS = 3
 const MAX_ATTACHMENT_BYTES = 1024 * 1024
 const MAX_ATTACHMENT_TEXT_CHARS = 12_000
-const SUPPORTED_ATTACHMENT_EXTENSIONS = new Set(["txt", "md", "pdf"])
+const SUPPORTED_ATTACHMENT_EXTENSIONS = new Set(["txt", "md", "pdf", "xlsx"])
 
 function App() {
   const [session, setSession] = useState<SessionFile | null>(null)
@@ -110,6 +110,7 @@ function App() {
   const [lastMemoryContext, setLastMemoryContext] = useState<MemoryContextSummary | null>(null)
   const [lastSubmittedText, setLastSubmittedText] = useState("")
   const [pendingUserMessage, setPendingUserMessage] = useState<PendingUserMessage | null>(null)
+  const [streamingAssistant, setStreamingAssistant] = useState<ChatMessage | null>(null)
   const [attachments, setAttachments] = useState<AttachmentDraft[]>([])
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null)
   const [finalizeJob, setFinalizeJob] = useState<FinalizeJob | null>(null)
@@ -131,7 +132,11 @@ function App() {
   const canFinalize = Boolean(session && organization?.can_organize && !isBusy && !isFinalizeActive)
   const finalizeButtonLabel = getFinalizeButtonLabel(organization)
   const statusLabel = organization?.label ?? "未開始"
-  const displayMessages = pendingUserMessage ? [...messages, pendingUserMessage] : messages
+  const displayMessages = [
+    ...messages,
+    ...(pendingUserMessage ? [pendingUserMessage] : []),
+    ...(streamingAssistant ? [streamingAssistant] : []),
+  ]
 
   const sessionTitle = useMemo(() => {
     if (!session) {
@@ -188,6 +193,7 @@ function App() {
       setMessages(sessionResult.messages)
       setSessions(listResult.sessions)
       setPendingUserMessage(null)
+      setStreamingAssistant(null)
       setAttachments([])
       setLastMemoryContext(null)
       setNotice("新規セッションを開始しました。")
@@ -233,6 +239,7 @@ function App() {
       setLastMemoryContext(null)
       setInput("")
       setPendingUserMessage(null)
+      setStreamingAssistant(null)
       setAttachments([])
       setFinalizeJob(null)
       setViewMode("chat")
@@ -262,6 +269,7 @@ function App() {
     setLastMemoryContext(null)
     setInput("")
     setLastSubmittedText(content)
+    setStreamingAssistant(null)
     setPendingUserMessage({
       role: "user",
       content: buildPendingUserContent(content, attachments),
@@ -271,7 +279,23 @@ function App() {
     setNotice("返答を生成しています。停止ボタンで中断できます。")
 
     try {
-      const result = await sendMessage(session?.jsonl_file ?? null, content, requestId, attachmentPayloads)
+      const streamTimestamp = new Date().toISOString()
+      const result = await sendMessageStream(
+        session?.jsonl_file ?? null,
+        content,
+        requestId,
+        attachmentPayloads,
+        (delta) => {
+          if (activeRequestIdRef.current !== requestId) {
+            return
+          }
+          setStreamingAssistant((current) => ({
+            role: "assistant",
+            content: `${current?.content ?? ""}${delta}`,
+            timestamp: current?.timestamp ?? streamTimestamp,
+          }))
+        },
+      )
       if (activeRequestIdRef.current !== requestId) {
         return
       }
@@ -280,6 +304,7 @@ function App() {
       const memoryContext = result.assistant ? result.memory_context : null
       setMessages(attachMemoryContextToLatestAssistant(result.messages, memoryContext))
       setPendingUserMessage(null)
+      setStreamingAssistant(null)
       setAttachments([])
       setLastMemoryContext(memoryContext)
       const attachmentNotice = formatAttachmentResultNotice(result.attachments)
@@ -301,6 +326,7 @@ function App() {
         setError(withNextAction(formatError(err)))
         setNotice("返答生成に失敗しました。")
         setPendingUserMessage((current) => (current ? { ...current, pending_status: "failed" } : current))
+        setStreamingAssistant(null)
       }
     } finally {
       if (activeRequestIdRef.current === requestId) {
@@ -353,6 +379,7 @@ function App() {
       setMessages(result.messages)
       setLastMemoryContext(null)
       setPendingUserMessage(null)
+      setStreamingAssistant(null)
       setAttachments([])
       setFinalizeJob(null)
       setViewMode("chat")
@@ -630,7 +657,7 @@ function App() {
             ) : (
               displayMessages.map((message, index) => <MessageBubble key={`${message.timestamp}-${index}`} message={message} />)
             )}
-            {isGenerating && <GeneratingRow stopping={busy === "stopping"} />}
+            {isGenerating && !streamingAssistant && <GeneratingRow stopping={busy === "stopping"} />}
           </div>
         </div>
 
@@ -646,7 +673,7 @@ function App() {
             type="file"
             className="hidden"
             multiple
-            accept=".txt,.md,.pdf,text/plain,text/markdown,application/pdf"
+            accept=".txt,.md,.pdf,.xlsx,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             onChange={(event) => void handleAttachmentInputChange(event)}
           />
           {attachments.length > 0 && (

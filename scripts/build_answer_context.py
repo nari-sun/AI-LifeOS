@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from memory_index import ROOT, MemorySearchResult, search_memory
+from memory_items import load_categories
 
 
 MEMORY_SCORE_THRESHOLD = 3
@@ -38,6 +39,10 @@ MEMORY_NEED_SIGNALS = (
     MemoryNeedSignal("嫌い", 2, "preference"),
     MemoryNeedSignal("生活", 2, "personal-topic"),
     MemoryNeedSignal("学習", 2, "personal-topic"),
+    MemoryNeedSignal("やりたいこと", 4, "structured-memory"),
+    MemoryNeedSignal("候補タスク", 4, "structured-memory"),
+    MemoryNeedSignal("家の状況", 4, "structured-memory"),
+    MemoryNeedSignal("学習状況", 4, "structured-memory"),
     MemoryNeedSignal("進捗", 2, "personal-topic"),
     MemoryNeedSignal("日記", 3, "personal-record"),
     MemoryNeedSignal("習慣", 2, "personal-topic"),
@@ -74,6 +79,15 @@ PERSONAL_TOPIC_SIGNALS = (
 )
 PAST_SIGNALS = ("前回", "前に", "以前", "過去", "昔", "話した", "決めた", "ログ", "履歴")
 PROJECT_SIGNALS = ("AI-LifeOS", "プロジェクト", "Phase", "フェーズ", "方針", "journal", "memory")
+
+CATEGORY_QUERY_ALIASES = {
+    "future_wishlist": ("やりたいこと", "いつか", "将来", "wishlist"),
+    "candidate_task": ("候補タスク", "作業候補"),
+    "home_status": ("家の状況", "住居", "家について", "home"),
+    "study_status": ("学習状況", "勉強の状況", "資格の学習", "安全確保支援士", "study"),
+    "project_status": ("プロジェクト状況", "プロジェクトの進捗", "project status"),
+    "preference": ("好み", "判断基準", "回答スタイル", "preference"),
+}
 
 
 @dataclass(frozen=True)
@@ -168,6 +182,14 @@ def build_answer_context(
         )
 
     memory_sections, priority_references = _read_priority_memory(root=root, max_chars=max_memory_chars)
+    inferred_categories = infer_memory_categories(root, question)
+    structured_results = _search_structured_memory(
+        root=root,
+        question=question,
+        categories=inferred_categories,
+        max_results=max_results,
+        use_index=use_index,
+    )
     journal_results = search_memory(
         root=root,
         query=question,
@@ -197,6 +219,12 @@ def build_answer_context(
         lines.extend(memory_sections)
         lines.append("")
 
+    if structured_results:
+        lines.append("## Structured Memory Matches")
+        for result in structured_results:
+            lines.extend(_format_result(result, root))
+        lines.append("")
+
     if journal_results:
         lines.append("## Journal Matches")
         for result in journal_results:
@@ -212,6 +240,7 @@ def build_answer_context(
     references = _dedupe_references(
         [
             *priority_references,
+            *(_reference_from_result(result, root) for result in structured_results),
             *(_reference_from_result(result, root) for result in journal_results),
             *(_reference_from_result(result, root) for result in conversation_results),
         ]
@@ -221,7 +250,7 @@ def build_answer_context(
     return AnswerContext(
         should_use_memory=True,
         text=context_text,
-        results=tuple([*journal_results, *conversation_results]),
+        results=tuple([*structured_results, *journal_results, *conversation_results]),
         references=tuple(references),
         score=assessment.score,
         threshold=assessment.threshold,
@@ -267,12 +296,73 @@ def _display_path(path: Path, root: Path) -> str:
 
 
 def _format_result(result: MemorySearchResult, root: Path) -> list[str]:
-    return [
+    lines = [
         f"- Date: {result.date or 'unknown'}",
         f"  Type: {result.document_type}",
         f"  Source: {_display_path(result.path, root)}",
         f"  Snippet: {result.snippet}",
     ]
+    if result.category:
+        lines.insert(2, f"  Category: {result.category} ({result.category_label or result.category})")
+    if result.status:
+        lines.insert(3, f"  Status: {result.status}")
+    if result.source:
+        lines.append(f"  Evidence: {result.source}")
+    return lines
+
+
+def infer_memory_categories(root: Path | str, question: str) -> tuple[str, ...]:
+    normalized = question.strip().lower()
+    if not normalized:
+        return ()
+    categories = load_categories(root)
+    matched: list[str] = []
+    for category in categories:
+        signals = [category.name, category.label, *CATEGORY_QUERY_ALIASES.get(category.name, ())]
+        if any(signal.lower() in normalized for signal in signals if signal):
+            matched.append(category.name)
+    return tuple(_dedupe(matched))
+
+
+def _search_structured_memory(
+    root: Path,
+    question: str,
+    categories: tuple[str, ...],
+    max_results: int,
+    use_index: bool,
+) -> list[MemorySearchResult]:
+    results: list[MemorySearchResult] = []
+    for category in categories:
+        results.extend(
+            search_memory(
+                root=root,
+                query="",
+                limit=max_results,
+                document_types=("memory_item",),
+                category=category,
+                use_index=use_index,
+            )
+        )
+    if not categories:
+        results.extend(
+            search_memory(
+                root=root,
+                query=question,
+                limit=max_results,
+                document_types=("memory_item",),
+                use_index=use_index,
+            )
+        )
+
+    deduped: list[MemorySearchResult] = []
+    seen: set[str] = set()
+    for result in results:
+        key = str(result.path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(result)
+    return deduped[: max(max_results, 1)]
 
 
 def _reference_from_result(result: MemorySearchResult, root: Path) -> MemoryContextReference:

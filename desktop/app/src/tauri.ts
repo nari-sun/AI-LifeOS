@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core"
+import { Channel, invoke } from "@tauri-apps/api/core"
 
 import type {
   CancelMessageResult,
@@ -8,6 +8,7 @@ import type {
   ListResumableResult,
   LocalDataReportResult,
   AttachmentPayload,
+  AssistantStreamEvent,
   ResumeSessionResult,
   SaveSessionResult,
   SendMessageResult,
@@ -40,6 +41,31 @@ export async function sendMessage(
       request_id: requestId,
       attachments,
     },
+  })
+}
+
+export async function sendMessageStream(
+  sessionFile: string | null,
+  content: string,
+  requestId: string,
+  attachments: AttachmentPayload[] = [],
+  onDelta: (delta: string) => void,
+) {
+  const onEvent = new Channel<AssistantStreamEvent>()
+  onEvent.onmessage = (event) => {
+    if (event.type === "delta" && event.delta) {
+      onDelta(event.delta)
+    }
+  }
+  return invoke<SendMessageResult>("send_message_stream", {
+    payload: {
+      ...defaultPayload,
+      session_file: sessionFile,
+      content,
+      request_id: requestId,
+      attachments,
+    },
+    onEvent,
   })
 }
 

@@ -39,6 +39,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - Phase2.65: `.session.json` によるセッション保存、10日以内の resume、dry-run prune を実装済み
 - Phase2.7: Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の Chat GUI MVP を実装済み
 - Phase3: Markdown検索、タグ/メタデータ抽出、SQLite index、回答用memory context、ベクトル検索評価、Phase4引き継ぎを実装済み
+- 構造化メモリ: 動的カテゴリ、出典、状態、タグを持つ`memory/items/*.md`の整理時保存・検索を実装済み
 
 ## できること
 
@@ -53,6 +54,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - 保存済みの raw.md / summary.md / journal / memory を検索する
 - `memory/search_index.sqlite3` を再構築可能な検索indexとして生成する
 - 私的な質問や好みに関係する会話では、`memory/long_term.md` と `memory/preferences.md` を読み取り専用コンテキストとして回答に渡す
+- ChatGPT exportのフォルダ、zip、または `conversations.json` をdry-run確認してから、選択した会話だけをraw.mdへ取り込む
 - `python -m unittest` で Python 側の保存・再開・GUIブリッジ処理をテストする
 
 ## Phase Overview
@@ -123,6 +125,7 @@ AI-LifeOS/
 │  ├─ index_conversations.py
 │  ├─ rebuild_index.py
 │  ├─ build_answer_context.py
+│  ├─ import_chatgpt_export.py
 │  └─ codex_cli_options.py
 ├─ docs/
 │  ├─ codex_conversation_mvp.md
@@ -131,6 +134,7 @@ AI-LifeOS/
 │  ├─ background_jobs.md
 │  ├─ file_attachments_mvp.md
 │  ├─ local_data_management.md
+│  ├─ chatgpt_export_import.md
 │  ├─ phase4_tool_integration_design.md
 │  ├─ searchable_memory.md
 │  ├─ response_settings_ui.md
@@ -238,6 +242,22 @@ Tauri command から scripts/chat_gui_bridge.py を呼ぶ
 ```
 
 GUIの「整理して保存」は raw.md 作成と summary / journal / memory 更新に接続します。Git commit はGUIから自動実行しません。
+
+### ChatGPT export import
+
+既定はdry-runです。件数、UTC期間、タイトル、会話ID、重複状態を確認できます。
+
+```powershell
+python scripts\import_chatgpt_export.py imports\chatgpt_export\export.zip
+```
+
+確認後、対象指定と `--apply` を明示して取り込みます。インポートだけではsummary / journal / memory / 検索indexを更新しません。
+
+```powershell
+python scripts\import_chatgpt_export.py imports\chatgpt_export\export.zip --id CONVERSATION_ID --apply
+```
+
+期間・タイトル・全件指定、重複判定、保存形式の詳細は [docs/chatgpt_export_import.md](docs/chatgpt_export_import.md) を参照してください。
 
 ## Codex Settings
 
@@ -390,10 +410,13 @@ python scripts\search_memory.py "検索語"
 python scripts\search_memory.py "検索語" --no-index
 python scripts\search_memory.py "検索語" --type journal
 python scripts\search_memory.py "" --tag Phase3
+python scripts\search_memory.py "" --type memory_item --category study_status --status active --tag 資格
 python scripts\search_memory.py "検索語" --json
 ```
 
 `raw.md` / `summary.md` / `journal` / `memory` を読み取り専用で検索します。
+
+構造化メモリは`memory/items/*.md`へ1項目1ファイルで保存し、個人用カテゴリ定義とともにGit管理しません。カテゴリの追加・保留、既存メモリとの役割分担は [docs/structured_memory.md](docs/structured_memory.md) を参照してください。
 
 ### SQLite indexを再構築する
 
@@ -454,13 +477,19 @@ npm run dev
 
 Node.js は 22 LTS 以上を使います。バージョンは `desktop/app/.nvmrc` で `22.23.1` に固定しています。
 
+リポジトリのルートで、PDF / Excel添付の抽出依存を初回にインストールします。
+
+```powershell
+python -m pip install -r config\attachment_requirements.txt
+```
+
 GUIでできること:
 
 - 新規チャット作成
 - メッセージ送信
 - user / assistant 発言の表示
 - 送信直後のuser発言の一時表示
-- `.txt` / `.md` / `.pdf` 添付MVP
+- `.txt` / `.md` / `.pdf` / `.xlsx` 添付MVP
 - 10日以内の再開可能セッション一覧表示
 - セッション再開
 - 「整理して保存」による raw.md 化と summary / journal / memory 更新のバックグラウンド実行

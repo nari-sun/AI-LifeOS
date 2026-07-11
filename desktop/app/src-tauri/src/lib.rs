@@ -1,10 +1,11 @@
 use serde_json::Value;
 use std::env;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::ipc::Channel;
 
 #[tauri::command]
 async fn start_session(payload: Value) -> Result<Value, String> {
@@ -14,6 +15,11 @@ async fn start_session(payload: Value) -> Result<Value, String> {
 #[tauri::command]
 async fn send_message(payload: Value) -> Result<Value, String> {
     run_bridge("send-message", payload)
+}
+
+#[tauri::command]
+async fn send_message_stream(payload: Value, on_event: Channel<Value>) -> Result<Value, String> {
+    run_bridge_stream("send-message-stream", payload, on_event)
 }
 
 #[tauri::command]
@@ -76,6 +82,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_session,
             send_message,
+            send_message_stream,
             cancel_message,
             save_session,
             list_resumable_sessions,
@@ -202,6 +209,79 @@ fn run_bridge(command_name: &str, payload: Value) -> Result<Value, String> {
         return Err(error);
     }
 
+    tauri_log(&root, &format!("bridge.success command={command_name}"));
+    Ok(value)
+}
+
+fn run_bridge_stream(
+    command_name: &str,
+    payload: Value,
+    on_event: Channel<Value>,
+) -> Result<Value, String> {
+    let root = project_root()?;
+    tauri_log(&root, &format!("bridge.start command={command_name}"));
+    let script = root.join("scripts").join("chat_gui_bridge.py");
+    if !script.exists() {
+        return Err(format!("Python bridge not found: {}", script.display()));
+    }
+
+    let mut child = Command::new(python_command())
+        .arg(&script)
+        .arg(command_name)
+        .current_dir(&root)
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Failed to start Python bridge: {error}"))?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(payload.to_string().as_bytes())
+            .map_err(|error| format!("Failed to write Python bridge payload: {error}"))?;
+    }
+    drop(child.stdin.take());
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to open Python bridge stdout.".to_string())?;
+    let mut result: Option<Value> = None;
+    for line in BufReader::new(stdout).lines() {
+        let line = line.map_err(|error| format!("Failed to read Python bridge output: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Value = serde_json::from_str(&line)
+            .map_err(|error| format!("Python bridge returned invalid stream JSON: {error}"))?;
+        match event.get("type").and_then(Value::as_str) {
+            Some("delta") => on_event
+                .send(event)
+                .map_err(|error| format!("Failed to send stream event to GUI: {error}"))?,
+            Some("result") => result = event.get("data").cloned(),
+            _ => {}
+        }
+    }
+
+    let mut stderr = String::new();
+    if let Some(mut stream) = child.stderr.take() {
+        let _ = stream.read_to_string(&mut stderr);
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("Failed to wait for Python bridge: {error}"))?;
+    let value = result.ok_or_else(|| {
+        if stderr.trim().is_empty() {
+            "Python bridge returned no stream result.".to_string()
+        } else {
+            stderr.trim().to_string()
+        }
+    })?;
+    if !status.success() || value.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(bridge_error(&value, stderr.trim()));
+    }
     tauri_log(&root, &format!("bridge.success command={command_name}"));
     Ok(value)
 }

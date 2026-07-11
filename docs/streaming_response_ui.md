@@ -4,30 +4,35 @@ RT-0017 は、Chat GUI で assistant 返答の生成途中の文章を表示で�
 
 ## Status
 
-Backlog. まだ実装しません。
+Implemented on 2026-07-11.
 
-現在の `codex.cmd exec --output-last-message` 方式では、Codex の実行完了後に最終返答だけを受け取ります。そのため、GUI は生成中の文章を token 単位または chunk 単位で表示できません。
+GUI送信では `codex app-server --stdio` の `item/agentMessage/delta` を使い、生成途中のassistant本文をchunk単位で表示します。CLI会話とストリーミング非対応環境のフォールバックには、従来の `codex.cmd exec --output-last-message` を残しています。
+
+動作確認時の基準CLIは `codex-cli 0.144.1` です。実行時はインストール済みCLIのapp-server protocolを使用します。
 
 ## Background
 
 Phase2.7 Chat GUI MVP では、GUI から `scripts/chat_gui_bridge.py` を呼び、bridge が `scripts/codex_conversation.py` の `generate_assistant_reply()` を通じて `codex.cmd exec` を実行しています。
 
-現在の流れ:
+GUI送信の流れ:
 
 ```text
 User message
 -> live JSONL に保存
--> codex.cmd exec を実行
--> Codex 完了後に --output-last-message の内容を読む
+-> codex app-server を起動して thread/start / turn/start
+-> item/agentMessage/delta だけを Tauri Channel でGUIへ送る
+-> item/completed の確定本文を受け取る
 -> assistant message として live JSONL に保存
 -> GUI に返す
 ```
 
-この方式では、以下は見えません。
+app-serverを初期化できない環境では、同じ保存済みuser messageに対して従来のexec方式へフォールバックします。user messageを二重保存しません。
 
-- assistant 返答の生成途中の文章
-- キャンセル時点までに生成されていた部分返答
+この方式でも、以下は表示・保存しません。
+
 - Codex 実行中に外へ出力されない内部試行
+- reasoning本文やreasoning summaryのイベント
+- キャンセル時点までの未確定な部分返答
 
 ## Goal
 
@@ -51,15 +56,13 @@ RT-0017 では以下を対象外にします。
 - OpenAI API の直接利用を前提にすること
 - 生成途中の未確定文章を自動で長期メモリ化すること
 
-## Design Direction
+## Implemented Design
 
-現実的な実装候補は2つあります。
-
-### Option A: Codex SDK / app-server に置き換える
+### Codex app-server
 
 Codex SDK または `codex app-server` のイベントストリームを使い、assistant 返答の差分を GUI に送ります。
 
-想定フロー:
+実装フロー:
 
 ```text
 desktop/app
@@ -82,17 +85,11 @@ desktop/app
 - JSON-RPC / SDK イベント処理のテストが必要
 - Codex CLI のバージョン差分に影響される可能性がある
 
-### Option B: 現行 exec の stdout/stderr を監視する
+### Fallback: existing exec
 
 `codex.cmd exec` の標準出力を監視して、表示できる進捗を拾う案です。
 
-ただし現行方式では、最終返答本文は `--output-last-message` で完了後に取得しています。stdout/stderr は進捗ログであり、assistant 返答本文の安定したストリームとは限りません。
-
-結論:
-
-- 本命ではない
-- 短期の進捗表示には使える可能性がある
-- assistant 本文のストリーミング表示としては採用しない
+app-serverの起動・初期化・thread開始に対応できない場合だけ、従来の `--output-last-message` 方式へ戻します。stdout/stderrをassistant本文として解釈する方式は採用していません。
 
 ## Data Handling
 
@@ -104,7 +101,7 @@ desktop/app
 - live JSONL: 完了後の確定 assistant message のみ保存
 - cancel 時: デフォルトでは部分出力を live JSONL に保存しない
 
-将来、部分出力を監査用に残す場合は、通常の会話ログとは別の派生ファイルにします。
+部分出力の監査ログは実装していません。将来残す場合は、通常の会話ログとは別の派生ファイルにします。
 
 候補:
 
@@ -132,6 +129,8 @@ logs/chat_gui_stream/YYYY-MM-DD_HHMMSS_<request_id>.jsonl
 - 完了イベントを受け取るまで live JSONL に assistant message を確定保存しない
 - 既存の非ストリーミング経路を fallback として残す
 
+実装ではPython bridgeが改行区切りJSONでdelta/resultをRustへ送り、RustのTauri ChannelがdeltaだけをReactへ転送します。保存に使う本文は `item/completed` の確定テキストであり、deltaの連結結果は保存根拠にしません。
+
 ## Acceptance Criteria
 
 - GUI で assistant 返答が生成途中から表示される
@@ -143,10 +142,17 @@ logs/chat_gui_stream/YYYY-MM-DD_HHMMSS_<request_id>.jsonl
 
 ## Dependencies
 
-- Codex SDK または `codex app-server` の採用判断
-- Tauri command から Python bridge の streaming event を扱う方式の確認
-- RT-0008 の停止処理との整合性
+- Codex SDKではなく `codex app-server` を採用済み
+- Python bridgeからTauri Channelへ転送する方式を採用済み
+- RT-0008 のcancel fileを検知して `turn/interrupt` を送る
 - RT-0010 の長期会話スレッド管理とは独立して進められるが、将来の統合時に再確認する
+
+## Verification
+
+- Python unit tests: app-server JSON-RPCのdelta/completed、interrupt、保存、フォールバックを自動確認
+- GUI build: TypeScript/Vite production build成功
+- Rust: `cargo check` 成功
+- Installed CLI smoke test: `item/agentMessage/delta` の逐次出力と完了後resultを確認
 
 ## Risks
 

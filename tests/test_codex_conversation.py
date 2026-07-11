@@ -1,5 +1,7 @@
 import json
+import io
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -14,6 +16,102 @@ SCRIPT = ROOT / "scripts" / "codex_conversation.py"
 
 import codex_conversation  # noqa: E402
 from live_session import create_live_message  # noqa: E402
+
+
+class FakeAppServerOutput:
+    def __init__(self):
+        self.lines = queue.Queue()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        value = self.lines.get(timeout=2)
+        if value is None:
+            raise StopIteration
+        return json.dumps(value) + "\n"
+
+    def push(self, value):
+        self.lines.put(value)
+
+    def close(self):
+        self.lines.put(None)
+
+
+class FakeAppServerStdin:
+    def __init__(self, process, complete_status="completed"):
+        self.process = process
+        self.complete_status = complete_status
+
+    def write(self, raw):
+        request = json.loads(raw)
+        self.process.requests.append(request)
+        method = request.get("method")
+        if method == "initialize":
+            self.process.stdout.push({"id": request["id"], "result": {}})
+        elif method == "thread/start":
+            self.process.stdout.push({"id": request["id"], "result": {"thread": {"id": "thread-1"}}})
+        elif method == "turn/start":
+            self.process.stdout.push({"id": request["id"], "result": {"turn": {"id": "turn-1"}}})
+            self.process.stdout.push(
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1", "delta": "途中"},
+                }
+            )
+            if self.complete_status == "completed":
+                self.process.stdout.push(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "item": {"id": "item-1", "type": "agentMessage", "text": "確定返答"},
+                        },
+                    }
+                )
+                self.process.stdout.push(
+                    {
+                        "method": "turn/completed",
+                        "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed", "items": []}},
+                    }
+                )
+        elif method == "turn/interrupt":
+            self.process.stdout.push({"id": request["id"], "result": {}})
+            self.process.stdout.push(
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "interrupted", "items": []}},
+                }
+            )
+        return len(raw)
+
+    def flush(self):
+        return None
+
+
+class FakeAppServerProcess:
+    def __init__(self, complete_status="completed"):
+        self.requests = []
+        self.stdout = FakeAppServerOutput()
+        self.stderr = io.StringIO("")
+        self.stdin = FakeAppServerStdin(self, complete_status=complete_status)
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+        self.stdout.close()
+
+    def wait(self, timeout=None):
+        self.returncode = 0
+        return 0
+
+    def kill(self):
+        self.returncode = -9
+        self.stdout.close()
 
 
 class CodexConversationTests(unittest.TestCase):
@@ -135,6 +233,46 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn("--sandbox", command)
         self.assertEqual("read-only", command[command.index("--sandbox") + 1])
         self.assertIn("User:\nHello", calls[0][1]["input"])
+
+    def test_streaming_app_server_emits_only_agent_delta_and_returns_completed_text(self):
+        process = FakeAppServerProcess()
+        deltas = []
+
+        result = codex_conversation.generate_assistant_reply_streaming_with_context(
+            root=ROOT,
+            messages=[create_live_message("user", "Hello")],
+            on_delta=deltas.append,
+            include_memory_context=False,
+            popen=lambda *args, **kwargs: process,
+        )
+
+        self.assertEqual(["途中"], deltas)
+        self.assertEqual("確定返答", result.reply)
+        thread_start = next(request for request in process.requests if request.get("method") == "thread/start")
+        self.assertEqual("read-only", thread_start["params"]["sandbox"])
+        self.assertEqual("never", thread_start["params"]["approvalPolicy"])
+        turn_start = next(request for request in process.requests if request.get("method") == "turn/start")
+        self.assertEqual("medium", turn_start["params"]["effort"])
+        self.assertEqual("fast", turn_start["params"]["serviceTier"])
+
+    def test_streaming_app_server_interrupt_suppresses_delta_and_raises(self):
+        process = FakeAppServerProcess(complete_status="interrupted")
+        deltas = []
+
+        with self.assertRaises(InterruptedError):
+            codex_conversation.generate_assistant_reply_streaming_with_context(
+                root=ROOT,
+                messages=[create_live_message("user", "Hello")],
+                on_delta=deltas.append,
+                is_cancelled=lambda: True,
+                include_memory_context=False,
+                popen=lambda *args, **kwargs: process,
+            )
+
+        self.assertEqual([], deltas)
+        interrupt = next(request for request in process.requests if request.get("method") == "turn/interrupt")
+        self.assertEqual("thread-1", interrupt["params"]["threadId"])
+        self.assertEqual("turn-1", interrupt["params"]["turnId"])
 
     def test_generate_assistant_reply_includes_memory_context_for_private_question(self):
         calls = []

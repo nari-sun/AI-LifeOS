@@ -144,11 +144,14 @@ GUIは Phase2.6 の会話エンジンと Phase2.65 のセッション保存・�
 python scripts\search_memory.py "検索語"
 python scripts\search_memory.py "検索語" --type journal
 python scripts\search_memory.py "" --tag Phase3
+python scripts\search_memory.py "" --type memory_item --category study_status --status active --tag 資格
 python scripts\rebuild_index.py
 python scripts\build_answer_context.py "俺の好みに合う店は？"
 ```
 
 検索は読み取り専用です。Phase3.3 の検索方式は `SQLite-backed index + Python ranking` MVPです。SQLiteには全文とメタデータを保存しますが、日本語の部分一致を安定させるため、検索結果ランキングの主経路はPython側で行います。FTS5が使える環境では `documents_fts` も補助テーブルとして作成します。
+
+構造化メモリの`memory/items/*.md`、個人用`memory/categories.json`、カテゴリ提案はGit管理せず、「整理して保存」時だけ更新します。公開用の初期カテゴリは`config/memory_categories.example.json`、項目雛形は`templates/memory_item.md`です。
 
 ## Repository Layout
 
@@ -178,6 +181,7 @@ AI-LifeOS/
 * [docs/session_save_mvp.md](docs/session_save_mvp.md): Phase2.65 Session Save / Resume
 * [docs/chat_gui_mvp.md](docs/chat_gui_mvp.md): Phase2.7 Chat GUI MVP
 * [docs/searchable_memory.md](docs/searchable_memory.md): Phase3 Searchable Memory
+* [docs/structured_memory.md](docs/structured_memory.md): 動的カテゴリ付き構造化メモリ
 * [docs/vector_search_evaluation.md](docs/vector_search_evaluation.md): Phase3.5 Vector Search Evaluation
 * [docs/phase4_planning_checkpoint.md](docs/phase4_planning_checkpoint.md): Phase3.6 Phase4引き継ぎ
 

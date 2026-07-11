@@ -105,6 +105,11 @@ export interface SendMessageResult {
   cancelled: boolean
 }
 
+export interface AssistantStreamEvent {
+  type: "delta"
+  delta: string
+}
+
 export interface CancelMessageResult {
   ok: boolean
   request_id: string

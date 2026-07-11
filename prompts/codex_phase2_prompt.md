@@ -11,6 +11,7 @@
 2. `journal/YYYY/MM/YYYY-MM-DD.md` を作成または追記する
 3. `memory/long_term.md` に長期的に重要な情報だけ追記する
 4. ユーザーの好み・判断基準・回答スタイルに関する明示情報がある場合だけ、`memory/preferences.md` に追記する
+5. 継続的に状態更新・カテゴリ別参照する価値がある明示情報だけ、`memory/items/*.md` の構造化メモリとして作成または更新する
 
 ## summary.md 形式
 
@@ -77,6 +78,21 @@ Session: 会話の短い名前
 - 既存内容を勝手に削除・大幅改変しない
 - 追記する場合は、既存の近い見出しに短い箇条書きで追加する
 
+## 構造化メモリルール
+
+- 構造化メモリは「整理して保存」中のこのタスクでだけ更新し、live会話中や検索中には更新しない
+- `python scripts/memory_items.py categories` で既存カテゴリを確認し、意味の合う既存カテゴリを優先する
+- `templates/memory_item.md` の全メタデータを持つ1項目1ファイルを `memory/items/` に置く
+- `source` は必ず今回の `{RAW_FILE}`、`source_date` はraw.mdのDateにし、本文には会話ログに明示された事実だけを書く
+- 一時的な作業ログではなく、後日カテゴリ・状態・タグで参照または更新する価値がある情報だけを抽出する
+- 同じ事実・状態の項目が既にあれば新規作成せず、出典を確認したうえで既存項目を更新する。既存項目を削除しない
+- 既存カテゴリに合わず、会話ログ上で明確な継続テーマである場合だけ新カテゴリを作成できる
+- 新カテゴリ作成前に、カテゴリ名だけでなくラベルと説明も比較して類似カテゴリとの重複を確認する
+- 新カテゴリは `python scripts/memory_items.py add-category` を使い、`--source {RAW_FILE}` とカテゴリ名・ラベル・説明・作成日時を `memory/categories.json` に残す
+- 分類に迷う場合はカテゴリを確定しない。`uncategorized` で項目を保存するか、`python scripts/memory_items.py propose-category` で根拠付き提案を `memory/category_suggestions.md` に残す
+- 好みは `preferences.md` の人間向け総合メモを維持しつつ、状態更新やカテゴリ検索に有用な場合だけ構造化メモリにも保存する
+- 候補タスクや将来希望を `long_term.md` に混在させず、`candidate_task` / `future_wishlist` の構造化メモリとして扱う
+
 ## 安全ルール
 
 - 会話ログにないことは書かない
@@ -85,6 +101,7 @@ Session: 会話の短い名前
 - OpenAI API直叩きを前提にしない
 - Markdownで書く
 - 既存ファイルの内容を壊さない
+- `memory/items/`、`memory/categories.json`、`memory/category_suggestions.md` は個人データでありGit管理しない
 - 不要なファイルは作らない
 - Git commit はしない。外側のスクリプトが最後にcommitする
 
@@ -95,4 +112,5 @@ Session: 会話の短い名前
 - 変更したファイル
 - memory/long_term.md に追記したか、追記しなかったか
 - memory/preferences.md に追記したか、追記しなかったか
+- 構造化メモリ項目・カテゴリ・カテゴリ提案を作成または更新したか
 - 判断に迷った点があればその内容

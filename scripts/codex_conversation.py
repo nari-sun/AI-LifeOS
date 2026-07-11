@@ -8,6 +8,8 @@ import threading
 import textwrap
 import time
 import os
+import json
+import queue
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +32,10 @@ DEFAULT_CHAT_CODEX_FAST_MODE = True
 class AssistantReplyResult:
     reply: str
     memory_context: AnswerContext | None
+
+
+class AppServerStreamingUnavailable(RuntimeError):
+    """Raised when the installed Codex CLI cannot provide app-server streaming."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -288,6 +294,223 @@ def generate_assistant_reply_with_context(
 
     _debug_log(root, f"assistant_reply.success chars={len(reply)}")
     return AssistantReplyResult(reply=reply, memory_context=memory_context_result)
+
+
+def generate_assistant_reply_streaming_with_context(
+    root: Path | str,
+    messages: list[LiveMessage],
+    on_delta: Callable[[str], None],
+    is_cancelled: Callable[[], bool] | None = None,
+    codex_command: str = "codex.cmd",
+    sandbox: str = "read-only",
+    approval: str = "never",
+    model: str | None = DEFAULT_CHAT_CODEX_MODEL,
+    reasoning_effort: str | None = DEFAULT_CHAT_CODEX_REASONING_EFFORT,
+    service_tier: str | None = DEFAULT_CHAT_CODEX_SERVICE_TIER,
+    fast_mode: bool | None = DEFAULT_CHAT_CODEX_FAST_MODE,
+    max_context_messages: int = 20,
+    include_memory_context: bool = True,
+    popen=subprocess.Popen,
+) -> AssistantReplyResult:
+    """Generate a reply through app-server and expose only agent-message deltas.
+
+    The authoritative completed agent message is returned to the caller. Deltas are
+    transient UI data and are never persisted by this function.
+    """
+    root = Path(root)
+    memory_context = ""
+    memory_context_result: AnswerContext | None = None
+    if include_memory_context:
+        memory_context_result = build_answer_context(root=root, question=_latest_user_content(messages))
+        memory_context = memory_context_result.text
+    prompt = build_codex_chat_prompt(
+        messages,
+        max_context_messages=max_context_messages,
+        memory_context=memory_context,
+    )
+
+    command = [codex_command, "app-server", "--stdio"]
+    if fast_mode is not None:
+        command.extend(["-c", f"features.fast_mode={'true' if fast_mode else 'false'}"])
+    try:
+        process = popen(
+            command,
+            cwd=root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        raise AppServerStreamingUnavailable("Codex app-serverを起動できませんでした。") from exc
+
+    if process.stdin is None or process.stdout is None:
+        _terminate_process(process)
+        raise AppServerStreamingUnavailable("Codex app-serverの標準入出力を開けませんでした。")
+
+    events: queue.Queue[dict | None] = queue.Queue()
+    stderr_lines: list[str] = []
+
+    def read_stdout() -> None:
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    events.put(value)
+        finally:
+            events.put(None)
+
+    def read_stderr() -> None:
+        if process.stderr is not None:
+            stderr_lines.extend(line.rstrip() for line in process.stderr)
+
+    threading.Thread(target=read_stdout, daemon=True).start()
+    threading.Thread(target=read_stderr, daemon=True).start()
+
+    def send(value: dict) -> None:
+        try:
+            process.stdin.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise AppServerStreamingUnavailable("Codex app-serverとの接続が終了しました。") from exc
+
+    def wait_response(request_id: int, timeout_seconds: float = 15.0) -> dict:
+        deadline = time.monotonic() + timeout_seconds
+        deferred: list[dict] = []
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    event = events.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if event is None:
+                    detail = "\n".join(stderr_lines[-10:]).strip()
+                    raise AppServerStreamingUnavailable(
+                        f"Codex app-serverが応答前に終了しました。{(' ' + detail) if detail else ''}"
+                    )
+                if event.get("id") == request_id:
+                    if "error" in event:
+                        raise AppServerStreamingUnavailable(f"Codex app-server request failed: {event['error']}")
+                    return event.get("result") or {}
+                deferred.append(event)
+        finally:
+            for event in deferred:
+                events.put(event)
+        raise AppServerStreamingUnavailable("Codex app-serverの初期化がタイムアウトしました。")
+
+    try:
+        send(
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "ai-lifeos", "version": "0.1.0"},
+                    "capabilities": {"experimentalApi": True},
+                },
+            }
+        )
+        wait_response(1)
+        send({"method": "initialized", "params": {}})
+        thread_params: dict[str, object] = {
+            "cwd": str(root.resolve()),
+            "approvalPolicy": approval,
+            "sandbox": sandbox,
+            "ephemeral": True,
+        }
+        if model:
+            thread_params["model"] = model
+        if service_tier:
+            thread_params["serviceTier"] = service_tier
+        send({"id": 2, "method": "thread/start", "params": thread_params})
+        thread_result = wait_response(2)
+        thread_id = str((thread_result.get("thread") or {}).get("id") or "")
+        if not thread_id:
+            raise AppServerStreamingUnavailable("Codex app-serverがthread idを返しませんでした。")
+
+        turn_params: dict[str, object] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        }
+        if model:
+            turn_params["model"] = model
+        if reasoning_effort:
+            turn_params["effort"] = reasoning_effort
+        if service_tier:
+            turn_params["serviceTier"] = service_tier
+        send({"id": 3, "method": "turn/start", "params": turn_params})
+        turn_result = wait_response(3, timeout_seconds=30.0)
+        turn_id = str((turn_result.get("turn") or {}).get("id") or "")
+        if not turn_id:
+            raise AppServerStreamingUnavailable("Codex app-serverがturn idを返しませんでした。")
+
+        final_reply = ""
+        interrupt_sent = False
+        while True:
+            if is_cancelled and is_cancelled() and not interrupt_sent:
+                send(
+                    {
+                        "id": 4,
+                        "method": "turn/interrupt",
+                        "params": {"threadId": thread_id, "turnId": turn_id},
+                    }
+                )
+                interrupt_sent = True
+            try:
+                event = events.get(timeout=0.1)
+            except queue.Empty:
+                if process.poll() is not None:
+                    raise RuntimeError("Codex app-serverが返答生成中に終了しました。")
+                continue
+            if event is None:
+                detail = "\n".join(stderr_lines[-10:]).strip()
+                raise RuntimeError(f"Codex app-serverが返答生成中に終了しました。\n{detail}".strip())
+            method = event.get("method")
+            params = event.get("params") or {}
+            if method == "item/agentMessage/delta":
+                delta = str(params.get("delta") or "")
+                if delta and not interrupt_sent:
+                    on_delta(delta)
+            elif method == "item/completed":
+                item = params.get("item") or {}
+                if item.get("type") == "agentMessage":
+                    final_reply = str(item.get("text") or "")
+            elif method == "turn/completed":
+                turn = params.get("turn") or {}
+                status = turn.get("status")
+                if status == "interrupted" or interrupt_sent:
+                    raise InterruptedError("返答生成を停止しました。")
+                if status != "completed":
+                    error = turn.get("error") or {}
+                    raise RuntimeError(str(error.get("message") or f"Codex turn failed: {status}"))
+                if not final_reply:
+                    for item in turn.get("items") or []:
+                        if item.get("type") == "agentMessage":
+                            final_reply = str(item.get("text") or "")
+                final_reply = final_reply.strip()
+                if not final_reply:
+                    raise RuntimeError("Codex app-server completed but returned an empty assistant reply.")
+                return AssistantReplyResult(reply=final_reply, memory_context=memory_context_result)
+    finally:
+        _terminate_process(process)
+
+
+def _terminate_process(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
 
 
 def _latest_user_content(messages: list[LiveMessage]) -> str:

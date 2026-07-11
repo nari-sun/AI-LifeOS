@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "categories": [
+    {
+      "name": "future_wishlist",
+      "label": "いつかやりたいこと",
+      "description": "将来実現したいことや、時期未定の希望"
+    },
+    {
+      "name": "candidate_task",
+      "label": "候補タスク",
+      "description": "実施決定前の作業候補"
+    },
+    {
+      "name": "home_status",
+      "label": "家の状況",
+      "description": "住居、設備、片付けなど家庭環境の継続状況"
+    },
+    {
+      "name": "study_status",
+      "label": "学習状況",
+      "description": "資格や分野ごとの学習進捗と次の目標"
+    },
+    {
+      "name": "project_status",
+      "label": "プロジェクト状況",
+      "description": "継続プロジェクトの状態、決定事項、次の節目"
+    },
+    {
+      "name": "preference",
+      "label": "好み",
+      "description": "継続的な好み、判断基準、回答スタイル"
+    },
+    {
+      "name": "uncategorized",
+      "label": "未分類",
+      "description": "根拠は明確だが既存カテゴリへの分類を確定できない項目"
+    }
+  ]
+}

@@ -20,6 +20,14 @@ def format_result(result: MemorySearchResult, root: Path) -> str:
         parts.append(f"  date: {result.date}")
     if result.tags:
         parts.append(f"  tags: {', '.join(result.tags)}")
+    if result.category:
+        parts.append(f"  category: {result.category} ({result.category_label or result.category})")
+    if result.status:
+        parts.append(f"  status: {result.status}")
+    if result.source:
+        parts.append(f"  source: {result.source}")
+    if result.confidence:
+        parts.append(f"  confidence: {result.confidence}")
     if result.snippet:
         parts.append(f"  snippet: {result.snippet}")
     return "\n".join(parts)
@@ -31,7 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=ROOT, help="AI-LifeOS root directory.")
     parser.add_argument("--limit", type=int, default=10, help="Maximum number of results.")
     parser.add_argument("--type", action="append", dest="document_types", help="Filter by document type.")
-    parser.add_argument("--tag", help="Filter by summary tag.")
+    parser.add_argument("--tag", help="Filter by tag.")
+    parser.add_argument("--category", help="Filter structured memory by category slug.")
+    parser.add_argument("--status", help="Filter structured memory by status.")
     parser.add_argument("--db", help="SQLite index path. Defaults to memory/search_index.sqlite3.")
     parser.add_argument("--no-index", action="store_true", help="Search Markdown files directly.")
     parser.add_argument("--rebuild-index", action="store_true", help="Rebuild SQLite index before searching.")
@@ -53,6 +63,8 @@ def main() -> int:
         limit=args.limit,
         document_types=args.document_types,
         tag=args.tag,
+        category=args.category,
+        status=args.status,
         use_index=not args.no_index,
     )
 
@@ -66,6 +78,12 @@ def main() -> int:
                         "title": result.title,
                         "date": result.date,
                         "tags": list(result.tags),
+                        "category": result.category,
+                        "category_label": result.category_label,
+                        "status": result.status,
+                        "source": result.source,
+                        "source_date": result.source_date,
+                        "confidence": result.confidence,
                         "snippet": result.snippet,
                         "score": result.score,
                     }
@@ -90,4 +108,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
