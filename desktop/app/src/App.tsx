@@ -96,6 +96,7 @@ const MAX_ATTACHMENTS = 3
 const MAX_ATTACHMENT_BYTES = 1024 * 1024
 const MAX_ATTACHMENT_TEXT_CHARS = 12_000
 const SUPPORTED_ATTACHMENT_EXTENSIONS = new Set(["txt", "md", "pdf", "xlsx"])
+const FINALIZE_JOB_STORAGE_KEY = "ai-lifeos.active-finalize-job"
 
 function App() {
   const [session, setSession] = useState<SessionFile | null>(null)
@@ -188,15 +189,55 @@ function App() {
     setReplyState("idle")
     setError(null)
     try {
-      const [sessionResult, listResult] = await Promise.all([startSession(), listResumableSessions()])
-      setSession(sessionResult.session)
-      setMessages(sessionResult.messages)
+      const listPromise = listResumableSessions()
+      const trackedJobId = readTrackedFinalizeJobId()
+      let restored = false
+
+      if (trackedJobId) {
+        try {
+          const jobResult = await getFinalizeJob(trackedJobId)
+          const resumed = await resumeSession(finalizeSessionId(jobResult.job.session_file))
+          setSession(resumed.session)
+          setMessages(resumed.messages)
+          setFinalizeJob(jobResult.job)
+          setPendingUserMessage(null)
+          setStreamingAssistant(null)
+          setAttachments([])
+          setLastMemoryContext(null)
+          restored = true
+
+          if (jobResult.job.status === "failed") {
+            clearTrackedFinalizeJob(trackedJobId)
+            setReplyState("failed")
+            setError(`整理処理に失敗しました: ${jobResult.job.error ?? jobResult.job.message ?? "不明なエラー"}`)
+            setNotice("再起動前の整理ジョブを回収しました。必要なら再実行できます。")
+          } else if (jobResult.job.status === "cancelled") {
+            clearTrackedFinalizeJob(trackedJobId)
+            setNotice("再起動前の整理ジョブはキャンセル済みです。")
+          } else if (jobResult.job.status === "succeeded") {
+            clearTrackedFinalizeJob(trackedJobId)
+            setNotice("再起動前の整理ジョブは完了しています。")
+          } else {
+            setNotice("再起動前の整理ジョブへ再接続しました。")
+          }
+        } catch {
+          clearTrackedFinalizeJob(trackedJobId)
+        }
+      }
+
+      if (!restored) {
+        const sessionResult = await startSession()
+        setSession(sessionResult.session)
+        setMessages(sessionResult.messages)
+        setPendingUserMessage(null)
+        setStreamingAssistant(null)
+        setAttachments([])
+        setLastMemoryContext(null)
+        setNotice("新規セッションを開始しました。")
+      }
+
+      const listResult = await listPromise
       setSessions(listResult.sessions)
-      setPendingUserMessage(null)
-      setStreamingAssistant(null)
-      setAttachments([])
-      setLastMemoryContext(null)
-      setNotice("新規セッションを開始しました。")
     } catch (err) {
       setReplyState("failed")
       setError(withNextAction(formatError(err)))
@@ -225,7 +266,7 @@ function App() {
   }
 
   async function createSession() {
-    if (isBusy) {
+    if (isBusy || isFinalizeActive) {
       return
     }
 
@@ -366,7 +407,7 @@ function App() {
   }
 
   async function loadSession(sessionId: string) {
-    if (isBusy) {
+    if (isBusy || isFinalizeActive) {
       return
     }
 
@@ -405,6 +446,7 @@ function App() {
     setError(null)
     try {
       const result = await startFinalizeJob(session.jsonl_file)
+      trackFinalizeJob(result.job.job_id)
       setFinalizeJob(result.job)
       setNotice("整理ジョブをバックグラウンドで開始しました。")
       await refreshSessionsAfterAction()
@@ -421,13 +463,16 @@ function App() {
       const result = await getFinalizeJob(jobId)
       setFinalizeJob(result.job)
       if (result.job.status === "succeeded" && result.job.result) {
+        clearTrackedFinalizeJob(jobId)
         setSession(result.job.result.session)
         setNotice(`整理済み: ${result.job.result.raw_file}`)
         await refreshSessionsAfterAction()
       } else if (result.job.status === "failed") {
+        clearTrackedFinalizeJob(jobId)
         setReplyState("failed")
         setError(`整理処理に失敗しました: ${result.job.error ?? result.job.message ?? "不明なエラー"}`)
       } else if (result.job.status === "cancelled") {
+        clearTrackedFinalizeJob(jobId)
         setNotice("整理ジョブをキャンセルしました。必要なら再度実行してください。")
       }
     } catch (err) {
@@ -1385,6 +1430,38 @@ function createRequestId() {
     return crypto.randomUUID()
   }
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function trackFinalizeJob(jobId: string) {
+  try {
+    window.localStorage.setItem(FINALIZE_JOB_STORAGE_KEY, jobId)
+  } catch {
+    // The status file remains authoritative when local storage is unavailable.
+  }
+}
+
+function readTrackedFinalizeJobId() {
+  try {
+    return window.localStorage.getItem(FINALIZE_JOB_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+function clearTrackedFinalizeJob(expectedJobId?: string) {
+  try {
+    if (expectedJobId && window.localStorage.getItem(FINALIZE_JOB_STORAGE_KEY) !== expectedJobId) {
+      return
+    }
+    window.localStorage.removeItem(FINALIZE_JOB_STORAGE_KEY)
+  } catch {
+    // Ignore storage cleanup failures; backend status recovery still applies.
+  }
+}
+
+function finalizeSessionId(sessionFile: string) {
+  const name = sessionFile.split(/[\\/]/).pop() ?? sessionFile
+  return name.replace(/\.jsonl$/i, "")
 }
 
 async function copyText(text: string) {

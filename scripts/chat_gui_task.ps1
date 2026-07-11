@@ -65,7 +65,10 @@ try {
     }
     elseif ($Mode -eq "dev") {
         Invoke-LoggedCommand -Exe "npm.cmd" -CommandArgs @("install")
-        Invoke-LoggedCommand -Exe "npm.cmd" -CommandArgs @("run", "tauri", "dev")
+        # Tauri's Rust watcher can report unchanged build.rs/icon files as changed
+        # shortly after startup and restart the whole app process tree. Vite keeps
+        # frontend hot reload active; restart this task manually for Rust changes.
+        Invoke-LoggedCommand -Exe "npm.cmd" -CommandArgs @("run", "tauri", "--", "dev", "--no-watch")
     }
     elseif ($Mode -eq "build") {
         Invoke-LoggedCommand -Exe "npm.cmd" -CommandArgs @("install")

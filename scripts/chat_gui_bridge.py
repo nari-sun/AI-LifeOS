@@ -1,11 +1,13 @@
 import argparse
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import traceback
 from datetime import date, datetime, time as datetime_time
 from pathlib import Path
@@ -36,6 +38,9 @@ TEXT_ATTACHMENT_EXTENSIONS = {".txt", ".md"}
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 LOCAL_DATA_FOLDERS = {"conversations", "journal", "memory", "inbox", "tasks", "imports", "logs"}
 BACKGROUND_PROCESSES: list[subprocess.Popen[str]] = []
+FINALIZE_ACTIVE_STATUSES = {"queued", "running"}
+FINALIZE_TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
+FINALIZE_WORKER_START_GRACE_SECONDS = 5.0
 
 
 class AssistantGenerationCancelled(RuntimeError):
@@ -293,7 +298,17 @@ def handle_open_local_data_folder(payload: dict[str, Any]) -> dict[str, Any]:
 def handle_start_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
     session_file = _resolve_existing_session(root=root, value=payload.get("session_file"))
+    existing = _find_active_finalize_job(root=root, session_file=session_file)
+    if existing is not None:
+        _gui_log(root, f"finalize_job.reused job_id={existing['job_id']} session={session_file.stem}")
+        return {"job": existing}
+
     job_id = _new_job_id()
+    locked_job = _claim_finalize_lock(root=root, session_file=session_file, job_id=job_id)
+    if locked_job is not None:
+        _gui_log(root, f"finalize_job.reused job_id={locked_job['job_id']} session={session_file.stem}")
+        return {"job": locked_job}
+
     log_path = _job_log_path(root, job_id)
     cancel_file = _job_cancel_file(root, job_id)
     _write_job_status(
@@ -313,6 +328,8 @@ def handle_start_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
             "created_at": _now_iso(),
             "started_at": None,
             "finished_at": None,
+            "launcher_pid": os.getpid(),
+            "worker_pid": None,
             "result": None,
         },
     )
@@ -325,7 +342,23 @@ def handle_start_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
         "codex_command": str(payload.get("codex_command") or "codex.cmd"),
         "codex_approval": str(payload.get("codex_approval") or "never"),
     }
-    _spawn_finalize_worker(root=root, payload=worker_payload, log_path=log_path)
+    try:
+        process = _spawn_finalize_worker(root=root, payload=worker_payload, log_path=log_path)
+        _write_job_status(root, job_id, {"worker_pid": process.pid})
+    except Exception as exc:
+        _write_job_status(
+            root,
+            job_id,
+            {
+                "status": "failed",
+                "stage": "failed",
+                "message": "整理ワーカーを起動できませんでした。",
+                "error": f"{type(exc).__name__}: {exc}",
+                "finished_at": _now_iso(),
+            },
+        )
+        _release_finalize_lock(root=root, session_file=session_file, job_id=job_id)
+        raise
     _gui_log(root, f"finalize_job.started job_id={job_id} session={session_file.stem}")
     return {"job": _read_job_status(root, job_id)}
 
@@ -333,14 +366,14 @@ def handle_start_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
 def handle_get_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
     job_id = _required_job_id(payload.get("job_id"))
-    return {"job": _read_job_status(root, job_id)}
+    return {"job": _refresh_finalize_job_status(root, job_id)}
 
 
 def handle_cancel_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
     job_id = _required_job_id(payload.get("job_id"))
-    status = _read_job_status(root, job_id)
-    if status.get("status") not in {"succeeded", "failed", "cancelled"}:
+    status = _refresh_finalize_job_status(root, job_id)
+    if status.get("status") not in FINALIZE_TERMINAL_STATUSES:
         cancel_file = _job_cancel_file(root, job_id)
         cancel_file.parent.mkdir(parents=True, exist_ok=True)
         cancel_file.write_text(_now_iso(), encoding="utf-8")
@@ -534,8 +567,156 @@ def _job_log_path(root: Path, job_id: str) -> Path:
     return _job_dir(root) / f"{job_id}.log"
 
 
+def _job_event_log(root: Path, job_id: str, message: str) -> None:
+    try:
+        path = _job_log_path(root, job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = _now_iso()
+        with path.open("a", encoding="utf-8") as file:
+            file.write(f"{timestamp} pid={os.getpid()} {message}\n")
+    except OSError:
+        pass
+
+
+def _job_worker_event(job_id: str, message: str) -> None:
+    timestamp = _now_iso()
+    sys.stderr.write(f"{timestamp} pid={os.getpid()} job_id={job_id} {message}\n")
+    sys.stderr.flush()
+
+
 def _job_cancel_file(root: Path, job_id: str) -> Path:
     return _job_dir(root) / f"{job_id}.cancel"
+
+
+def _finalize_lock_path(root: Path, session_file: Path) -> Path:
+    session_key = str(session_file.resolve())
+    if os.name == "nt":
+        session_key = session_key.casefold()
+    digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:24]
+    return _job_dir(root) / f"session-{digest}.lock"
+
+
+def _claim_finalize_lock(root: Path, session_file: Path, job_id: str) -> dict[str, Any] | None:
+    lock_path = _finalize_lock_path(root, session_file)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_value = {
+        "job_id": job_id,
+        "session_file": _display_path(session_file, root),
+        "created_at": _now_iso(),
+    }
+
+    for _ in range(120):
+        try:
+            with lock_path.open("x", encoding="utf-8") as file:
+                json.dump(lock_value, file, ensure_ascii=False, indent=2)
+                file.write("\n")
+            return None
+        except FileExistsError:
+            existing_lock = _read_finalize_lock(lock_path)
+            existing_job_id = str(existing_lock.get("job_id") or "") if existing_lock else ""
+            if JOB_ID_PATTERN.fullmatch(existing_job_id):
+                try:
+                    existing = _refresh_finalize_job_status(root, existing_job_id)
+                except (FileNotFoundError, ValueError):
+                    existing = None
+                if existing is not None and existing.get("status") in FINALIZE_ACTIVE_STATUSES:
+                    if _job_matches_session(root, existing, session_file):
+                        return existing
+                if existing is not None or not _lock_is_recent(existing_lock, lock_path):
+                    _release_finalize_lock(root=root, session_file=session_file, job_id=existing_job_id)
+                    continue
+            elif not _lock_is_recent(existing_lock, lock_path):
+                lock_path.unlink(missing_ok=True)
+                continue
+            time.sleep(0.05)
+
+    raise RuntimeError("整理ジョブのセッションロックを取得できませんでした。少し待ってから再実行してください。")
+
+
+def _read_finalize_lock(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _lock_is_recent(value: dict[str, Any], path: Path) -> bool:
+    created_age = _seconds_since(value.get("created_at"))
+    if created_age != float("inf"):
+        return created_age < FINALIZE_WORKER_START_GRACE_SECONDS
+    try:
+        return time.time() - path.stat().st_mtime < FINALIZE_WORKER_START_GRACE_SECONDS
+    except OSError:
+        return False
+
+
+def _release_finalize_lock(root: Path, session_file: Path, job_id: str) -> None:
+    lock_path = _finalize_lock_path(root, session_file)
+    if not lock_path.exists():
+        return
+    lock_value = _read_finalize_lock(lock_path)
+    if str(lock_value.get("job_id") or "") != job_id:
+        return
+    lock_path.unlink(missing_ok=True)
+
+
+def _find_active_finalize_job(root: Path, session_file: Path) -> dict[str, Any] | None:
+    job_dir = _job_dir(root)
+    if not job_dir.exists():
+        return None
+
+    active: list[dict[str, Any]] = []
+    for path in job_dir.glob("*.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict) or not _job_matches_session(root, value, session_file):
+            continue
+        job_id = str(value.get("job_id") or "")
+        if not JOB_ID_PATTERN.fullmatch(job_id):
+            continue
+        try:
+            refreshed = _refresh_finalize_job_status(root, job_id)
+        except (FileNotFoundError, ValueError):
+            continue
+        if refreshed.get("status") in FINALIZE_ACTIVE_STATUSES:
+            active.append(refreshed)
+
+    if not active:
+        return None
+
+    active.sort(key=lambda item: str(item.get("created_at") or ""))
+    primary = active[0]
+    for duplicate in active[1:]:
+        duplicate_id = str(duplicate["job_id"])
+        cancel_file = _job_cancel_file(root, duplicate_id)
+        cancel_file.parent.mkdir(parents=True, exist_ok=True)
+        cancel_file.write_text(_now_iso(), encoding="utf-8")
+        _write_job_status(
+            root,
+            duplicate_id,
+            {
+                "message": "同じセッションの整理ジョブが既に動いているため、この重複ジョブを停止します。",
+                "cancel_requested_at": _now_iso(),
+            },
+        )
+        _gui_log(root, f"finalize_job.duplicate_cancelled job_id={duplicate_id} primary={primary['job_id']}")
+    return primary
+
+
+def _job_matches_session(root: Path, status: dict[str, Any], session_file: Path) -> bool:
+    value = status.get("session_file")
+    if not value:
+        return False
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = root / path
+    try:
+        return path.resolve() == session_file.resolve()
+    except OSError:
+        return False
 
 
 def _read_job_status(root: Path, job_id: str) -> dict[str, Any]:
@@ -552,6 +733,98 @@ def _read_job_status(root: Path, job_id: str) -> dict[str, Any]:
     return value
 
 
+def _refresh_finalize_job_status(root: Path, job_id: str) -> dict[str, Any]:
+    status = _read_job_status(root, job_id)
+    if status.get("status") not in FINALIZE_ACTIVE_STATUSES:
+        return status
+
+    worker_pid = status.get("worker_pid")
+    try:
+        pid = int(worker_pid) if worker_pid is not None else None
+    except (TypeError, ValueError):
+        pid = None
+
+    launcher_pid_value = status.get("launcher_pid")
+    try:
+        launcher_pid = int(launcher_pid_value) if launcher_pid_value is not None else None
+    except (TypeError, ValueError):
+        launcher_pid = None
+
+    worker_missing = pid is not None and not _process_exists(pid)
+    launcher_alive = launcher_pid is not None and _process_exists(launcher_pid)
+    worker_never_started = (
+        pid is None
+        and not launcher_alive
+        and _seconds_since(status.get("created_at")) >= FINALIZE_WORKER_START_GRACE_SECONDS
+    )
+    if not worker_missing and not worker_never_started:
+        return status
+
+    status = _write_job_status(
+        root,
+        job_id,
+        {
+            "status": "failed",
+            "stage": "failed",
+            "message": "整理ワーカーが終了したため、ジョブを失敗状態へ回収しました。再実行できます。",
+            "error": "Finalize worker exited before recording a terminal result.",
+            "finished_at": _now_iso(),
+        },
+    )
+    _job_event_log(root, job_id, f"worker.missing worker_pid={pid or '-'} status=failed")
+    session_value = status.get("session_file")
+    if session_value:
+        session_path = Path(str(session_value))
+        if not session_path.is_absolute():
+            session_path = root / session_path
+        _release_finalize_lock(root=root, session_file=session_path, job_id=job_id)
+    _gui_log(root, f"finalize_job.orphan_recovered job_id={job_id} worker_pid={pid or '-'}")
+    return status
+
+
+def _seconds_since(value: Any) -> float:
+    try:
+        then = datetime.fromisoformat(str(value))
+        now = datetime.now().astimezone()
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=now.tzinfo)
+        return max(0.0, (now - then).total_seconds())
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return ctypes.get_last_error() == 5
+        except (AttributeError, OSError):
+            return False
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _write_job_status(root: Path, job_id: str, update: dict[str, Any]) -> dict[str, Any]:
     path = _job_status_path(root, job_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -563,38 +836,62 @@ def _write_job_status(root: Path, job_id: str, update: dict[str, Any]) -> dict[s
         except json.JSONDecodeError:
             current = {}
     current.update(update)
-    temp_path = path.with_suffix(".json.tmp")
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
     temp_path.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temp_path.replace(path)
     return current
 
 
-def _spawn_finalize_worker(root: Path, payload: dict[str, Any], log_path: Path) -> None:
+def _spawn_finalize_worker(root: Path, payload: dict[str, Any], log_path: Path) -> subprocess.Popen[str]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("a", encoding="utf-8")
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    creationflags = _finalize_worker_creationflags()
     try:
-        process = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "run-finalize-job"],
-            cwd=root,
-            env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
-            stdin=subprocess.PIPE,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            creationflags=creationflags,
-        )
+        command = [sys.executable, str(Path(__file__).resolve()), "run-finalize-job"]
+        popen_kwargs = {
+            "cwd": root,
+            "env": {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            "stdin": subprocess.PIPE,
+            "stdout": log_handle,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "encoding": "utf-8",
+            "creationflags": creationflags,
+            "close_fds": True,
+        }
+        try:
+            process = subprocess.Popen(command, **popen_kwargs)
+        except OSError as exc:
+            breakaway_flag = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+            if os.name != "nt" or not breakaway_flag or not (creationflags & breakaway_flag):
+                raise
+            fallback_flags = creationflags & ~breakaway_flag
+            log_handle.write(
+                f"{_now_iso()} pid={os.getpid()} worker.detach_fallback type={type(exc).__name__} "
+                f"message={_safe_log_text(str(exc))}\n"
+            )
+            log_handle.flush()
+            popen_kwargs["creationflags"] = fallback_flags
+            process = subprocess.Popen(command, **popen_kwargs)
         assert process.stdin is not None
         process.stdin.write(json.dumps(payload, ensure_ascii=False))
         process.stdin.close()
         BACKGROUND_PROCESSES.append(process)
         log_handle.close()
+        return process
     except Exception:
         log_handle.close()
         raise
+
+
+def _finalize_worker_creationflags() -> int:
+    if os.name != "nt":
+        return 0
+    return (
+        getattr(subprocess, "DETACHED_PROCESS", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+    )
 
 
 def _run_finalize_job(root: Path, payload: dict[str, Any], job_id: str) -> None:
@@ -609,8 +906,10 @@ def _run_finalize_job(root: Path, payload: dict[str, Any], job_id: str) -> None:
             "message": "整理処理を開始しました。",
             "percent": 5,
             "started_at": _now_iso(),
+            "worker_pid": os.getpid(),
         },
     )
+    _job_worker_event(job_id, f"worker.start session={session_file.name}")
 
     def progress(percent: int, message: str) -> None:
         if cancel_file.exists():
@@ -624,6 +923,10 @@ def _run_finalize_job(root: Path, payload: dict[str, Any], job_id: str) -> None:
                 "message": message,
                 "percent": percent,
             },
+        )
+        _job_worker_event(
+            job_id,
+            f"worker.progress percent={percent} stage={_stage_from_progress_message(message)} message={_safe_log_text(message)}",
         )
 
     try:
@@ -662,6 +965,7 @@ def _run_finalize_job(root: Path, payload: dict[str, Any], job_id: str) -> None:
                 },
             },
         )
+        _job_worker_event(job_id, "worker.succeeded percent=100")
     except AssistantGenerationCancelled as exc:
         _write_job_status(
             root,
@@ -673,6 +977,7 @@ def _run_finalize_job(root: Path, payload: dict[str, Any], job_id: str) -> None:
                 "finished_at": _now_iso(),
             },
         )
+        _job_worker_event(job_id, f"worker.cancelled message={_safe_log_text(str(exc))}")
     except Exception as exc:
         _write_job_status(
             root,
@@ -685,7 +990,10 @@ def _run_finalize_job(root: Path, payload: dict[str, Any], job_id: str) -> None:
                 "finished_at": _now_iso(),
             },
         )
+        _job_worker_event(job_id, f"worker.failed {_format_exception(exc)}")
         raise
+    finally:
+        _release_finalize_lock(root=root, session_file=session_file, job_id=job_id)
 
 
 def _stage_from_progress_message(message: str) -> str:
@@ -750,9 +1058,7 @@ def _cancelable_run_command(root: Path, cancel_file: Path) -> Callable[..., subp
         if cancel_file.exists():
             raise AssistantGenerationCancelled("返答生成を停止しました。")
 
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        creationflags = _cancelable_subprocess_creationflags()
 
         process = subprocess.Popen(
             command,
@@ -789,6 +1095,12 @@ def _cancelable_run_command(root: Path, cancel_file: Path) -> Callable[..., subp
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
     return run_command
+
+
+def _cancelable_subprocess_creationflags() -> int:
+    if os.name != "nt":
+        return 0
+    return getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:

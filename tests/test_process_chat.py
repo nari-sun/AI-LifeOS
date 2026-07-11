@@ -155,6 +155,27 @@ class ProcessChatTests(unittest.TestCase):
         )
         self.assertEqual("整理して", calls[0][1]["input"])
 
+    def test_run_codex_task_captures_bytes_and_decodes_cp932_error(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr="認証エラー".encode("cp932"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(RuntimeError) as raised:
+                process_chat.run_codex_task(
+                    root=Path(temp_dir),
+                    prompt="整理して",
+                    capture_output=True,
+                    run_command=fake_run,
+                )
+
+        self.assertIn("認証エラー", str(raised.exception))
+        self.assertEqual("整理して".encode("utf-8"), calls[0][1]["input"])
+        self.assertFalse(calls[0][1]["text"])
+        self.assertNotIn("encoding", calls[0][1])
+
     def test_prepare_memory_targets_creates_memory_and_journal_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

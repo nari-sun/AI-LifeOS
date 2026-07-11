@@ -2,12 +2,16 @@ import base64
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -438,6 +442,111 @@ class ChatGuiBridgeTests(unittest.TestCase):
             self.assertTrue((root / status["result"]["raw_file"]).exists())
             for process in chat_gui_bridge.BACKGROUND_PROCESSES:
                 process.wait(timeout=5)
+            self.assertFalse(chat_gui_bridge._finalize_lock_path(root, session.path).exists())
+            job_log = (root / status["log_path"]).read_text(encoding="utf-8")
+            self.assertIn("worker.start", job_log)
+            self.assertIn("worker.progress", job_log)
+            self.assertIn("worker.succeeded", job_log)
+
+    def test_finalize_job_reuses_active_job_for_same_session(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = create_live_session(root=root, started_at=datetime(2026, 7, 3, 12, 0, tzinfo=timezone.utc))
+            session.append_message("user", "finalize once", session.started_at)
+            fake_process = mock.Mock(pid=os.getpid())
+
+            with mock.patch.object(chat_gui_bridge, "_spawn_finalize_worker", return_value=fake_process) as spawn:
+                first = chat_gui_bridge.handle_start_finalize_job(
+                    {"root": str(root), "session_file": str(session.path), "run_codex": False}
+                )["job"]
+                second = chat_gui_bridge.handle_start_finalize_job(
+                    {"root": str(root), "session_file": str(session.path), "run_codex": False}
+                )["job"]
+
+            self.assertEqual(first["job_id"], second["job_id"])
+            spawn.assert_called_once()
+            self.assertEqual(1, len(list((root / "logs" / "chat_gui_jobs").glob("*.json"))))
+
+    def test_finalize_job_lock_prevents_concurrent_duplicate_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = create_live_session(root=root, started_at=datetime(2026, 7, 3, 12, 0, tzinfo=timezone.utc))
+            session.append_message("user", "concurrent finalize", session.started_at)
+            payload = {"root": str(root), "session_file": str(session.path), "run_codex": False}
+            fake_process = mock.Mock(pid=os.getpid())
+
+            with mock.patch.object(chat_gui_bridge, "_spawn_finalize_worker", return_value=fake_process) as spawn:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    jobs = list(executor.map(lambda _: chat_gui_bridge.handle_start_finalize_job(payload)["job"], range(2)))
+
+            self.assertEqual(jobs[0]["job_id"], jobs[1]["job_id"])
+            spawn.assert_called_once()
+
+    def test_get_finalize_job_recovers_dead_worker_and_releases_lock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = create_live_session(root=root, started_at=datetime(2026, 7, 3, 12, 0, tzinfo=timezone.utc))
+            session.append_message("user", "recover orphan", session.started_at)
+            job_id = "orphan-job"
+            chat_gui_bridge._write_job_status(
+                root,
+                job_id,
+                {
+                    "job_id": job_id,
+                    "status": "running",
+                    "stage": "memory",
+                    "session_file": chat_gui_bridge._display_path(session.path, root),
+                    "created_at": "2026-07-03T12:00:00+00:00",
+                    "worker_pid": 999999,
+                },
+            )
+            self.assertIsNone(chat_gui_bridge._claim_finalize_lock(root, session.path, job_id))
+
+            with mock.patch.object(chat_gui_bridge, "_process_exists", return_value=False):
+                status = chat_gui_bridge.handle_get_finalize_job({"root": str(root), "job_id": job_id})["job"]
+
+            self.assertEqual("failed", status["status"])
+            self.assertIn("terminal result", status["error"])
+            self.assertFalse(chat_gui_bridge._finalize_lock_path(root, session.path).exists())
+            job_log = chat_gui_bridge._job_log_path(root, job_id).read_text(encoding="utf-8")
+            self.assertIn("worker.missing", job_log)
+
+    def test_cancelable_runner_keeps_non_utf8_stderr_as_bytes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = chat_gui_bridge._cancelable_run_command(root, root / "cancel")
+            completed = runner(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stderr.buffer.write('認証エラー'.encode('cp932')); raise SystemExit(1)",
+                ],
+                cwd=root,
+                input=b"",
+                text=False,
+            )
+
+            self.assertEqual(1, completed.returncode)
+            self.assertEqual("認証エラー".encode("cp932"), completed.stderr)
+
+    def test_finalize_worker_uses_detached_windows_process_flags(self):
+        flags = chat_gui_bridge._finalize_worker_creationflags()
+        if os.name != "nt":
+            self.assertEqual(0, flags)
+            return
+
+        self.assertNotEqual(0, flags & subprocess.DETACHED_PROCESS)
+        self.assertNotEqual(0, flags & subprocess.CREATE_NEW_PROCESS_GROUP)
+        self.assertNotEqual(0, flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
+
+    def test_cancelable_subprocess_hides_windows_console(self):
+        flags = chat_gui_bridge._cancelable_subprocess_creationflags()
+        if os.name != "nt":
+            self.assertEqual(0, flags)
+            return
+
+        self.assertNotEqual(0, flags & subprocess.CREATE_NEW_PROCESS_GROUP)
+        self.assertNotEqual(0, flags & subprocess.CREATE_NO_WINDOW)
 
 
 if __name__ == "__main__":

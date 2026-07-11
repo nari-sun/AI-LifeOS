@@ -1,4 +1,5 @@
 import argparse
+import locale
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -168,14 +169,22 @@ def run_codex_task(
     )
 
     try:
-        run_kwargs = {
-            "cwd": root,
-            "input": prompt,
-            "text": True,
-            "encoding": "utf-8",
-        }
         if capture_output:
-            run_kwargs["capture_output"] = True
+            # Capture bytes so Windows-native stderr using CP932 cannot crash
+            # subprocess' reader thread before the actual Codex error is read.
+            run_kwargs = {
+                "cwd": root,
+                "input": prompt.encode("utf-8"),
+                "text": False,
+                "capture_output": True,
+            }
+        else:
+            run_kwargs = {
+                "cwd": root,
+                "input": prompt,
+                "text": True,
+                "encoding": "utf-8",
+            }
 
         completed = run_command(
             command,
@@ -199,11 +208,35 @@ def _completed_process_output(completed) -> str:
     for label in ("stderr", "stdout"):
         value = getattr(completed, label, "")
         if value:
-            text = str(value).strip()
+            text = _decode_subprocess_output(value).strip()
             if text:
                 parts.append(f"{label}:\n{text[-2000:]}")
 
     return "\n".join(parts)
+
+
+def _decode_subprocess_output(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, bytes):
+        return str(value)
+
+    encodings = ["utf-8", "cp932", locale.getpreferredencoding(False)]
+    if sys.platform == "win32":
+        encodings.append("mbcs")
+
+    tried: set[str] = set()
+    for encoding in encodings:
+        normalized = encoding.lower()
+        if normalized in tried:
+            continue
+        tried.add(normalized)
+        try:
+            return value.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+
+    return value.decode("utf-8", errors="replace")
 
 
 def commit_changes(

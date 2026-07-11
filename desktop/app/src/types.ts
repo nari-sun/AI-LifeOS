@@ -169,6 +169,8 @@ export interface FinalizeJob {
   created_at: string
   started_at: string | null
   finished_at: string | null
+  launcher_pid: number | null
+  worker_pid: number | null
   result: FinalizeSessionResult | null
 }
 
