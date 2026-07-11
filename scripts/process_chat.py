@@ -23,8 +23,8 @@ DEFAULT_COMMIT_PATHS = (
     "templates",
     "tests",
 )
-DEFAULT_MEMORY_CODEX_MODEL = "gpt-5.5"
-DEFAULT_MEMORY_CODEX_REASONING_EFFORT = "xhigh"
+DEFAULT_MEMORY_CODEX_MODEL = "gpt-5.6-terra"
+DEFAULT_MEMORY_CODEX_REASONING_EFFORT = "medium"
 PHASE2_PROMPT_TEMPLATE = Path("prompts") / "codex_phase2_prompt.md"
 
 

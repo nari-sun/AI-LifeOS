@@ -32,7 +32,7 @@ Tauri 2
 * user / assistant発言の表示
 * user発言をCodex呼び出し前に `inbox/live/*.jsonl` へ保存
 * assistant返答を受信後に `inbox/live/*.jsonl` へ保存
-* assistant返答生成は `gpt-5.4-mini` / `model_reasoning_effort="medium"` / `service_tier="fast"` を使う
+* assistant返答生成は `gpt-5.6-luna` / `model_reasoning_effort="medium"` を使い、service tierは指定せず `features.fast_mode=false` とする
 * 10日以内の再開可能セッション一覧表示
 * セッション再開
 * セッションメタデータ保存
@@ -40,6 +40,7 @@ Tauri 2
 * 送信直後のuser発言をUI一時状態として表示
 * `.txt` / `.md` / `.pdf` / `.xlsx` 添付MVP
 * ローカル個人データの読み取り専用管理画面
+* 管理 > データ整理から、未整理・整理失敗の再開可能セッションを古い順に逐次整理
 * エラー表示
 
 最初のGUIで扱わないこと:
@@ -49,7 +50,6 @@ Tauri 2
 * MCP連携
 * モデル・応答設定UI
 * ChatGPT風のメッセージ編集、回答再生成、会話分岐
-* 10日超セッションの自動削除
 * 会話中の memory / journal 自動編集
 * 自動Git commit
 
@@ -116,7 +116,7 @@ npm run bundle
 * ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない
 * GUI中に `memory/long_term.md` や `journal` を勝手に編集しない
 * memory / journal / summary 更新は「会話を整理して保存」操作で既存finalize処理に接続する
-* memory / journal / summary 更新は `gpt-5.5` / `model_reasoning_effort="xhigh"` を使う
+* memory / journal / summary 更新は `gpt-5.6-terra` / `model_reasoning_effort="medium"` を使う
 * モデル・応答設定UIは RT-0015 として保留し、方針は `docs/response_settings_ui.md` に分ける
 * 未実装の設定をGUIに出さない
 * Git commitはGUIから自動連発しない
@@ -204,6 +204,15 @@ MVP制限:
 * `cancelled`
 
 GUIはジョブIDをpollして、進捗、現在段階、完了結果、エラー、ログパスを表示します。ジョブ中も画面は応答しますが、同じセッションへの新規送信は競合防止のため無効化します。詳細は `docs/background_jobs.md` に整理しています。
+
+## 管理メニュー
+
+左サイドバーの「管理」は展開式メニューです。
+
+* 「ローカルデータ」は既存の読み取り専用データ管理画面を開く
+* 「データ整理」は、10日以内の再開可能セッションのうち未整理または整理失敗のものを古い順に1件ずつ整理する
+
+データ整理は確認後にだけ開始します。個別の失敗は記録して残りを続行し、停止した場合や失敗した場合は未処理のセッションを後で再実行できます。整理中は新規チャット、セッション切り替え、個別整理を無効化します。
 
 ## RT-0014 Local Data Management
 

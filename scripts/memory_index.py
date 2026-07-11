@@ -91,23 +91,24 @@ def collect_documents(root: Path | str = ROOT) -> list[MemoryDocument]:
             except ValueError:
                 continue
 
-        documents.append(
-            MemoryDocument(
-                document_key=relative,
-                document_type=document_type,
-                path=path,
-                title=structured.category_label if structured else _extract_title(content, path),
-                date=structured.source_date if structured else _extract_date(content, path, root, document_type),
-                tags=structured.tags if structured else tuple(_extract_tags(content)),
-                content=structured.content if structured else content,
-                category=structured.category if structured else None,
-                category_label=structured.category_label if structured else None,
-                status=structured.status if structured else None,
-                source=structured.source if structured else None,
-                source_date=structured.source_date if structured else None,
-                confidence=structured.confidence if structured else None,
-            )
+        document = MemoryDocument(
+            document_key=relative,
+            document_type=document_type,
+            path=path,
+            title=structured.category_label if structured else _extract_title(content, path),
+            date=structured.source_date if structured else _extract_date(content, path, root, document_type),
+            tags=structured.tags if structured else tuple(_extract_tags(content)),
+            content=structured.content if structured else content,
+            category=structured.category if structured else None,
+            category_label=structured.category_label if structured else None,
+            status=structured.status if structured else None,
+            source=structured.source if structured else None,
+            source_date=structured.source_date if structured else None,
+            confidence=structured.confidence if structured else None,
         )
+        documents.append(document)
+        if document_type == "raw":
+            documents.extend(_raw_message_documents(document))
 
     return sorted(documents, key=lambda document: (document.date or "", document.document_type, document.document_key))
 
@@ -153,6 +154,15 @@ def search_memory(
             category=category,
             status=status,
         )
+        # Existing indexes predate message-level raw evidence.  Keep them usable
+        # without requiring a manual rebuild before the first answer after an
+        # upgrade.
+        if "raw_chunk" in type_filter and not documents:
+            documents = [
+                document
+                for document in collect_documents(root)
+                if document.document_type == "raw_chunk"
+            ]
     else:
         documents = collect_documents(root)
         if type_filter:
@@ -207,6 +217,48 @@ def _document_type(path: Path, root: Path) -> str | None:
             return "memory_item"
         return "memory"
     return None
+
+
+def _raw_message_documents(document: MemoryDocument) -> list[MemoryDocument]:
+    """Create searchable message-sized evidence from a finalized live-chat raw.md.
+
+    The complete raw file remains indexed for compatibility and manual search.
+    Pasted or imported files without the live-chat headings fall back to that
+    whole-document index entry.
+    """
+    pattern = re.compile(
+        r"^## (?P<role>User|Assistant)\s*\n\s*Timestamp:\s*(?P<timestamp>[^\n]+)\s*\n\s*"
+        r"(?P<content>.*?)(?=^## (?:User|Assistant)\s*$|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    chunks: list[MemoryDocument] = []
+    for message_number, match in enumerate(pattern.finditer(document.content), start=1):
+        role = match.group("role")
+        timestamp = match.group("timestamp").strip()
+        content = match.group("content").strip()
+        if not content:
+            continue
+
+        chunks.append(
+            MemoryDocument(
+                document_key=f"{document.document_key}#message-{message_number:03d}-{role.lower()}",
+                document_type="raw_chunk",
+                path=document.path,
+                title=f"{document.title} / {role} message {message_number}",
+                date=document.date,
+                tags=document.tags,
+                content="\n".join(
+                    (
+                        f"Session: {document.title}",
+                        f"Role: {role}",
+                        f"Timestamp: {timestamp}",
+                        "",
+                        content,
+                    )
+                ),
+            )
+        )
+    return chunks
 
 
 def _extract_title(content: str, path: Path) -> str:
@@ -284,7 +336,7 @@ def _rank_documents(documents: list[MemoryDocument], query: str, limit: int) -> 
                 title=document.title,
                 date=document.date,
                 tags=document.tags,
-                snippet=_snippet(document.content, terms),
+                snippet=_snippet(document.content, terms, width=2200 if document.document_type == "raw_chunk" else 160),
                 score=score,
                 category=document.category,
                 category_label=document.category_label,
@@ -314,6 +366,11 @@ def _score(document: MemoryDocument, terms: list[str]) -> int:
         score += 2
     if document.document_type == "summary" and score:
         score += 2
+    if document.document_type == "raw_chunk" and score:
+        # Detailed user messages are more useful evidence than a short question
+        # that merely repeats the search wording.  Keep the bonus capped so a
+        # long but weakly related transcript cannot dominate keyword matches.
+        score += min(max((len(document.content) - 160) // 400, 0), 4)
     return score
 
 

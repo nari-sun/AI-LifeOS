@@ -6,10 +6,15 @@ updates.
 
 ## Scope
 
-The first GUI job is `finalize-session`.
+GUI jobs are `finalize-session` and `organize-sessions`.
 
-It runs outside the foreground Tauri command so the React UI can keep rendering,
+They run outside the foreground Tauri command so the React UI can keep rendering,
 poll status, and show progress while Codex and indexing work continue.
+
+`organize-sessions` is started only from the 管理 > データ整理 screen. It selects
+reopenable sessions within the existing 10-day retention window whose organization
+state has `can_organize: true`, then processes them oldest first. This includes
+unorganized sessions and sessions whose raw, memory, or index stage failed.
 
 ## Status Files
 
@@ -20,6 +25,7 @@ logs/chat_gui_jobs/<job_id>.json
 logs/chat_gui_jobs/<job_id>.log
 logs/chat_gui_jobs/<job_id>.cancel
 logs/chat_gui_jobs/session-<hash>.lock
+logs/chat_gui_jobs/organize-sessions.lock
 ```
 
 `logs/` is local diagnostics data and must not be committed. `privacy_check.py`
@@ -54,6 +60,11 @@ While the job is active:
 Completion updates the session organization state from the job result. Failure
 shows the error and leaves the session metadata available for retry.
 
+The 管理 > データ整理 screen starts one `organize-sessions` worker. It processes
+one session at a time, records the current session and counts, continues after
+per-session failures, and exposes a best-effort stop action. It refreshes the
+sidebar after a terminal result so retry candidates remain visible.
+
 ## Safety Rules
 
 * Jobs do not commit Git changes.
@@ -62,6 +73,11 @@ shows the error and leaves the session metadata available for retry.
   `session_store.py` organization metadata.
 * A session-specific lock makes repeated or concurrent finalize requests
   idempotent. The active job is returned instead of starting a second writer.
+* An organize-sessions lock makes bulk requests idempotent. While it is active,
+  individual finalize requests are rejected so summary, journal, memory, and
+  index writes cannot run in parallel.
+* Bulk organization is a user-triggered action; simply opening the GUI or the
+  管理 screen never changes session, journal, memory, or conversation data.
 * Polling checks the recorded worker process. If a GUI or worker restart leaves
   a `queued` or `running` status without a live worker, the job is recovered as
   `failed`, its lock is released, and the session can be retried.

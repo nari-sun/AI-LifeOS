@@ -179,15 +179,49 @@ export interface FinalizeJobResult {
   job: FinalizeJob
 }
 
-export interface CleanupExpiredResult {
+export interface OrganizeSessionsFailure {
+  session_id: string
+  error: string
+}
+
+export interface OrganizeSessionsJob {
+  job_id: string
+  name: "organize-sessions"
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled"
+  stage: string | null
+  message: string | null
+  error: string | null
+  percent: number
+  total_sessions: number
+  completed_count: number
+  failed_count: number
+  skipped_count: number
+  failed_sessions: OrganizeSessionsFailure[]
+  current_session: string | null
+  log_path: string
+  cancel_file: string
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  launcher_pid: number | null
+  worker_pid: number | null
+  result: {
+    total_sessions: number
+    completed_sessions: string[]
+    failed_sessions: OrganizeSessionsFailure[]
+    skipped_sessions: string[]
+  } | null
+}
+
+export interface OrganizeSessionsJobResult {
   ok: boolean
-  results: Array<{
-    session_id: string
-    status: string
-    deleted_paths: string[]
-    raw_file: string | null
-    error: string | null
-  }>
+  job: OrganizeSessionsJob
+}
+
+export interface StartOrganizeSessionsJobResult {
+  ok: boolean
+  job: OrganizeSessionsJob | null
+  eligible_count: number
 }
 
 export interface LocalDataDirectoryReport {

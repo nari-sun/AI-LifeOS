@@ -23,7 +23,7 @@ from codex_conversation import (
 from finalize_live_chat import finalize_live_chat
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from local_data_report import build_local_data_report
-from session_store import cleanup_expired_sessions, get_session_organization, list_resumable_sessions, load_resume_session, save_session
+from session_store import get_session_organization, list_resumable_sessions, load_resume_session, save_session
 
 GUI_LOG_ENV = "AI_LIFEOS_GUI_LOG"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -41,6 +41,7 @@ BACKGROUND_PROCESSES: list[subprocess.Popen[str]] = []
 FINALIZE_ACTIVE_STATUSES = {"queued", "running"}
 FINALIZE_TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 FINALIZE_WORKER_START_GRACE_SECONDS = 5.0
+ORGANIZE_SESSIONS_JOB_NAME = "organize-sessions"
 
 
 class AssistantGenerationCancelled(RuntimeError):
@@ -128,6 +129,16 @@ def handle_send_message(
                     )
             reply = reply_result.reply
             memory_context = reply_result.memory_context
+            if memory_context is not None:
+                raw_chunk_count = sum(1 for result in memory_context.results if result.document_type == "raw_chunk")
+                _gui_log(
+                    root,
+                    "send_message.memory_context "
+                    f"session={session_file.stem} used={memory_context.used_memory} "
+                    f"score={memory_context.score}/{memory_context.threshold} "
+                    f"references={len(memory_context.references)} results={len(memory_context.results)} "
+                    f"raw_chunks={raw_chunk_count}",
+                )
             if cancel_file and cancel_file.exists():
                 raise AssistantGenerationCancelled("返答生成を停止しました。")
             saved_assistant = create_live_message("assistant", reply)
@@ -193,8 +204,9 @@ def handle_save_session(payload: dict[str, Any]) -> dict[str, Any]:
 def handle_list_resumable(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
     retention_days = int(payload.get("retention_days") or 10)
-    sessions = list_resumable_sessions(root=root, retention_days=retention_days)
-    _gui_log(root, f"list_resumable.done days={retention_days} count={len(sessions)}")
+    max_sessions = int(payload.get("max_sessions") or 50)
+    sessions = list_resumable_sessions(root=root, retention_days=retention_days, limit=max_sessions)
+    _gui_log(root, f"list_resumable.done days={retention_days} limit={max_sessions} count={len(sessions)}")
     return {"sessions": [_serialize_resume_session(session, root) for session in sessions]}
 
 
@@ -215,6 +227,8 @@ def handle_resume_session(payload: dict[str, Any]) -> dict[str, Any]:
 
 def handle_finalize_session(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
+    if _find_active_organize_sessions_job(root) is not None:
+        raise RuntimeError("データ整理が進行中です。完了または停止してから個別整理を実行してください。")
     session_file = _resolve_existing_session(root=root, value=payload.get("session_file"))
     run_codex = bool(payload.get("run_codex", True))
     _gui_log(root, f"finalize_session.start session={session_file.stem} run_codex={run_codex}")
@@ -238,33 +252,6 @@ def handle_finalize_session(payload: dict[str, Any]) -> dict[str, Any]:
         "codex_updated": bool(result.codex),
         "git_committed": bool(result.git and result.git.committed),
         "organization": result.organization,
-    }
-
-
-def handle_cleanup_expired(payload: dict[str, Any]) -> dict[str, Any]:
-    root = _payload_root(payload)
-    retention_days = int(payload.get("retention_days") or 10)
-    delete = bool(payload.get("delete", False))
-    auto_finalize = bool(payload.get("auto_finalize", False))
-    _gui_log(root, f"cleanup_expired.start days={retention_days} delete={delete} auto_finalize={auto_finalize}")
-    results = cleanup_expired_sessions(
-        root=root,
-        retention_days=retention_days,
-        delete=delete,
-        auto_finalize=auto_finalize,
-    )
-    _gui_log(root, f"cleanup_expired.done count={len(results)}")
-    return {
-        "results": [
-            {
-                "session_id": result.session_id,
-                "status": result.status,
-                "deleted_paths": [_display_path(path, root) for path in result.deleted_paths],
-                "raw_file": _display_path(result.raw_file, root) if result.raw_file else None,
-                "error": result.error,
-            }
-            for result in results
-        ],
     }
 
 
@@ -297,6 +284,8 @@ def handle_open_local_data_folder(payload: dict[str, Any]) -> dict[str, Any]:
 
 def handle_start_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
+    if _find_active_organize_sessions_job(root) is not None:
+        raise RuntimeError("データ整理が進行中です。完了または停止してから個別整理を実行してください。")
     session_file = _resolve_existing_session(root=root, value=payload.get("session_file"))
     existing = _find_active_finalize_job(root=root, session_file=session_file)
     if existing is not None:
@@ -397,6 +386,120 @@ def handle_run_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
     return {"job": _read_job_status(root, job_id)}
 
 
+def handle_start_organize_sessions_job(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    retention_days = int(payload.get("retention_days") or 10)
+    existing = _find_active_organize_sessions_job(root)
+    if existing is not None:
+        _gui_log(root, f"organize_sessions.reused job_id={existing['job_id']}")
+        return {"job": existing, "eligible_count": int(existing.get("total_sessions") or 0)}
+
+    active_finalize = _find_any_active_finalize_job(root)
+    if active_finalize is not None:
+        raise RuntimeError("個別の整理ジョブが進行中です。完了または停止してからデータ整理を実行してください。")
+
+    targets = _organize_session_targets(root=root, retention_days=retention_days)
+    if not targets:
+        _gui_log(root, f"organize_sessions.none days={retention_days}")
+        return {"job": None, "eligible_count": 0}
+
+    job_id = _new_job_id()
+    locked_job = _claim_organize_sessions_lock(root=root, job_id=job_id)
+    if locked_job is not None:
+        _gui_log(root, f"organize_sessions.reused job_id={locked_job['job_id']}")
+        return {"job": locked_job, "eligible_count": int(locked_job.get("total_sessions") or 0)}
+    log_path = _job_log_path(root, job_id)
+    cancel_file = _job_cancel_file(root, job_id)
+    _write_job_status(
+        root,
+        job_id,
+        {
+            "job_id": job_id,
+            "name": ORGANIZE_SESSIONS_JOB_NAME,
+            "status": "queued",
+            "stage": "queued",
+            "message": "データ整理ジョブを開始待ちです。",
+            "error": None,
+            "percent": 0,
+            "total_sessions": len(targets),
+            "completed_count": 0,
+            "failed_count": 0,
+            "skipped_count": 0,
+            "failed_sessions": [],
+            "current_session": None,
+            "log_path": _display_path(log_path, root),
+            "cancel_file": _display_path(cancel_file, root),
+            "created_at": _now_iso(),
+            "started_at": None,
+            "finished_at": None,
+            "launcher_pid": os.getpid(),
+            "worker_pid": None,
+            "result": None,
+        },
+    )
+
+    worker_payload = {
+        "root": str(root),
+        "job_id": job_id,
+        "session_files": [_display_path(path, root) for path in targets],
+        "run_codex": bool(payload.get("run_codex", True)),
+        "codex_command": str(payload.get("codex_command") or "codex.cmd"),
+        "codex_approval": str(payload.get("codex_approval") or "never"),
+    }
+    try:
+        process = _spawn_organize_sessions_worker(root=root, payload=worker_payload, log_path=log_path)
+        _write_job_status(root, job_id, {"worker_pid": process.pid})
+    except Exception as exc:
+        _write_job_status(
+            root,
+            job_id,
+            {
+                "status": "failed",
+                "stage": "failed",
+                "message": "データ整理ワーカーを起動できませんでした。",
+                "error": f"{type(exc).__name__}: {exc}",
+                "finished_at": _now_iso(),
+            },
+        )
+        _release_organize_sessions_lock(root=root, job_id=job_id)
+        raise
+    _gui_log(root, f"organize_sessions.started job_id={job_id} targets={len(targets)}")
+    return {"job": _read_job_status(root, job_id), "eligible_count": len(targets)}
+
+
+def handle_get_organize_sessions_job(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    job_id = _required_job_id(payload.get("job_id"))
+    return {"job": _refresh_organize_sessions_job_status(root, job_id)}
+
+
+def handle_cancel_organize_sessions_job(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    job_id = _required_job_id(payload.get("job_id"))
+    status = _refresh_organize_sessions_job_status(root, job_id)
+    if status.get("status") not in FINALIZE_TERMINAL_STATUSES:
+        cancel_file = _job_cancel_file(root, job_id)
+        cancel_file.parent.mkdir(parents=True, exist_ok=True)
+        cancel_file.write_text(_now_iso(), encoding="utf-8")
+        status = _write_job_status(
+            root,
+            job_id,
+            {
+                "message": "データ整理の停止要求を送信しました。現在のセッション処理後に停止します。",
+                "cancel_requested_at": _now_iso(),
+            },
+        )
+        _gui_log(root, f"organize_sessions.cancel_requested job_id={job_id}")
+    return {"job": status}
+
+
+def handle_run_organize_sessions_job(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    job_id = _required_job_id(payload.get("job_id"))
+    _run_organize_sessions_job(root=root, payload=payload, job_id=job_id)
+    return {"job": _read_job_status(root, job_id)}
+
+
 COMMANDS = {
     "start-session": handle_start_session,
     "send-message": handle_send_message,
@@ -406,13 +509,16 @@ COMMANDS = {
     "list-resumable": handle_list_resumable,
     "resume-session": handle_resume_session,
     "finalize-session": handle_finalize_session,
-    "cleanup-expired": handle_cleanup_expired,
     "local-data-report": handle_local_data_report,
     "open-local-data-folder": handle_open_local_data_folder,
     "start-finalize-job": handle_start_finalize_job,
     "get-finalize-job": handle_get_finalize_job,
     "cancel-finalize-job": handle_cancel_finalize_job,
     "run-finalize-job": handle_run_finalize_job,
+    "start-organize-sessions-job": handle_start_organize_sessions_job,
+    "get-organize-sessions-job": handle_get_organize_sessions_job,
+    "cancel-organize-sessions-job": handle_cancel_organize_sessions_job,
+    "run-organize-sessions-job": handle_run_organize_sessions_job,
 }
 
 
@@ -588,6 +694,52 @@ def _job_cancel_file(root: Path, job_id: str) -> Path:
     return _job_dir(root) / f"{job_id}.cancel"
 
 
+def _organize_sessions_lock_path(root: Path) -> Path:
+    return _job_dir(root) / "organize-sessions.lock"
+
+
+def _claim_organize_sessions_lock(root: Path, job_id: str) -> dict[str, Any] | None:
+    lock_path = _organize_sessions_lock_path(root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_value = {"job_id": job_id, "created_at": _now_iso()}
+
+    for _ in range(120):
+        try:
+            with lock_path.open("x", encoding="utf-8") as file:
+                json.dump(lock_value, file, ensure_ascii=False, indent=2)
+                file.write("\n")
+            return None
+        except FileExistsError:
+            existing_lock = _read_finalize_lock(lock_path)
+            existing_job_id = str(existing_lock.get("job_id") or "") if existing_lock else ""
+            if JOB_ID_PATTERN.fullmatch(existing_job_id):
+                try:
+                    existing = _refresh_organize_sessions_job_status(root, existing_job_id)
+                except (FileNotFoundError, ValueError):
+                    existing = None
+                if existing is not None and existing.get("status") in FINALIZE_ACTIVE_STATUSES:
+                    return existing
+                if existing is not None or not _lock_is_recent(existing_lock, lock_path):
+                    _release_organize_sessions_lock(root=root, job_id=existing_job_id)
+                    continue
+            elif not _lock_is_recent(existing_lock, lock_path):
+                lock_path.unlink(missing_ok=True)
+                continue
+            time.sleep(0.05)
+
+    raise RuntimeError("データ整理ジョブのロックを取得できませんでした。少し待ってから再実行してください。")
+
+
+def _release_organize_sessions_lock(root: Path, job_id: str) -> None:
+    lock_path = _organize_sessions_lock_path(root)
+    if not lock_path.exists():
+        return
+    lock_value = _read_finalize_lock(lock_path)
+    if str(lock_value.get("job_id") or "") != job_id:
+        return
+    lock_path.unlink(missing_ok=True)
+
+
 def _finalize_lock_path(root: Path, session_file: Path) -> Path:
     session_key = str(session_file.resolve())
     if os.name == "nt":
@@ -706,6 +858,63 @@ def _find_active_finalize_job(root: Path, session_file: Path) -> dict[str, Any] 
     return primary
 
 
+def _find_any_active_finalize_job(root: Path) -> dict[str, Any] | None:
+    job_dir = _job_dir(root)
+    if not job_dir.exists():
+        return None
+
+    for path in job_dir.glob("*.json"):
+        try:
+            status = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(status, dict) or status.get("name") != "finalize-session":
+            continue
+        job_id = str(status.get("job_id") or "")
+        if not JOB_ID_PATTERN.fullmatch(job_id):
+            continue
+        refreshed = _refresh_finalize_job_status(root, job_id)
+        if refreshed.get("status") in FINALIZE_ACTIVE_STATUSES:
+            return refreshed
+    return None
+
+
+def _find_active_organize_sessions_job(root: Path) -> dict[str, Any] | None:
+    job_dir = _job_dir(root)
+    if not job_dir.exists():
+        return None
+
+    active: list[dict[str, Any]] = []
+    for path in job_dir.glob("*.json"):
+        try:
+            status = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(status, dict) or status.get("name") != ORGANIZE_SESSIONS_JOB_NAME:
+            continue
+        job_id = str(status.get("job_id") or "")
+        if not JOB_ID_PATTERN.fullmatch(job_id):
+            continue
+        refreshed = _refresh_organize_sessions_job_status(root, job_id)
+        if refreshed.get("status") in FINALIZE_ACTIVE_STATUSES:
+            active.append(refreshed)
+
+    if not active:
+        return None
+    return min(active, key=lambda item: str(item.get("created_at") or ""))
+
+
+def _organize_session_targets(root: Path, retention_days: int) -> list[Path]:
+    sessions = list_resumable_sessions(root=root, retention_days=retention_days)
+    targets = [
+        session
+        for session in sessions
+        if get_session_organization(root=root, session_file=session.jsonl_file).get("can_organize")
+    ]
+    targets.sort(key=lambda session: session.last_user_at)
+    return [session.jsonl_file for session in targets]
+
+
 def _job_matches_session(root: Path, status: dict[str, Any], session_file: Path) -> bool:
     value = status.get("session_file")
     if not value:
@@ -782,6 +991,53 @@ def _refresh_finalize_job_status(root: Path, job_id: str) -> dict[str, Any]:
     return status
 
 
+def _refresh_organize_sessions_job_status(root: Path, job_id: str) -> dict[str, Any]:
+    status = _read_job_status(root, job_id)
+    if status.get("name") != ORGANIZE_SESSIONS_JOB_NAME:
+        raise ValueError(f"データ整理ジョブではありません: {job_id}")
+    if status.get("status") not in FINALIZE_ACTIVE_STATUSES:
+        return status
+
+    worker_pid = status.get("worker_pid")
+    try:
+        pid = int(worker_pid) if worker_pid is not None else None
+    except (TypeError, ValueError):
+        pid = None
+
+    launcher_pid_value = status.get("launcher_pid")
+    try:
+        launcher_pid = int(launcher_pid_value) if launcher_pid_value is not None else None
+    except (TypeError, ValueError):
+        launcher_pid = None
+
+    worker_missing = pid is not None and not _process_exists(pid)
+    launcher_alive = launcher_pid is not None and _process_exists(launcher_pid)
+    worker_never_started = (
+        pid is None
+        and not launcher_alive
+        and _seconds_since(status.get("created_at")) >= FINALIZE_WORKER_START_GRACE_SECONDS
+    )
+    if not worker_missing and not worker_never_started:
+        return status
+
+    status = _write_job_status(
+        root,
+        job_id,
+        {
+            "status": "failed",
+            "stage": "failed",
+            "message": "データ整理ワーカーが終了したため、ジョブを失敗状態へ回収しました。再実行できます。",
+            "error": "Organize sessions worker exited before recording a terminal result.",
+            "finished_at": _now_iso(),
+            "current_session": None,
+        },
+    )
+    _job_event_log(root, job_id, f"worker.missing worker_pid={pid or '-'} status=failed")
+    _release_organize_sessions_lock(root=root, job_id=job_id)
+    _gui_log(root, f"organize_sessions.orphan_recovered job_id={job_id} worker_pid={pid or '-'}")
+    return status
+
+
 def _seconds_since(value: Any) -> float:
     try:
         then = datetime.fromisoformat(str(value))
@@ -843,11 +1099,24 @@ def _write_job_status(root: Path, job_id: str, update: dict[str, Any]) -> dict[s
 
 
 def _spawn_finalize_worker(root: Path, payload: dict[str, Any], log_path: Path) -> subprocess.Popen[str]:
+    return _spawn_background_worker(root=root, payload=payload, log_path=log_path, worker_command="run-finalize-job")
+
+
+def _spawn_organize_sessions_worker(root: Path, payload: dict[str, Any], log_path: Path) -> subprocess.Popen[str]:
+    return _spawn_background_worker(root=root, payload=payload, log_path=log_path, worker_command="run-organize-sessions-job")
+
+
+def _spawn_background_worker(
+    root: Path,
+    payload: dict[str, Any],
+    log_path: Path,
+    worker_command: str,
+) -> subprocess.Popen[str]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("a", encoding="utf-8")
     creationflags = _finalize_worker_creationflags()
     try:
-        command = [sys.executable, str(Path(__file__).resolve()), "run-finalize-job"]
+        command = [sys.executable, str(Path(__file__).resolve()), worker_command]
         popen_kwargs = {
             "cwd": root,
             "env": {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
@@ -994,6 +1263,210 @@ def _run_finalize_job(root: Path, payload: dict[str, Any], job_id: str) -> None:
         raise
     finally:
         _release_finalize_lock(root=root, session_file=session_file, job_id=job_id)
+
+
+def _run_organize_sessions_job(root: Path, payload: dict[str, Any], job_id: str) -> None:
+    raw_targets = payload.get("session_files")
+    if not isinstance(raw_targets, list):
+        raise ValueError("データ整理対象が不正です。")
+    session_values = [str(value) for value in raw_targets if str(value).strip()]
+    if not session_values:
+        raise ValueError("データ整理対象がありません。")
+
+    cancel_file = _job_cancel_file(root, job_id)
+    total = len(session_values)
+    completed: list[str] = []
+    skipped: list[str] = []
+    failed: list[dict[str, str]] = []
+    _write_job_status(
+        root,
+        job_id,
+        {
+            "status": "running",
+            "stage": "starting",
+            "message": f"データ整理を開始しました（{total}件）。",
+            "percent": 1,
+            "started_at": _now_iso(),
+            "worker_pid": os.getpid(),
+        },
+    )
+    _job_worker_event(job_id, f"worker.start targets={total}")
+
+    def update_progress(index: int, session_id: str, percent: int, message: str) -> None:
+        if cancel_file.exists():
+            raise AssistantGenerationCancelled("データ整理をキャンセルしました。")
+        overall_percent = min(99, max(1, int((((index - 1) + (percent / 100)) / total) * 100)))
+        _write_job_status(
+            root,
+            job_id,
+            {
+                "status": "running",
+                "stage": _stage_from_progress_message(message),
+                "message": f"{index}/{total}: {session_id} — {message}",
+                "percent": overall_percent,
+                "current_session": session_id,
+                "completed_count": len(completed),
+                "failed_count": len(failed),
+                "skipped_count": len(skipped),
+                "failed_sessions": failed,
+            },
+        )
+        _job_worker_event(
+            job_id,
+            f"worker.progress index={index}/{total} session={session_id} percent={overall_percent} "
+            f"stage={_stage_from_progress_message(message)} message={_safe_log_text(message)}",
+        )
+
+    try:
+        run_command = _cancelable_run_command(root=root, cancel_file=cancel_file)
+        for index, session_value in enumerate(session_values, start=1):
+            if cancel_file.exists():
+                raise AssistantGenerationCancelled("データ整理をキャンセルしました。")
+
+            try:
+                session_file = _resolve_existing_session(root=root, value=session_value)
+            except FileNotFoundError:
+                skipped.append(Path(session_value).stem)
+                continue
+
+            organization = get_session_organization(root=root, session_file=session_file)
+            if not organization.get("can_organize"):
+                skipped.append(session_file.stem)
+                update_progress(index, session_file.stem, 100, "既に整理済みのためスキップしました。")
+                continue
+
+            update_progress(index, session_file.stem, 1, "整理を開始しています。")
+            try:
+                finalize_live_chat(
+                    root=root,
+                    session_file=session_file,
+                    run_codex=bool(payload.get("run_codex", True)),
+                    commit=False,
+                    force=True,
+                    codex_command=str(payload.get("codex_command") or "codex.cmd"),
+                    codex_sandbox="workspace-write",
+                    codex_approval=str(payload.get("codex_approval") or "never"),
+                    progress=lambda percent, message, current_index=index, current_session=session_file.stem: update_progress(
+                        current_index,
+                        current_session,
+                        percent,
+                        message,
+                    ),
+                    run_command=run_command,
+                )
+            except AssistantGenerationCancelled:
+                raise
+            except Exception as exc:
+                failed.append({"session_id": session_file.stem, "error": f"{type(exc).__name__}: {exc}"})
+                _job_worker_event(job_id, f"worker.session_failed session={session_file.stem} {_format_exception(exc)}")
+            else:
+                completed.append(session_file.stem)
+
+            _write_job_status(
+                root,
+                job_id,
+                {
+                    "status": "running",
+                    "stage": "running",
+                    "message": f"{index}/{total}件を処理しました。",
+                    "percent": min(99, int((index / total) * 100)),
+                    "current_session": None,
+                    "completed_count": len(completed),
+                    "failed_count": len(failed),
+                    "skipped_count": len(skipped),
+                    "failed_sessions": failed,
+                },
+            )
+
+        result = {
+            "total_sessions": total,
+            "completed_sessions": completed,
+            "failed_sessions": failed,
+            "skipped_sessions": skipped,
+        }
+        if failed:
+            _write_job_status(
+                root,
+                job_id,
+                {
+                    "status": "failed",
+                    "stage": "done",
+                    "message": f"データ整理を完了しましたが、{len(failed)}件で失敗しました。",
+                    "error": "一部のセッションを整理できませんでした。詳細はジョブログを確認してください。",
+                    "percent": 100,
+                    "current_session": None,
+                    "completed_count": len(completed),
+                    "failed_count": len(failed),
+                    "skipped_count": len(skipped),
+                    "failed_sessions": failed,
+                    "finished_at": _now_iso(),
+                    "result": result,
+                },
+            )
+            _job_worker_event(job_id, f"worker.completed_with_failures completed={len(completed)} failed={len(failed)}")
+        else:
+            _write_job_status(
+                root,
+                job_id,
+                {
+                    "status": "succeeded",
+                    "stage": "done",
+                    "message": f"データ整理が完了しました（{len(completed)}件、スキップ{len(skipped)}件）。",
+                    "percent": 100,
+                    "current_session": None,
+                    "completed_count": len(completed),
+                    "failed_count": 0,
+                    "skipped_count": len(skipped),
+                    "failed_sessions": [],
+                    "finished_at": _now_iso(),
+                    "result": result,
+                },
+            )
+            _job_worker_event(job_id, f"worker.succeeded completed={len(completed)} skipped={len(skipped)}")
+    except AssistantGenerationCancelled as exc:
+        _write_job_status(
+            root,
+            job_id,
+            {
+                "status": "cancelled",
+                "stage": "cancelled",
+                "message": str(exc),
+                "current_session": None,
+                "completed_count": len(completed),
+                "failed_count": len(failed),
+                "skipped_count": len(skipped),
+                "failed_sessions": failed,
+                "finished_at": _now_iso(),
+                "result": {
+                    "total_sessions": total,
+                    "completed_sessions": completed,
+                    "failed_sessions": failed,
+                    "skipped_sessions": skipped,
+                },
+            },
+        )
+        _job_worker_event(job_id, f"worker.cancelled completed={len(completed)} failed={len(failed)}")
+    except Exception as exc:
+        _write_job_status(
+            root,
+            job_id,
+            {
+                "status": "failed",
+                "stage": "failed",
+                "message": "データ整理に失敗しました。",
+                "error": f"{type(exc).__name__}: {exc}",
+                "current_session": None,
+                "completed_count": len(completed),
+                "failed_count": len(failed),
+                "skipped_count": len(skipped),
+                "failed_sessions": failed,
+                "finished_at": _now_iso(),
+            },
+        )
+        _job_worker_event(job_id, f"worker.failed {_format_exception(exc)}")
+        raise
+    finally:
+        _release_organize_sessions_lock(root=root, job_id=job_id)
 
 
 def _stage_from_progress_message(message: str) -> str:

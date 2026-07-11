@@ -29,6 +29,7 @@ MEMORY_NEED_SIGNALS = (
     MemoryNeedSignal("決めた", 3, "past-decision"),
     MemoryNeedSignal("ログ", 3, "past-conversation"),
     MemoryNeedSignal("履歴", 3, "past-conversation"),
+    MemoryNeedSignal("なんだっけ", 3, "past-conversation"),
     MemoryNeedSignal("俺", 2, "self-reference"),
     MemoryNeedSignal("私", 2, "self-reference"),
     MemoryNeedSignal("僕", 2, "self-reference"),
@@ -37,6 +38,7 @@ MEMORY_NEED_SIGNALS = (
     MemoryNeedSignal("好み", 3, "preference"),
     MemoryNeedSignal("好き", 2, "preference"),
     MemoryNeedSignal("嫌い", 2, "preference"),
+    MemoryNeedSignal("感想", 2, "personal-topic"),
     MemoryNeedSignal("生活", 2, "personal-topic"),
     MemoryNeedSignal("学習", 2, "personal-topic"),
     MemoryNeedSignal("やりたいこと", 4, "structured-memory"),
@@ -67,6 +69,7 @@ PERSONAL_TOPIC_SIGNALS = (
     "好み",
     "好き",
     "嫌い",
+    "感想",
     "生活",
     "学習",
     "進捗",
@@ -77,7 +80,7 @@ PERSONAL_TOPIC_SIGNALS = (
     "店",
     "おすすめ",
 )
-PAST_SIGNALS = ("前回", "前に", "以前", "過去", "昔", "話した", "決めた", "ログ", "履歴")
+PAST_SIGNALS = ("前回", "前に", "以前", "過去", "昔", "話した", "決めた", "ログ", "履歴", "なんだっけ")
 PROJECT_SIGNALS = ("AI-LifeOS", "プロジェクト", "Phase", "フェーズ", "方針", "journal", "memory")
 
 CATEGORY_QUERY_ALIASES = {
@@ -204,6 +207,14 @@ def build_answer_context(
         document_types=("summary", "raw"),
         use_index=use_index,
     )
+    raw_chunk_candidates = search_memory(
+        root=root,
+        query=question,
+        limit=max(max_results * 4, 8),
+        document_types=("raw_chunk",),
+        use_index=use_index,
+    )
+    raw_chunk_results = _prioritize_raw_user_evidence(raw_chunk_candidates, limit=min(max(max_results, 1), 2))
 
     lines = [
         "AI-LifeOS memory context (read-only).",
@@ -237,12 +248,20 @@ def build_answer_context(
             lines.extend(_format_result(result, root))
         lines.append("")
 
+    if raw_chunk_results:
+        lines.append("## Raw Conversation Evidence")
+        lines.append("Use these message-level excerpts as the primary evidence for past conversations.")
+        for result in raw_chunk_results:
+            lines.extend(_format_result(result, root))
+        lines.append("")
+
     references = _dedupe_references(
         [
             *priority_references,
             *(_reference_from_result(result, root) for result in structured_results),
             *(_reference_from_result(result, root) for result in journal_results),
             *(_reference_from_result(result, root) for result in conversation_results),
+            *(_reference_from_result(result, root) for result in raw_chunk_results),
         ]
     )
     context_text = "\n".join(lines).rstrip() if references else ""
@@ -250,7 +269,7 @@ def build_answer_context(
     return AnswerContext(
         should_use_memory=True,
         text=context_text,
-        results=tuple([*structured_results, *journal_results, *conversation_results]),
+        results=tuple([*structured_results, *journal_results, *conversation_results, *raw_chunk_results]),
         references=tuple(references),
         score=assessment.score,
         threshold=assessment.threshold,
@@ -363,6 +382,13 @@ def _search_structured_memory(
         seen.add(key)
         deduped.append(result)
     return deduped[: max(max_results, 1)]
+
+
+def _prioritize_raw_user_evidence(
+    candidates: list[MemorySearchResult], limit: int
+) -> list[MemorySearchResult]:
+    user_messages = [result for result in candidates if " / user message " in result.title.lower()]
+    return (user_messages or candidates)[: max(limit, 1)]
 
 
 def _reference_from_result(result: MemorySearchResult, root: Path) -> MemoryContextReference:

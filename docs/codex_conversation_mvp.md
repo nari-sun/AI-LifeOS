@@ -83,7 +83,7 @@ For this project, direct app-server integration is deferred because it would req
 Phase2.6 currently uses:
 
 ```powershell
-codex.cmd --ask-for-approval never exec --model gpt-5.4-mini -c 'model_reasoning_effort="medium"' -c 'service_tier="fast"' -c features.fast_mode=true -C <repo> --sandbox read-only --output-last-message <tempfile> -
+codex.cmd --ask-for-approval never exec --model gpt-5.6-luna -c 'model_reasoning_effort="medium"' -c features.fast_mode=false -C <repo> --sandbox read-only --output-last-message <tempfile> -
 ```
 
 Reasoning:
@@ -92,11 +92,11 @@ Reasoning:
 - Does not require OpenAI API keys.
 - Does not add new dependencies.
 - Keeps chat turns read-only.
-- Uses `gpt-5.4-mini` with medium reasoning and requests Fast mode for chat replies.
+- Uses `gpt-5.6-luna` with medium reasoning, without a service-tier override or Fast mode, for chat replies.
 - Lets the application save the user message before Codex runs.
 - Writes the assistant reply only after Codex returns.
 
-Exit-time summary / journal / memory processing uses `gpt-5.5` with `model_reasoning_effort="xhigh"` through the existing Phase2.5 task path.
+Exit-time summary / journal / memory processing uses `gpt-5.6-terra` with `model_reasoning_effort="medium"` through the existing Phase2.5 task path.
 
 Limitation:
 

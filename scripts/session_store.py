@@ -8,6 +8,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 VALID_ROLES = {"user", "assistant"}
 VALID_STATUSES = {"saved", "raw_created", "raw_failed", "memory_failed", "index_failed", "finalized"}
+DEFAULT_RESUME_LIST_LIMIT = 50
 ORGANIZE_STAGE_LABELS = {
     "raw": "raw.md作成",
     "memory": "記憶整理",
@@ -41,11 +42,15 @@ class ResumeSession:
 
 @dataclass(frozen=True)
 class ExpiredSessionCleanupResult:
+    """Compatibility result for callers that previously requested cleanup.
+
+    Expired sessions are now retained permanently; ``deleted_paths`` is always
+    empty and the status is always ``保持``.
+    """
+
     session_id: str
     status: str
     deleted_paths: tuple[Path, ...]
-    raw_file: Path | None = None
-    error: str | None = None
 
 
 def save_session(
@@ -130,6 +135,7 @@ def list_resumable_sessions(
     root: Path | str = ROOT,
     retention_days: int = 10,
     now: datetime | None = None,
+    limit: int = DEFAULT_RESUME_LIST_LIMIT,
 ) -> list[ResumeSession]:
     root = Path(root)
     cutoff = _retention_cutoff(retention_days=retention_days, now=now)
@@ -140,7 +146,7 @@ def list_resumable_sessions(
         if summary and _is_at_or_after(summary.last_user_at, cutoff):
             sessions.append(summary)
 
-    return sorted(sessions, key=lambda session: session.last_user_at, reverse=True)
+    return sorted(sessions, key=lambda session: session.last_user_at, reverse=True)[: max(limit, 1)]
 
 
 def load_resume_session(
@@ -191,115 +197,32 @@ def prune_expired_sessions(
     root: Path | str = ROOT,
     retention_days: int = 10,
     now: datetime | None = None,
-    delete: bool = False,
-    auto_finalize: bool = True,
 ) -> list[Path]:
-    targets: list[Path] = []
-    for session in list_expired_sessions(root=root, retention_days=retention_days, now=now):
-        if delete:
-            cleanup = cleanup_expired_session(
-                root=root,
-                session_file=session.jsonl_file,
-                auto_finalize=auto_finalize,
-                delete=True,
-            )
-            targets.extend(cleanup.deleted_paths)
-            continue
-
-        targets.extend(_session_deletion_targets(root=Path(root), session_file=session.jsonl_file, include_unorganized=True))
-
-    return targets
+    """List sessions that are no longer eligible for resume without deleting them."""
+    return [session.jsonl_file for session in list_expired_sessions(root=root, retention_days=retention_days, now=now)]
 
 
 def cleanup_expired_sessions(
     root: Path | str = ROOT,
     retention_days: int = 10,
     now: datetime | None = None,
-    delete: bool = True,
-    auto_finalize: bool = True,
+    delete: bool = False,
+    auto_finalize: bool = False,
 ) -> list[ExpiredSessionCleanupResult]:
+    """Retain expired sessions for backward-compatible callers.
+
+    The parameters are accepted only so older local callers fail safely after
+    the retention-policy change.  No file is finalized, moved, or deleted.
+    """
+    del delete, auto_finalize
     return [
-        cleanup_expired_session(
-            root=root,
-            session_file=session.jsonl_file,
-            auto_finalize=auto_finalize,
-            delete=delete,
+        ExpiredSessionCleanupResult(
+            session_id=session.session_id,
+            status="保持",
+            deleted_paths=(),
         )
         for session in list_expired_sessions(root=root, retention_days=retention_days, now=now)
     ]
-
-
-def cleanup_expired_session(
-    root: Path | str,
-    session_file: Path | str,
-    auto_finalize: bool = True,
-    delete: bool = True,
-) -> ExpiredSessionCleanupResult:
-    root = Path(root)
-    jsonl_file = _resolve_session_file(root=root, session_file=session_file)
-    organization = get_session_organization(root=root, session_file=jsonl_file)
-
-    if not organization["is_organized"]:
-        if organization["failed_stage"]:
-            return ExpiredSessionCleanupResult(
-                session_id=jsonl_file.stem,
-                status="整理失敗",
-                deleted_paths=(),
-                raw_file=_optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, jsonl_file),
-                error=organization.get("last_error"),
-            )
-        if not auto_finalize:
-            return ExpiredSessionCleanupResult(
-                session_id=jsonl_file.stem,
-                status="整理未完了",
-                deleted_paths=(),
-                raw_file=_optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, jsonl_file),
-            )
-
-        try:
-            from finalize_live_chat import finalize_live_chat
-
-            finalize_live_chat(
-                root=root,
-                session_file=jsonl_file,
-                run_codex=True,
-                commit=False,
-                force=True,
-            )
-        except Exception as exc:
-            return ExpiredSessionCleanupResult(
-                session_id=jsonl_file.stem,
-                status="整理失敗",
-                deleted_paths=(),
-                raw_file=_optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, jsonl_file),
-                error=f"{type(exc).__name__}: {exc}",
-            )
-        organization = get_session_organization(root=root, session_file=jsonl_file)
-
-    if not organization["is_organized"]:
-        return ExpiredSessionCleanupResult(
-            session_id=jsonl_file.stem,
-            status="整理未完了",
-            deleted_paths=(),
-            raw_file=_optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, jsonl_file),
-        )
-
-    targets = _session_deletion_targets(root=root, session_file=jsonl_file, include_unorganized=False)
-    deleted: list[Path] = []
-    if delete:
-        for target in targets:
-            if target.exists():
-                target.unlink()
-                deleted.append(target)
-    else:
-        deleted = targets
-
-    return ExpiredSessionCleanupResult(
-        session_id=jsonl_file.stem,
-        status="削除済み" if delete else "削除対象",
-        deleted_paths=tuple(deleted),
-        raw_file=_optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, jsonl_file),
-    )
 
 
 def get_session_organization(root: Path | str = ROOT, session_file: Path | str | None = None) -> dict[str, Any]:
@@ -509,51 +432,6 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
-def _optional_path(root: Path, value: Any) -> Path | None:
-    text = _optional_string(value)
-    if not text:
-        return None
-    path = Path(text)
-    return path if path.is_absolute() else root / path
-
-
-def _session_deletion_targets(root: Path, session_file: Path, include_unorganized: bool) -> list[Path]:
-    targets = [session_file]
-    metadata_file = session_file.with_suffix(".session.json")
-    if metadata_file.exists():
-        targets.append(metadata_file)
-
-    organization = get_session_organization(root=root, session_file=session_file)
-    raw_file = _optional_path(root, organization.get("raw_file")) or _raw_file_for_session(root, session_file)
-    if raw_file and raw_file.exists() and (include_unorganized or organization["is_organized"]):
-        targets.append(raw_file)
-
-    return targets
-
-
-def _raw_file_for_session(root: Path, session_file: Path) -> Path | None:
-    try:
-        imported_at = datetime.strptime(session_file.stem[:17], "%Y-%m-%d_%H%M%S")
-    except ValueError:
-        try:
-            records = _read_jsonl_messages(session_file)
-        except (FileNotFoundError, ValueError):
-            return None
-        if not records:
-            return None
-        imported_at = records[0]["timestamp"]
-
-    date = imported_at.strftime("%Y-%m-%d")
-    return (
-        root
-        / "conversations"
-        / imported_at.strftime("%Y")
-        / imported_at.strftime("%m")
-        / f"{date}_{imported_at.strftime('%H%M%S')}"
-        / "raw.md"
-    )
-
-
 def _resolve_session_file(root: Path, session_file: Path | str | None) -> Path:
     if session_file is None:
         return _latest_live_session_file(root)
@@ -759,15 +637,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume_parser = subparsers.add_parser("resume-list", help="再開できるliveセッションを一覧表示する")
     resume_parser.add_argument("--days", type=int, default=10, help="最後のuser入力から何日以内を残すか")
+    resume_parser.add_argument("--limit", type=int, default=DEFAULT_RESUME_LIST_LIMIT, help="表示する最新セッション数")
 
-    prune_parser = subparsers.add_parser("prune", help="再開期限を過ぎたliveセッションを確認または削除する")
+    prune_parser = subparsers.add_parser("prune", help="再開期限を過ぎたliveセッションを一覧する")
     prune_parser.add_argument("--days", type=int, default=10, help="最後のuser入力から何日以内を残すか")
-    prune_parser.add_argument("--delete", action="store_true", help="期限切れセッションを実際に削除する")
-    prune_parser.add_argument(
-        "--no-auto-finalize",
-        action="store_true",
-        help="--delete 時に未整理セッションの自動整理を行わない",
-    )
 
     return parser
 
@@ -797,7 +670,7 @@ def main() -> int:
             return 0
 
         if args.command == "resume-list":
-            sessions = list_resumable_sessions(root=root, retention_days=args.days)
+            sessions = list_resumable_sessions(root=root, retention_days=args.days, limit=args.limit)
             if not sessions:
                 print("再開できるセッションはありません。")
                 return 0
@@ -813,18 +686,13 @@ def main() -> int:
             targets = prune_expired_sessions(
                 root=root,
                 retention_days=args.days,
-                delete=args.delete,
-                auto_finalize=not args.no_auto_finalize,
             )
             if not targets:
-                print("削除対象の期限切れセッションはありません。")
+                print("resume対象外の期限切れセッションはありません。")
                 return 0
 
-            action = "削除しました" if args.delete else "削除対象です"
             for target in targets:
-                print(f"{action}: {_relative_path(target, root)}")
-            if not args.delete:
-                print("実際に削除するには --delete を付けてください。")
+                print(f"resume対象外: {_relative_path(target, root)}")
             return 0
     except (FileNotFoundError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}")

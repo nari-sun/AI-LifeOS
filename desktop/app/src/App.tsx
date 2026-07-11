@@ -5,6 +5,7 @@ import {
   Archive,
   Bot,
   Brain,
+  ChevronDown,
   CheckCircle2,
   Clipboard,
   ClipboardCheck,
@@ -18,6 +19,7 @@ import {
   RefreshCw,
   RotateCcw,
   Send,
+  Settings,
   Square,
   User,
   X,
@@ -30,14 +32,17 @@ import { cn } from "@/lib/utils"
 import {
   cancelMessage,
   cancelFinalizeJob,
+  cancelOrganizeSessionsJob,
   getFinalizeJob,
   getLocalDataReport,
+  getOrganizeSessionsJob,
   isTauriRuntime,
   listResumableSessions,
   openLocalDataFolder,
   resumeSession,
   sendMessageStream,
   startFinalizeJob,
+  startOrganizeSessionsJob,
   startSession,
 } from "@/tauri"
 import type {
@@ -47,13 +52,14 @@ import type {
   LocalDataReport,
   MemoryContextSummary,
   ResumeSession,
+  OrganizeSessionsJob,
   SessionFile,
   SessionOrganization,
 } from "@/types"
 
 type BusyState = "idle" | "starting" | "generating" | "stopping" | "resuming" | "finalizing" | "refreshing"
 type ReplyState = "idle" | "generating" | "stopping" | "stopped" | "failed" | "completed"
-type ViewMode = "chat" | "data"
+type ViewMode = "chat" | "data" | "organize"
 type PendingMessageStatus = "sending" | "failed"
 
 interface PendingUserMessage extends ChatMessage {
@@ -97,12 +103,14 @@ const MAX_ATTACHMENT_BYTES = 1024 * 1024
 const MAX_ATTACHMENT_TEXT_CHARS = 12_000
 const SUPPORTED_ATTACHMENT_EXTENSIONS = new Set(["txt", "md", "pdf", "xlsx"])
 const FINALIZE_JOB_STORAGE_KEY = "ai-lifeos.active-finalize-job"
+const ORGANIZE_SESSIONS_JOB_STORAGE_KEY = "ai-lifeos.organize-sessions-job"
 
 function App() {
   const [session, setSession] = useState<SessionFile | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [sessions, setSessions] = useState<ResumeSession[]>([])
   const [viewMode, setViewMode] = useState<ViewMode>("chat")
+  const [managementExpanded, setManagementExpanded] = useState(false)
   const [input, setInput] = useState("")
   const [busy, setBusy] = useState<BusyState>("idle")
   const [replyState, setReplyState] = useState<ReplyState>("idle")
@@ -115,6 +123,7 @@ function App() {
   const [attachments, setAttachments] = useState<AttachmentDraft[]>([])
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null)
   const [finalizeJob, setFinalizeJob] = useState<FinalizeJob | null>(null)
+  const [organizeSessionsJob, setOrganizeSessionsJob] = useState<OrganizeSessionsJob | null>(null)
   const [localDataReport, setLocalDataReport] = useState<LocalDataReport | null>(null)
   const [localDataLoading, setLocalDataLoading] = useState(false)
   const viewportRef = useRef<HTMLDivElement | null>(null)
@@ -124,15 +133,18 @@ function App() {
 
   const isBusy = busy !== "idle"
   const isFinalizeActive = finalizeJob?.status === "queued" || finalizeJob?.status === "running"
+  const isOrganizeSessionsActive = organizeSessionsJob?.status === "queued" || organizeSessionsJob?.status === "running"
+  const isOrganizationActive = isFinalizeActive || isOrganizeSessionsActive
   const isGenerating = busy === "generating" || busy === "stopping"
   const hasAttachmentError = attachments.some((attachment) => attachment.status === "error")
-  const canSend = input.trim().length > 0 && !isBusy && !isFinalizeActive && !hasAttachmentError
+  const canSend = input.trim().length > 0 && !isBusy && !isOrganizationActive && !hasAttachmentError
   const canStop = busy === "generating" && activeRequestId !== null
   const canRestoreInput = lastSubmittedText.trim().length > 0 && !isBusy
   const organization = session?.organization ?? null
-  const canFinalize = Boolean(session && organization?.can_organize && !isBusy && !isFinalizeActive)
+  const canFinalize = Boolean(session && organization?.can_organize && !isBusy && !isOrganizationActive)
   const finalizeButtonLabel = getFinalizeButtonLabel(organization)
   const statusLabel = organization?.label ?? "未開始"
+  const eligibleSessionCount = sessions.filter((item) => item.organization.can_organize).length
   const displayMessages = [
     ...messages,
     ...(pendingUserMessage ? [pendingUserMessage] : []),
@@ -183,6 +195,17 @@ function App() {
     }, 1200)
     return () => window.clearInterval(timer)
   }, [finalizeJob?.job_id, finalizeJob?.status])
+
+  useEffect(() => {
+    if (!organizeSessionsJob || (organizeSessionsJob.status !== "queued" && organizeSessionsJob.status !== "running")) {
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      void pollOrganizeSessionsJob(organizeSessionsJob.job_id)
+    }, 1200)
+    return () => window.clearInterval(timer)
+  }, [organizeSessionsJob?.job_id, organizeSessionsJob?.status])
 
   async function initialize() {
     setBusy("starting")
@@ -238,6 +261,32 @@ function App() {
 
       const listResult = await listPromise
       setSessions(listResult.sessions)
+
+      if (!trackedJobId) {
+        const trackedOrganizeJobId = readTrackedOrganizeSessionsJobId()
+        if (trackedOrganizeJobId) {
+          try {
+            const result = await getOrganizeSessionsJob(trackedOrganizeJobId)
+            setOrganizeSessionsJob(result.job)
+            setManagementExpanded(true)
+            setViewMode("organize")
+            if (result.job.status === "failed") {
+              clearTrackedOrganizeSessionsJob(trackedOrganizeJobId)
+              setError(`データ整理に失敗しました: ${result.job.error ?? result.job.message ?? "不明なエラー"}`)
+            } else if (result.job.status === "cancelled") {
+              clearTrackedOrganizeSessionsJob(trackedOrganizeJobId)
+              setNotice("再起動前のデータ整理はキャンセル済みです。")
+            } else if (result.job.status === "succeeded") {
+              clearTrackedOrganizeSessionsJob(trackedOrganizeJobId)
+              setNotice("再起動前のデータ整理は完了しています。")
+            } else {
+              setNotice("再起動前のデータ整理へ再接続しました。")
+            }
+          } catch {
+            clearTrackedOrganizeSessionsJob(trackedOrganizeJobId)
+          }
+        }
+      }
     } catch (err) {
       setReplyState("failed")
       setError(withNextAction(formatError(err)))
@@ -266,7 +315,7 @@ function App() {
   }
 
   async function createSession() {
-    if (isBusy || isFinalizeActive) {
+    if (isBusy || isOrganizationActive) {
       return
     }
 
@@ -296,7 +345,7 @@ function App() {
 
   async function submitMessage(overrideContent?: string) {
     const content = (overrideContent ?? input).trim()
-    if (!content || isBusy || isFinalizeActive || hasAttachmentError) {
+    if (!content || isBusy || isOrganizationActive || hasAttachmentError) {
       return
     }
 
@@ -407,7 +456,7 @@ function App() {
   }
 
   async function loadSession(sessionId: string) {
-    if (isBusy || isFinalizeActive) {
+    if (isBusy || isOrganizationActive) {
       return
     }
 
@@ -434,7 +483,7 @@ function App() {
   }
 
   async function finalizeCurrentSession() {
-    if (!session || !organization?.can_organize || isBusy || isFinalizeActive) {
+    if (!session || !organization?.can_organize || isBusy || isOrganizationActive) {
       return
     }
     const confirmed = window.confirm("raw.md 作成、記憶整理、検索 index 更新を実行します。時間がかかる場合があります。")
@@ -490,6 +539,77 @@ function App() {
       setNotice("整理ジョブへキャンセル要求を送信しました。")
     } catch (err) {
       setError(`整理ジョブのキャンセル要求に失敗しました: ${formatError(err)}`)
+    }
+  }
+
+  async function organizeUnorganizedSessions() {
+    if (isBusy || isOrganizationActive) {
+      return
+    }
+    if (eligibleSessionCount === 0) {
+      setNotice("整理対象のセッションはありません。")
+      return
+    }
+    const confirmed = window.confirm(
+      `未整理または整理失敗の ${eligibleSessionCount} 件を古い順に整理します。途中の失敗は記録して次のセッションへ進みます。`,
+    )
+    if (!confirmed) {
+      return
+    }
+
+    setBusy("finalizing")
+    setError(null)
+    try {
+      const result = await startOrganizeSessionsJob()
+      if (!result.job) {
+        setNotice("整理対象のセッションはありません。")
+        await refreshSessionsAfterAction()
+        return
+      }
+      trackOrganizeSessionsJob(result.job.job_id)
+      setOrganizeSessionsJob(result.job)
+      setManagementExpanded(true)
+      setViewMode("organize")
+      setNotice(`データ整理を開始しました（${result.eligible_count}件）。`)
+    } catch (err) {
+      setError(`データ整理の開始に失敗しました: ${formatError(err)}`)
+    } finally {
+      setBusy("idle")
+    }
+  }
+
+  async function pollOrganizeSessionsJob(jobId: string) {
+    try {
+      const result = await getOrganizeSessionsJob(jobId)
+      setOrganizeSessionsJob(result.job)
+      if (result.job.status === "succeeded") {
+        clearTrackedOrganizeSessionsJob(jobId)
+        setNotice(result.job.message ?? "データ整理が完了しました。")
+        await refreshSessionsAfterAction()
+      } else if (result.job.status === "failed") {
+        clearTrackedOrganizeSessionsJob(jobId)
+        setError(`データ整理に失敗しました: ${result.job.error ?? result.job.message ?? "不明なエラー"}`)
+        await refreshSessionsAfterAction()
+      } else if (result.job.status === "cancelled") {
+        clearTrackedOrganizeSessionsJob(jobId)
+        setNotice("データ整理を停止しました。未処理のセッションは後で再実行できます。")
+        await refreshSessionsAfterAction()
+      }
+    } catch (err) {
+      setError(withNextAction(formatError(err)))
+    }
+  }
+
+  async function cancelOrganizeSessions() {
+    if (!organizeSessionsJob || !isOrganizeSessionsActive) {
+      return
+    }
+    try {
+      const result = await cancelOrganizeSessionsJob(organizeSessionsJob.job_id)
+      setOrganizeSessionsJob(result.job)
+      setNotice("データ整理へ停止要求を送信しました。")
+    } catch (err) {
+      setError(`データ整理の停止要求に失敗しました: ${formatError(err)}`)
     }
   }
 
@@ -569,18 +689,46 @@ function App() {
         </div>
 
         <div className="space-y-2 border-b border-border p-3">
-          <Button className="w-full justify-start" variant="secondary" onClick={createSession} disabled={isBusy}>
+          <Button className="w-full justify-start" variant="secondary" onClick={createSession} disabled={isBusy || isOrganizationActive}>
             <MessageSquarePlus className="h-4 w-4" />
             新規チャット
           </Button>
           <Button
             className="w-full justify-start"
-            variant={viewMode === "data" ? "secondary" : "ghost"}
-            onClick={() => setViewMode((current) => (current === "data" ? "chat" : "data"))}
+            variant={viewMode === "data" || viewMode === "organize" ? "secondary" : "ghost"}
+            onClick={() => setManagementExpanded((current) => !current)}
           >
-            <Database className="h-4 w-4" />
-            ローカルデータ
+            <Settings className="h-4 w-4" />
+            管理
+            <ChevronDown className={cn("ml-auto h-4 w-4 transition-transform", managementExpanded && "rotate-180")} />
           </Button>
+          {managementExpanded && (
+            <div className="space-y-1 border-l border-border pl-3">
+              <Button
+                className="w-full justify-start"
+                variant={viewMode === "data" ? "secondary" : "ghost"}
+                onClick={() => {
+                  setManagementExpanded(true)
+                  setViewMode("data")
+                }}
+              >
+                <Database className="h-4 w-4" />
+                ローカルデータ
+              </Button>
+              <Button
+                className="w-full justify-start"
+                variant={viewMode === "organize" ? "secondary" : "ghost"}
+                onClick={() => {
+                  setManagementExpanded(true)
+                  setViewMode("organize")
+                }}
+              >
+                <Archive className="h-4 w-4" />
+                データ整理
+                {eligibleSessionCount > 0 && <Badge variant="outline" className="ml-auto">{eligibleSessionCount}</Badge>}
+              </Button>
+            </div>
+          )}
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
@@ -603,7 +751,7 @@ function App() {
                     session?.session_id === item.session_id && "border-primary bg-primary/10",
                   )}
                   onClick={() => void loadSession(item.session_id)}
-                  disabled={isBusy}
+                  disabled={isBusy || isOrganizationActive}
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0 flex-1">
@@ -626,9 +774,11 @@ function App() {
       <section className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold">{viewMode === "data" ? "ローカルデータ管理" : sessionTitle}</div>
+            <div className="truncate text-sm font-semibold">
+              {viewMode === "data" ? "ローカルデータ管理" : viewMode === "organize" ? "データ整理" : sessionTitle}
+            </div>
             <div className="truncate text-xs text-muted-foreground">
-              {viewMode === "data" ? (localDataReport?.root ?? "AI-LifeOS root") : (session?.jsonl_file ?? "inbox/live")}
+              {viewMode === "data" || viewMode === "organize" ? (localDataReport?.root ?? "AI-LifeOS root") : (session?.jsonl_file ?? "inbox/live")}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -639,6 +789,11 @@ function App() {
                   <RefreshCw className={cn("h-4 w-4", localDataLoading && "animate-spin")} />
                   更新
                 </Button>
+              </>
+            ) : viewMode === "organize" ? (
+              <>
+                <Badge variant="secondary">対象 {eligibleSessionCount}件</Badge>
+                {isOrganizeSessionsActive && <Badge>実行中</Badge>}
               </>
             ) : (
               <>
@@ -661,6 +816,14 @@ function App() {
 
         {viewMode === "data" ? (
           <DataManagementScreen report={localDataReport} loading={localDataLoading} onRefresh={refreshLocalDataReport} onOpenFolder={openDataFolder} />
+        ) : viewMode === "organize" ? (
+          <OrganizeSessionsScreen
+            eligibleSessionCount={eligibleSessionCount}
+            job={organizeSessionsJob}
+            disabled={isBusy || isOrganizationActive}
+            onStart={organizeUnorganizedSessions}
+            onCancel={cancelOrganizeSessions}
+          />
         ) : (
           <>
         <div className="border-b border-border bg-muted/40 px-4 py-2">
@@ -855,6 +1018,88 @@ function FinalizeJobPanel({ job, onCancel }: { job: FinalizeJob; onCancel: () =>
           停止
         </Button>
       )}
+    </div>
+  )
+}
+
+function OrganizeSessionsScreen({
+  eligibleSessionCount,
+  job,
+  disabled,
+  onStart,
+  onCancel,
+}: {
+  eligibleSessionCount: number
+  job: OrganizeSessionsJob | null
+  disabled: boolean
+  onStart: () => void
+  onCancel: () => void
+}) {
+  const active = job?.status === "queued" || job?.status === "running"
+  const failedSessions = job?.failed_sessions ?? []
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
+      <div className="mx-auto flex max-w-4xl flex-col gap-5">
+        <section className="rounded-md border border-border p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2 text-sm font-semibold">
+                <Archive className="h-4 w-4" />
+                未整理セッションを順に整理
+              </div>
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+                再開可能なセッションのうち、未整理・新規会話あり・整理失敗のものを古い順に1件ずつ処理します。失敗したセッションは記録し、残りの処理を続けます。
+              </p>
+            </div>
+            <Button onClick={onStart} disabled={disabled || eligibleSessionCount === 0}>
+              <Archive className="h-4 w-4" />
+              {eligibleSessionCount > 0 ? `${eligibleSessionCount}件を整理` : "整理対象なし"}
+            </Button>
+          </div>
+        </section>
+
+        <section className="grid gap-3 sm:grid-cols-4">
+          <DataMetric icon={<Archive className="h-4 w-4" />} label="整理対象" value={`${eligibleSessionCount}件`} />
+          <DataMetric icon={<CheckCircle2 className="h-4 w-4" />} label="完了" value={`${job?.completed_count ?? 0}件`} />
+          <DataMetric icon={<AlertTriangle className="h-4 w-4" />} label="失敗" value={`${job?.failed_count ?? 0}件`} />
+          <DataMetric icon={<RotateCcw className="h-4 w-4" />} label="スキップ" value={`${job?.skipped_count ?? 0}件`} />
+        </section>
+
+        {job && (
+          <section className="rounded-md border border-border p-4">
+            <div className="flex flex-wrap items-center gap-2">
+              {active ? <Loader2 className="h-4 w-4 animate-spin text-primary" /> : <Archive className="h-4 w-4" />}
+              <span className="font-medium">データ整理ジョブ</span>
+              <Badge variant={job.status === "failed" ? "outline" : "secondary"}>{job.status}</Badge>
+              <span className="text-sm text-muted-foreground">{job.percent}%</span>
+              {active && (
+                <Button type="button" size="sm" variant="outline" className="ml-auto" onClick={onCancel}>
+                  <Square className="h-3.5 w-3.5" />
+                  停止
+                </Button>
+              )}
+            </div>
+            <div className="mt-3 break-words text-sm text-muted-foreground">{job.error ?? job.message}</div>
+            {job.current_session && <div className="mt-2 text-xs text-muted-foreground">処理中: {job.current_session}</div>}
+            {failedSessions.length > 0 && (
+              <div className="mt-4 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">
+                <div className="mb-2 flex items-center gap-2 font-medium text-destructive">
+                  <AlertTriangle className="h-4 w-4" />
+                  失敗したセッション
+                </div>
+                <ul className="space-y-2 text-xs text-muted-foreground">
+                  {failedSessions.map((item) => (
+                    <li key={item.session_id} className="break-words">
+                      <span className="font-mono text-foreground">{item.session_id}</span>: {item.error}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </section>
+        )}
+      </div>
     </div>
   )
 }
@@ -1454,6 +1699,33 @@ function clearTrackedFinalizeJob(expectedJobId?: string) {
       return
     }
     window.localStorage.removeItem(FINALIZE_JOB_STORAGE_KEY)
+  } catch {
+    // Ignore storage cleanup failures; backend status recovery still applies.
+  }
+}
+
+function trackOrganizeSessionsJob(jobId: string) {
+  try {
+    window.localStorage.setItem(ORGANIZE_SESSIONS_JOB_STORAGE_KEY, jobId)
+  } catch {
+    // The status file remains authoritative when local storage is unavailable.
+  }
+}
+
+function readTrackedOrganizeSessionsJobId() {
+  try {
+    return window.localStorage.getItem(ORGANIZE_SESSIONS_JOB_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+function clearTrackedOrganizeSessionsJob(expectedJobId?: string) {
+  try {
+    if (expectedJobId && window.localStorage.getItem(ORGANIZE_SESSIONS_JOB_STORAGE_KEY) !== expectedJobId) {
+      return
+    }
+    window.localStorage.removeItem(ORGANIZE_SESSIONS_JOB_STORAGE_KEY)
   } catch {
     // Ignore storage cleanup failures; backend status recovery still applies.
   }

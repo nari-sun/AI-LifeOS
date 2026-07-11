@@ -29,10 +29,10 @@ ChatGPT 風の日常利用では、用途に応じて応答速度、品質、口
 
 ```text
 scripts/codex_conversation.py
-model: gpt-5.4-mini
+model: gpt-5.6-luna
 model_reasoning_effort: medium
-service_tier: fast
-features.fast_mode: true
+service_tier: (not specified)
+features.fast_mode: false
 sandbox: read-only
 approval: never
 ```
@@ -54,8 +54,8 @@ scripts/codex_conversation.py
 ```text
 scripts/process_chat.py
 scripts/finalize_live_chat.py
-model: gpt-5.5
-model_reasoning_effort: xhigh
+model: gpt-5.6-terra
+model_reasoning_effort: medium
 sandbox: workspace-write
 approval: never
 ```

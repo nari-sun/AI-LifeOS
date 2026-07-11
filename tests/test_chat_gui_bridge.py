@@ -394,23 +394,8 @@ class ChatGuiBridgeTests(unittest.TestCase):
             self.assertEqual(result["session"]["session_id"], session.path.stem)
             self.assertEqual([message["role"] for message in result["messages"]], ["user", "assistant"])
 
-    def test_cleanup_expired_is_dry_run_by_default(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            old = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
-            session = create_live_session(root=root, started_at=old)
-            session.append_message("user", "old message", old)
-
-            result = chat_gui_bridge.handle_cleanup_expired(
-                {
-                    "root": str(root),
-                    "retention_days": 10,
-                }
-            )
-
-            self.assertTrue(session.path.exists())
-            self.assertEqual(1, len(result["results"]))
-            self.assertNotEqual("削除済み", result["results"][0]["status"])
+    def test_cleanup_expired_command_is_not_exposed(self):
+        self.assertNotIn("cleanup-expired", chat_gui_bridge.COMMANDS)
 
     def test_finalize_job_runs_in_background_and_returns_status(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -547,6 +532,102 @@ class ChatGuiBridgeTests(unittest.TestCase):
 
         self.assertNotEqual(0, flags & subprocess.CREATE_NEW_PROCESS_GROUP)
         self.assertNotEqual(0, flags & subprocess.CREATE_NO_WINDOW)
+
+    def test_organize_sessions_job_processes_unorganized_sessions_oldest_first(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir()
+            (prompt_dir / "codex_phase2_prompt.md").write_text("Process {RAW_FILE}", encoding="utf-8")
+            now = datetime.now(timezone.utc)
+            older = create_live_session(root=root, started_at=now - timedelta(minutes=2))
+            newer = create_live_session(root=root, started_at=now - timedelta(minutes=1))
+            older.append_message("user", "older", older.started_at)
+            newer.append_message("user", "newer", newer.started_at)
+
+            started = chat_gui_bridge.handle_start_organize_sessions_job(
+                {"root": str(root), "retention_days": 10, "run_codex": False}
+            )
+            self.assertEqual(2, started["eligible_count"])
+            job_id = started["job"]["job_id"]
+
+            status = None
+            for _ in range(50):
+                status = chat_gui_bridge.handle_get_organize_sessions_job({"root": str(root), "job_id": job_id})["job"]
+                if status["status"] in {"succeeded", "failed", "cancelled"}:
+                    break
+                time.sleep(0.1)
+
+            self.assertIsNotNone(status)
+            self.assertEqual("succeeded", status["status"])
+            self.assertEqual([older.path.stem, newer.path.stem], status["result"]["completed_sessions"])
+            for process in chat_gui_bridge.BACKGROUND_PROCESSES:
+                process.wait(timeout=5)
+            self.assertFalse(chat_gui_bridge._organize_sessions_lock_path(root).exists())
+            job_log = (root / status["log_path"]).read_text(encoding="utf-8")
+            self.assertIn("worker.start targets=2", job_log)
+            self.assertIn("worker.succeeded", job_log)
+
+    def test_organize_sessions_job_reuses_active_job(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            now = datetime.now(timezone.utc)
+            session = create_live_session(root=root, started_at=now)
+            session.append_message("user", "organize", now)
+            fake_process = mock.Mock(pid=os.getpid())
+
+            with mock.patch.object(chat_gui_bridge, "_spawn_organize_sessions_worker", return_value=fake_process) as spawn:
+                first = chat_gui_bridge.handle_start_organize_sessions_job({"root": str(root), "retention_days": 10})["job"]
+                second = chat_gui_bridge.handle_start_organize_sessions_job({"root": str(root), "retention_days": 10})["job"]
+
+            self.assertEqual(first["job_id"], second["job_id"])
+            spawn.assert_called_once()
+
+    def test_active_organize_sessions_job_blocks_individual_finalize(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            now = datetime.now(timezone.utc)
+            session = create_live_session(root=root, started_at=now)
+            session.append_message("user", "blocked", now)
+            job_id = "organize-active"
+            chat_gui_bridge._write_job_status(
+                root,
+                job_id,
+                {
+                    "job_id": job_id,
+                    "name": chat_gui_bridge.ORGANIZE_SESSIONS_JOB_NAME,
+                    "status": "running",
+                    "created_at": now.isoformat(),
+                    "worker_pid": os.getpid(),
+                },
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "データ整理が進行中"):
+                chat_gui_bridge.handle_start_finalize_job({"root": str(root), "session_file": str(session.path)})
+
+    def test_get_organize_sessions_job_recovers_dead_worker_and_releases_lock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            job_id = "organize-orphan"
+            chat_gui_bridge._write_job_status(
+                root,
+                job_id,
+                {
+                    "job_id": job_id,
+                    "name": chat_gui_bridge.ORGANIZE_SESSIONS_JOB_NAME,
+                    "status": "running",
+                    "created_at": "2026-07-03T12:00:00+00:00",
+                    "worker_pid": 999999,
+                },
+            )
+            self.assertIsNone(chat_gui_bridge._claim_organize_sessions_lock(root, job_id))
+
+            with mock.patch.object(chat_gui_bridge, "_process_exists", return_value=False):
+                status = chat_gui_bridge.handle_get_organize_sessions_job({"root": str(root), "job_id": job_id})["job"]
+
+            self.assertEqual("failed", status["status"])
+            self.assertIn("terminal result", status["error"])
+            self.assertFalse(chat_gui_bridge._organize_sessions_lock_path(root).exists())
 
 
 if __name__ == "__main__":

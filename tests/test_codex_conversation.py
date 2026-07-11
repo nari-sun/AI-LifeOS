@@ -206,6 +206,32 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn("User:\nLatest", prompt)
         self.assertIn("Do not edit files", prompt)
 
+    def test_parser_defaults_to_no_fast_mode_or_service_tier(self):
+        args = codex_conversation.build_parser().parse_args([])
+
+        self.assertIsNone(args.chat_codex_service_tier)
+        self.assertFalse(args.chat_codex_fast_mode)
+
+    def test_build_codex_chat_prompt_requires_grounded_memory_recall(self):
+        memory_context = """AI-LifeOS memory context (read-only).
+
+## Conversation Matches
+- Date: 2026-07-11
+  Source: conversations/2026/07/example/summary.md
+  Snippet: ユーザーは千昭の計画性のなさを指摘した。"""
+
+        prompt = codex_conversation.build_codex_chat_prompt(
+            [create_live_message("user", "前に話した感想を覚えてる？")],
+            memory_context=memory_context,
+        )
+
+        self.assertIn("Memory-grounding rules:", prompt)
+        self.assertIn("state only claims supported by that context", prompt)
+        self.assertIn("Do not fill gaps with general knowledge", prompt)
+        self.assertIn("Do not reverse, soften, or strengthen a stored claim", prompt)
+        self.assertIn("say that the stored records do not confirm it", prompt)
+        self.assertIn("ユーザーは千昭の計画性のなさを指摘した", prompt)
+
     def test_generate_assistant_reply_reads_codex_output_file(self):
         calls = []
 
@@ -226,10 +252,10 @@ class CodexConversationTests(unittest.TestCase):
         command = calls[0][0]
         self.assertEqual("Fake assistant reply.", reply)
         self.assertEqual("codex.cmd", command[0])
-        self.assertEqual("gpt-5.4-mini", command[command.index("--model") + 1])
+        self.assertEqual("gpt-5.6-luna", command[command.index("--model") + 1])
         self.assertIn('model_reasoning_effort="medium"', command)
-        self.assertIn('service_tier="fast"', command)
-        self.assertIn("features.fast_mode=true", command)
+        self.assertNotIn('service_tier="fast"', command)
+        self.assertIn("features.fast_mode=false", command)
         self.assertIn("--sandbox", command)
         self.assertEqual("read-only", command[command.index("--sandbox") + 1])
         self.assertIn("User:\nHello", calls[0][1]["input"])
@@ -251,9 +277,12 @@ class CodexConversationTests(unittest.TestCase):
         thread_start = next(request for request in process.requests if request.get("method") == "thread/start")
         self.assertEqual("read-only", thread_start["params"]["sandbox"])
         self.assertEqual("never", thread_start["params"]["approvalPolicy"])
+        self.assertEqual("gpt-5.6-luna", thread_start["params"]["model"])
         turn_start = next(request for request in process.requests if request.get("method") == "turn/start")
+        self.assertEqual("gpt-5.6-luna", turn_start["params"]["model"])
         self.assertEqual("medium", turn_start["params"]["effort"])
-        self.assertEqual("fast", turn_start["params"]["serviceTier"])
+        self.assertNotIn("serviceTier", thread_start["params"])
+        self.assertNotIn("serviceTier", turn_start["params"])
 
     def test_streaming_app_server_interrupt_suppresses_delta_and_raises(self):
         process = FakeAppServerProcess(complete_status="interrupted")
@@ -357,8 +386,8 @@ class CodexConversationTests(unittest.TestCase):
             self.assertIn("Updated summary/journal/memory.", status)
             self.assertTrue(result.raw_file.exists())
             self.assertEqual("codex.cmd", calls[0][0])
-            self.assertEqual("gpt-5.5", calls[0][calls[0].index("--model") + 1])
-            self.assertIn('model_reasoning_effort="xhigh"', calls[0])
+            self.assertEqual("gpt-5.6-terra", calls[0][calls[0].index("--model") + 1])
+            self.assertIn('model_reasoning_effort="medium"', calls[0])
             self.assertEqual("workspace-write", calls[0][calls[0].index("--sandbox") + 1])
             self.assertIn((5, "Saving live log..."), progress_events)
             self.assertIn((70, "Updating summary, journal, and memory..."), progress_events)

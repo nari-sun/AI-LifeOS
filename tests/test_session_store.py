@@ -149,6 +149,37 @@ class SessionStoreTests(unittest.TestCase):
 
             self.assertEqual(["recent"], [session.session_id for session in sessions])
 
+    def test_list_resumable_sessions_returns_only_the_latest_fifty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_dir = root / "inbox" / "live"
+            live_dir.mkdir(parents=True)
+            started_at = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+            for index in range(51):
+                timestamp = started_at + timedelta(minutes=index)
+                path = live_dir / f"session-{index:02d}.jsonl"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "role": "user",
+                            "timestamp": timestamp.isoformat(),
+                            "content": f"message {index}",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+            sessions = session_store.list_resumable_sessions(
+                root=root,
+                retention_days=10,
+                now=started_at + timedelta(days=1),
+            )
+
+            self.assertEqual(50, len(sessions))
+            self.assertEqual("session-50", sessions[0].session_id)
+            self.assertEqual("session-01", sessions[-1].session_id)
+
     def test_load_resume_session_loads_latest_resumable_messages(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -161,7 +192,7 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(2, len(records))
             self.assertEqual("セッション保存を追加したい", records[0]["content"])
 
-    def test_prune_expired_sessions_does_not_delete_unorganized_sessions(self):
+    def test_prune_expired_sessions_lists_sessions_without_deleting_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             live_file = self.make_live_file(root, "old.jsonl")
@@ -182,23 +213,21 @@ class SessionStoreTests(unittest.TestCase):
             now = datetime(2026, 7, 1, 22, 30, 0, tzinfo=timezone(timedelta(hours=9)))
 
             dry_run_targets = session_store.prune_expired_sessions(root=root, retention_days=10, now=now)
-            self.assertEqual([live_file, metadata_file], dry_run_targets)
+            self.assertEqual([live_file], dry_run_targets)
             self.assertTrue(live_file.exists())
             self.assertTrue(metadata_file.exists())
 
-            deleted_targets = session_store.prune_expired_sessions(
+            listed_again = session_store.prune_expired_sessions(
                 root=root,
                 retention_days=10,
                 now=now,
-                delete=True,
-                auto_finalize=False,
             )
 
-            self.assertEqual([], deleted_targets)
+            self.assertEqual([live_file], listed_again)
             self.assertTrue(live_file.exists())
             self.assertTrue(metadata_file.exists())
 
-    def test_cleanup_expired_sessions_deletes_only_organized_artifacts(self):
+    def test_cleanup_expired_sessions_retains_organized_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             live_file = self.make_live_file(root, "old.jsonl")
@@ -251,13 +280,13 @@ class SessionStoreTests(unittest.TestCase):
             results = session_store.cleanup_expired_sessions(root=root, retention_days=10, now=now)
 
             self.assertEqual(1, len(results))
-            self.assertEqual("削除済み", results[0].status)
-            self.assertEqual((live_file, metadata_file, raw_file), results[0].deleted_paths)
-            self.assertFalse(live_file.exists())
-            self.assertFalse(metadata_file.exists())
-            self.assertFalse(raw_file.exists())
+            self.assertEqual("保持", results[0].status)
+            self.assertEqual((), results[0].deleted_paths)
+            self.assertTrue(live_file.exists())
+            self.assertTrue(metadata_file.exists())
+            self.assertTrue(raw_file.exists())
 
-    def test_cleanup_expired_sessions_keeps_failed_sessions_for_manual_resume(self):
+    def test_cleanup_expired_sessions_retains_failed_sessions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             live_file = self.make_live_file(root, "old.jsonl")
@@ -293,7 +322,7 @@ class SessionStoreTests(unittest.TestCase):
             results = session_store.cleanup_expired_sessions(root=root, retention_days=10, now=now)
 
             self.assertEqual(1, len(results))
-            self.assertEqual("整理失敗", results[0].status)
+            self.assertEqual("保持", results[0].status)
             self.assertEqual((), results[0].deleted_paths)
             self.assertTrue(live_file.exists())
             self.assertTrue(metadata_file.exists())

@@ -50,7 +50,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - PowerShell上で live 会話を行い、`inbox/live/*.jsonl` に user / assistant 発言を逐次保存する
 - live JSONLを raw.md に変換し、既存の Phase2.5 記憶整理へ接続する
 - live 会話セッションを `.session.json` として保存し、最後のuser入力から10日以内のセッションを再開する
-- Tauri GUIから新規チャット、送信、履歴再開、添付、ローカルデータ確認、バックグラウンド整理を実行する
+- Tauri GUIから新規チャット、送信、履歴再開、添付、管理メニューのローカルデータ確認、未整理セッションの逐次バックグラウンド整理を実行する
 - 保存済みの raw.md / summary.md / journal / memory を検索する
 - `memory/search_index.sqlite3` を再構築可能な検索indexとして生成する
 - 私的な質問や好みに関係する会話では、`memory/long_term.md` と `memory/preferences.md` を読み取り専用コンテキストとして回答に渡す
@@ -264,10 +264,10 @@ python scripts\import_chatgpt_export.py imports\chatgpt_export\export.zip --id C
 会話返答生成:
 
 ```text
-model: gpt-5.4-mini
+model: gpt-5.6-luna
 model_reasoning_effort: medium
-service_tier: fast
-features.fast_mode: true
+service_tier: (not specified)
+features.fast_mode: false
 sandbox: read-only
 approval: never
 ```
@@ -275,8 +275,8 @@ approval: never
 summary / journal / memory 更新:
 
 ```text
-model: gpt-5.5
-model_reasoning_effort: xhigh
+model: gpt-5.6-terra
+model_reasoning_effort: medium
 sandbox: workspace-write
 approval: never
 ```
@@ -392,16 +392,15 @@ python scripts\session_store.py save
 python scripts\session_store.py list
 python scripts\session_store.py resume-list
 python scripts\session_store.py prune
-python scripts\session_store.py prune --delete
 ```
 
 ルール:
 
 - `.session.json` は元の `inbox/live/*.jsonl` の横に作る
 - 再開候補は最後のuser入力から10日以内に限定する
-- `prune` はデフォルトでは削除しない
-- 実削除は `prune --delete` を明示した場合だけ行う
-- 削除対象は同名の `.jsonl` と `.session.json` に限定する
+- 再開セッション一覧は新しい順に最大50件表示する
+- 10日超のセッションも、会話ログ・live JSONL・`.session.json` を削除せずに保持する
+- `prune` はresume対象外のセッションを確認するだけで、削除しない
 
 ### 保存済み記憶を検索する
 
@@ -502,7 +501,6 @@ GUIでまだやらないこと:
 - ベクトル検索
 - MCP連携
 - モデル・応答設定UI
-- 10日超セッションの自動削除
 - 会話中の memory / journal 自動編集
 - 自動Git commit
 

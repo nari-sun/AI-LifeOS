@@ -42,7 +42,8 @@ class Phase3MemoryTests(unittest.TestCase):
             encoding="utf-8",
         )
         (session / "raw.md").write_text(
-            "# Chat Log\n\nDate: 2026-07-05\n\nラーメンの好みについて話した。\n",
+            "# Chat Log\n\nDate: 2026-07-05\n\nラーメンの好みについて話した。\n"
+            "『時をかける少女』を見て、時間を戻せるからこそ生まれる選択の重さが印象に残ったと感想を述べた。\n",
             encoding="utf-8",
         )
         journal = root / "journal" / "2026" / "07"
@@ -333,6 +334,65 @@ class Phase3MemoryTests(unittest.TestCase):
         self.assertTrue(personal.should_use_memory)
         self.assertIn("self-plus-personal-topic", personal.reasons)
         self.assertFalse(generic.should_use_memory)
+
+    def test_build_answer_context_uses_past_personal_impression(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="俺の時をかける少女の感想ってなんだっけ？",
+                use_index=False,
+            )
+
+            self.assertTrue(context.should_use_memory)
+            self.assertIn("past-conversation", context.reasons)
+            self.assertIn("Conversation Matches", context.text)
+            self.assertIn("選択の重さが印象に残った", context.text)
+
+    def test_answer_context_includes_matching_raw_message_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = root / "conversations" / "2026" / "07" / "2026-07-11_173611"
+            session.mkdir(parents=True)
+            (session / "raw.md").write_text(
+                "\n".join(
+                    (
+                        "# Chat Log",
+                        "",
+                        "Date: 2026-07-11",
+                        "Session: AI-LifeOS movie thoughts",
+                        "",
+                        "## User",
+                        "",
+                        "Timestamp: 2026-07-11T17:36:42+09:00",
+                        "",
+                        "PERSONAL_SENTINEL: memories accumulate instead of disappearing.",
+                        "",
+                        "## Assistant",
+                        "",
+                        "Timestamp: 2026-07-11T17:37:03+09:00",
+                        "",
+                        "That is a thoughtful reading.",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            memory_index.rebuild_index(root)
+            with closing(sqlite3.connect(memory_index.default_index_path(root))) as connection:
+                connection.execute("DELETE FROM documents WHERE document_type = 'raw_chunk'")
+                connection.commit()
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="AI-LifeOS movie thoughts",
+            )
+
+            self.assertTrue(context.should_use_memory)
+            self.assertIn("Raw Conversation Evidence", context.text)
+            self.assertIn("PERSONAL_SENTINEL", context.text)
+            self.assertTrue(any(result.document_type == "raw_chunk" for result in context.results))
 
     def test_answer_context_records_reference_sources(self):
         with tempfile.TemporaryDirectory() as temp_dir:

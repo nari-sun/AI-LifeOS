@@ -106,8 +106,8 @@ Phase4.0 では、Phase3 の検索・記憶取得基盤を前提に、MCP連携�
 
 * 判断基準は最後の user 入力
 * resume 候補は10日以内
-* `prune` は dry-run
-* 実削除は `prune --delete` の明示時だけ
+* `prune` はresume対象外セッションの一覧表示のみ
+* 会話ログ・live JSONL・セッション情報は削除しない
 
 ## Phase2.7: Chat GUI MVP
 

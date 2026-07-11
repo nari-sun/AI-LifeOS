@@ -2,11 +2,12 @@ import { Channel, invoke } from "@tauri-apps/api/core"
 
 import type {
   CancelMessageResult,
-  CleanupExpiredResult,
   FinalizeJobResult,
   FinalizeSessionResult,
   ListResumableResult,
   LocalDataReportResult,
+  OrganizeSessionsJobResult,
+  StartOrganizeSessionsJobResult,
   AttachmentPayload,
   AssistantStreamEvent,
   ResumeSessionResult,
@@ -86,7 +87,12 @@ export async function saveSession(sessionFile: string) {
 }
 
 export async function listResumableSessions() {
-  return invoke<ListResumableResult>("list_resumable_sessions", { payload: defaultPayload })
+  return invoke<ListResumableResult>("list_resumable_sessions", {
+    payload: {
+      ...defaultPayload,
+      max_sessions: 50,
+    },
+  })
 }
 
 export async function resumeSession(sessionRef: string) {
@@ -132,8 +138,29 @@ export async function cancelFinalizeJob(jobId: string) {
   })
 }
 
-export async function cleanupExpiredSessions() {
-  return invoke<CleanupExpiredResult>("cleanup_expired_sessions", { payload: defaultPayload })
+export async function startOrganizeSessionsJob() {
+  return invoke<StartOrganizeSessionsJobResult>("start_organize_sessions_job", {
+    payload: {
+      ...defaultPayload,
+      run_codex: true,
+    },
+  })
+}
+
+export async function getOrganizeSessionsJob(jobId: string) {
+  return invoke<OrganizeSessionsJobResult>("get_organize_sessions_job", {
+    payload: {
+      job_id: jobId,
+    },
+  })
+}
+
+export async function cancelOrganizeSessionsJob(jobId: string) {
+  return invoke<OrganizeSessionsJobResult>("cancel_organize_sessions_job", {
+    payload: {
+      job_id: jobId,
+    },
+  })
 }
 
 export async function getLocalDataReport() {

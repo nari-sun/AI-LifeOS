@@ -63,8 +63,18 @@ async fn cancel_finalize_job(payload: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn cleanup_expired_sessions(payload: Value) -> Result<Value, String> {
-    run_bridge("cleanup-expired", payload)
+async fn start_organize_sessions_job(payload: Value) -> Result<Value, String> {
+    run_bridge("start-organize-sessions-job", payload)
+}
+
+#[tauri::command]
+async fn get_organize_sessions_job(payload: Value) -> Result<Value, String> {
+    run_bridge("get-organize-sessions-job", payload)
+}
+
+#[tauri::command]
+async fn cancel_organize_sessions_job(payload: Value) -> Result<Value, String> {
+    run_bridge("cancel-organize-sessions-job", payload)
 }
 
 #[tauri::command]
@@ -91,7 +101,9 @@ pub fn run() {
             start_finalize_job,
             get_finalize_job,
             cancel_finalize_job,
-            cleanup_expired_sessions,
+            start_organize_sessions_job,
+            get_organize_sessions_job,
+            cancel_organize_sessions_job,
             local_data_report,
             open_local_data_folder
         ])

@@ -22,10 +22,10 @@ from live_session import ROOT, LiveMessage, LiveSession, create_live_message, cr
 from session_store import ResumeSession, list_resumable_sessions, load_resume_session
 
 DEBUG_LOG_ENV = "AI_LIFEOS_DEBUG_LOG"
-DEFAULT_CHAT_CODEX_MODEL = "gpt-5.4-mini"
+DEFAULT_CHAT_CODEX_MODEL = "gpt-5.6-luna"
 DEFAULT_CHAT_CODEX_REASONING_EFFORT = "medium"
-DEFAULT_CHAT_CODEX_SERVICE_TIER = "fast"
-DEFAULT_CHAT_CODEX_FAST_MODE = True
+DEFAULT_CHAT_CODEX_SERVICE_TIER: str | None = None
+DEFAULT_CHAT_CODEX_FAST_MODE = False
 
 
 @dataclass(frozen=True)
@@ -64,13 +64,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chat-codex-service-tier",
         default=DEFAULT_CHAT_CODEX_SERVICE_TIER,
-        help="Codex service tier for chat replies. The default requests Fast mode.",
+        help="Codex service tier for chat replies. The default leaves the tier unspecified.",
+    )
+    parser.add_argument(
+        "--chat-codex-fast-mode",
+        dest="chat_codex_fast_mode",
+        action="store_true",
+        help="Pass features.fast_mode=true for chat replies.",
     )
     parser.add_argument(
         "--no-chat-codex-fast-mode",
-        action="store_true",
-        help="Do not pass features.fast_mode=true for chat replies.",
+        dest="chat_codex_fast_mode",
+        action="store_false",
+        help=argparse.SUPPRESS,
     )
+    parser.set_defaults(chat_codex_fast_mode=DEFAULT_CHAT_CODEX_FAST_MODE)
     parser.add_argument(
         "--codex-sandbox",
         default="read-only",
@@ -162,7 +170,26 @@ def build_codex_chat_prompt(
         "",
     ]
     if memory_context.strip():
-        lines.extend(["Memory Context:", "", memory_context.strip(), ""])
+        lines.extend(
+            [
+                "Memory-grounding rules:",
+                "- Treat the memory context as evidence, not as a suggestion.",
+                "- When answering about the user's past conversations, opinions, experiences, preferences, "
+                "or decisions, state only claims supported by that context.",
+                "- Do not fill gaps with general knowledge, plausible inference, or invented recollections.",
+                "- Do not reverse, soften, or strengthen a stored claim. Preserve the meaning of the source.",
+                "- For a question asking what the user previously said, thought, or felt, give a concise "
+                "source-grounded summary. Mention the source date or title naturally when it helps establish "
+                "the basis of the answer.",
+                "- If the context does not support a specific answer, say that the stored records do not "
+                "confirm it. Do not guess.",
+                "",
+                "Memory Context:",
+                "",
+                memory_context.strip(),
+                "",
+            ]
+        )
     lines.extend(["Transcript:", "", *transcript_lines])
     return "\n".join(lines).rstrip()
 
@@ -323,6 +350,13 @@ def generate_assistant_reply_streaming_with_context(
     if include_memory_context:
         memory_context_result = build_answer_context(root=root, question=_latest_user_content(messages))
         memory_context = memory_context_result.text
+        _debug_log(
+            root,
+            "assistant_reply.streaming_memory_context "
+            f"enabled={memory_context_result.used_memory} "
+            f"score={memory_context_result.score}/{memory_context_result.threshold} "
+            f"references={len(memory_context_result.references)} results={len(memory_context_result.results)}",
+        )
     prompt = build_codex_chat_prompt(
         messages,
         max_context_messages=max_context_messages,
@@ -646,8 +680,7 @@ def _format_resume_list(sessions: list[ResumeSession]) -> str:
 
 
 def _resume_candidates(root: Path, retention_days: int) -> list[ResumeSession]:
-    sessions = list_resumable_sessions(root=root, retention_days=retention_days)
-    return sessions[:10]
+    return list_resumable_sessions(root=root, retention_days=retention_days, limit=10)
 
 
 def _cursor_selection_available() -> bool:
@@ -1088,7 +1121,7 @@ def main() -> int:
                     model=args.chat_codex_model,
                     reasoning_effort=args.chat_codex_reasoning_effort,
                     service_tier=args.chat_codex_service_tier,
-                    fast_mode=not args.no_chat_codex_fast_mode,
+                    fast_mode=args.chat_codex_fast_mode,
                     max_context_messages=args.max_context_messages,
                     include_memory_context=not args.no_memory_context,
                 )
