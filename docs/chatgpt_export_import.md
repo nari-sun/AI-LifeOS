@@ -25,6 +25,12 @@ python scripts\import_chatgpt_export.py imports\chatgpt_export\export.zip
 exportを展開済みなら、フォルダまたは `conversations.json` を直接指定できます。dry-runには、
 export内件数、選択件数、UTC期間、タイトル、会話ID、発言数、重複状態が表示されます。
 
+### Chat GUIから確認する
+
+Chat GUIでは、左サイドバーの **管理 > ChatGPTインポート** から、export ZIP、展開済みフォルダ、または `conversations.json` を選択できます。
+
+最初の選択操作はdry-runで、会話一覧、新規件数、重複件数を表示するだけです。タイトル、会話ID、UTC作成日で絞り込み、取り込む会話にチェックを付けます。重複済みの会話は選択できません。
+
 ## 2. 対象を絞る
 
 ```powershell
@@ -64,6 +70,8 @@ conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/
 
 同じ秒に複数の会話がある場合は、既存セッションを上書きせず、空いている次の秒の標準形式ディレクトリへ保存します。
 `raw.md` 内の `Created At` と sidecar metadata には元のUTC時刻が保持されます。
+
+GUIでは、選択件数を確認するダイアログに同意した場合だけ同じ取り込みを実行します。GUIの取り込みも、summary / journal / memory / 検索indexを更新しません。
 
 ## 記憶整理
 

@@ -5,6 +5,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Iterable
 
 from memory_items import read_memory_item
@@ -47,6 +48,41 @@ class MemorySearchResult:
     source: str | None = None
     source_date: str | None = None
     confidence: str | None = None
+
+
+@dataclass(frozen=True)
+class SearchProfile:
+    """Timing and candidate counts for one read-only memory search.
+
+    ``index_load_ms`` is the time spent opening and inspecting the SQLite
+    index (or collecting Markdown when ``source`` is ``markdown``).
+    ``filter_ms`` is the time spent applying the metadata filters.  For an
+    index-backed search that work is the parameterized SQLite query itself,
+    so candidate documents never need to be loaded into Python merely to be
+    discarded.  ``ranking_ms`` covers the existing Python Japanese partial
+    match ranking.
+    """
+
+    source: str
+    index_load_ms: float
+    filter_ms: float
+    ranking_ms: float
+    total_ms: float
+    candidate_count: int
+    result_count: int
+    filters: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source": self.source,
+            "index_load_ms": round(self.index_load_ms, 3),
+            "filter_ms": round(self.filter_ms, 3),
+            "ranking_ms": round(self.ranking_ms, 3),
+            "total_ms": round(self.total_ms, 3),
+            "candidate_count": self.candidate_count,
+            "result_count": self.result_count,
+            "filters": list(self.filters),
+        }
 
 
 def default_index_path(root: Path | str = ROOT) -> Path:
@@ -139,42 +175,216 @@ def search_memory(
     tag: str | None = None,
     category: str | None = None,
     status: str | None = None,
+    date: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    path: str | None = None,
     use_index: bool = True,
 ) -> list[MemorySearchResult]:
+    results, _ = search_memory_with_profile(
+        root=root,
+        query=query,
+        db_path=db_path,
+        limit=limit,
+        document_types=document_types,
+        tag=tag,
+        category=category,
+        status=status,
+        date=date,
+        date_from=date_from,
+        date_to=date_to,
+        path=path,
+        use_index=use_index,
+    )
+    return results
+
+
+def search_memory_with_profile(
+    root: Path | str = ROOT,
+    query: str = "",
+    db_path: Path | str | None = None,
+    limit: int = 10,
+    document_types: Iterable[str] | None = None,
+    tag: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
+    date: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    path: str | None = None,
+    use_index: bool = True,
+) -> tuple[list[MemorySearchResult], SearchProfile]:
+    """Search memory and return the normal results together with timings.
+
+    This deliberately remains separate from :func:`search_memory` so existing
+    callers continue to receive only a result list.
+    """
     root = Path(root)
     db_file = _resolve_db_path(root, db_path)
     type_filter = tuple(document_types or ())
+    started_at = perf_counter()
+    index_load_ms = 0.0
+    filter_ms = 0.0
+    source = "markdown"
 
     if use_index and db_file.exists():
-        documents = _load_documents_from_index(
+        source = "sqlite"
+        documents, index_load_ms, filter_ms = _load_documents_from_index(
             root=root,
             db_path=db_file,
             document_types=type_filter,
             tag=tag,
             category=category,
             status=status,
+            date=date,
+            date_from=date_from,
+            date_to=date_to,
+            path=path,
         )
         # Existing indexes predate message-level raw evidence.  Keep them usable
         # without requiring a manual rebuild before the first answer after an
         # upgrade.
         if "raw_chunk" in type_filter and not documents:
+            collect_started_at = perf_counter()
             documents = [
                 document
                 for document in collect_documents(root)
                 if document.document_type == "raw_chunk"
             ]
+            index_load_ms += (perf_counter() - collect_started_at) * 1000
+            filter_started_at = perf_counter()
+            documents = _filter_documents(
+                documents,
+                document_types=type_filter,
+                tag=tag,
+                category=category,
+                status=status,
+                date=date,
+                date_from=date_from,
+                date_to=date_to,
+                path=path,
+                root=root,
+            )
+            filter_ms += (perf_counter() - filter_started_at) * 1000
+            source = "markdown-fallback"
     else:
+        collect_started_at = perf_counter()
         documents = collect_documents(root)
-        if type_filter:
-            documents = [document for document in documents if document.document_type in type_filter]
-        if tag:
-            documents = [document for document in documents if tag in document.tags]
-        if category:
-            documents = [document for document in documents if document.category == category]
-        if status:
-            documents = [document for document in documents if document.status == status]
+        index_load_ms = (perf_counter() - collect_started_at) * 1000
+        filter_started_at = perf_counter()
+        documents = _filter_documents(
+            documents,
+            document_types=type_filter,
+            tag=tag,
+            category=category,
+            status=status,
+            date=date,
+            date_from=date_from,
+            date_to=date_to,
+            path=path,
+            root=root,
+        )
+        filter_ms = (perf_counter() - filter_started_at) * 1000
 
-    return _rank_documents(documents, query=query, limit=limit)
+    ranking_started_at = perf_counter()
+    results = _rank_documents(documents, query=query, limit=limit)
+    ranking_ms = (perf_counter() - ranking_started_at) * 1000
+    profile = SearchProfile(
+        source=source,
+        index_load_ms=index_load_ms,
+        filter_ms=filter_ms,
+        ranking_ms=ranking_ms,
+        total_ms=(perf_counter() - started_at) * 1000,
+        candidate_count=len(documents),
+        result_count=len(results),
+        filters=_filter_names(
+            document_types=type_filter,
+            tag=tag,
+            category=category,
+            status=status,
+            date=date,
+            date_from=date_from,
+            date_to=date_to,
+            path=path,
+        ),
+    )
+    return results, profile
+
+
+def _filter_documents(
+    documents: list[MemoryDocument],
+    document_types: tuple[str, ...],
+    tag: str | None,
+    category: str | None,
+    status: str | None,
+    date: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    path: str | None,
+    root: Path,
+) -> list[MemoryDocument]:
+    filtered = documents
+    if document_types:
+        filtered = [document for document in filtered if document.document_type in document_types]
+    if tag:
+        filtered = [document for document in filtered if tag in document.tags]
+    if category:
+        filtered = [document for document in filtered if document.category == category]
+    if status:
+        filtered = [document for document in filtered if document.status == status]
+    if date:
+        filtered = [document for document in filtered if document.date == date]
+    if date_from:
+        filtered = [document for document in filtered if document.date and document.date >= date_from]
+    if date_to:
+        filtered = [document for document in filtered if document.date and document.date <= date_to]
+    if path:
+        normalized_path = _normalize_path(path)
+        filtered = [
+            document
+            for document in filtered
+            if normalized_path in _normalize_path(_relative_path(document.path, root))
+        ]
+    return filtered
+
+
+def _filter_names(
+    document_types: tuple[str, ...],
+    tag: str | None,
+    category: str | None,
+    status: str | None,
+    date: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    path: str | None,
+) -> tuple[str, ...]:
+    names: list[str] = []
+    if document_types:
+        names.append("document_type")
+    if tag:
+        names.append("tag")
+    if category:
+        names.append("category")
+    if status:
+        names.append("status")
+    if date:
+        names.append("date")
+    if date_from:
+        names.append("date_from")
+    if date_to:
+        names.append("date_to")
+    if path:
+        names.append("path")
+    return tuple(names)
+
+
+def _normalize_path(value: str) -> str:
+    return value.replace("\\", "/").lower()
+
+
+def _sql_contains_pattern(value: str) -> str:
+    escaped = _normalize_path(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 def _candidate_paths(root: Path) -> list[Path]:
@@ -535,14 +745,21 @@ def _load_documents_from_index(
     tag: str | None = None,
     category: str | None = None,
     status: str | None = None,
-) -> list[MemoryDocument]:
+    date: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    path: str | None = None,
+) -> tuple[list[MemoryDocument], float, float]:
+    index_load_started_at = perf_counter()
     with closing(sqlite3.connect(db_path)) as connection:
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(documents)").fetchall()}
+    index_load_ms = (perf_counter() - index_load_started_at) * 1000
     structured_columns = {"category", "category_label", "status", "source", "source_date", "confidence"}
     has_structured_columns = structured_columns.issubset(columns)
     if (category or status) and not has_structured_columns:
-        return []
+        return [], index_load_ms, 0.0
 
+    filter_started_at = perf_counter()
     structured_select = (
         "d.category, d.category_label, d.status, d.source, d.source_date, d.confidence"
         if has_structured_columns
@@ -571,6 +788,18 @@ def _load_documents_from_index(
     if status:
         where.append("d.status = ?")
         params.append(status)
+    if date:
+        where.append("d.date = ?")
+        params.append(date)
+    if date_from:
+        where.append("d.date >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append("d.date <= ?")
+        params.append(date_to)
+    if path:
+        where.append("LOWER(REPLACE(d.path, CHAR(92), '/')) LIKE ? ESCAPE '\\'")
+        params.append(_sql_contains_pattern(path))
     if where:
         query.append("WHERE " + " AND ".join(where))
     query.append("ORDER BY COALESCE(d.date, ''), d.path")
@@ -612,7 +841,8 @@ def _load_documents_from_index(
                 confidence=str(confidence) if confidence else None,
             )
         )
-    return documents
+    filter_ms = (perf_counter() - filter_started_at) * 1000
+    return documents, index_load_ms, filter_ms
 
 
 def _relative_path(path: Path, root: Path) -> str:

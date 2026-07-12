@@ -51,10 +51,11 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - live JSONLを raw.md に変換し、既存の Phase2.5 記憶整理へ接続する
 - live 会話セッションを `.session.json` として保存し、最後のuser入力から10日以内のセッションを再開する
 - Tauri GUIから新規チャット、送信、履歴再開、添付、管理メニューのローカルデータ確認、未整理セッションの逐次バックグラウンド整理を実行する
+- Tauri GUIのassistant返答を、任意導入のKokoro TTSで文ごとに先行再生・停止し、5種類の日本語voiceから選択する
 - 保存済みの raw.md / summary.md / journal / memory を検索する
 - `memory/search_index.sqlite3` を再構築可能な検索indexとして生成する
 - 私的な質問や好みに関係する会話では、`memory/long_term.md` と `memory/preferences.md` を読み取り専用コンテキストとして回答に渡す
-- ChatGPT exportのフォルダ、zip、または `conversations.json` をdry-run確認してから、選択した会話だけをraw.mdへ取り込む
+- ChatGPT exportのフォルダ、zip、または `conversations.json` をCLIまたはGUIでdry-run確認してから、選択した会話だけをraw.mdへ取り込む
 - `python -m unittest` で Python 側の保存・再開・GUIブリッジ処理をテストする
 
 ## Phase Overview
@@ -119,6 +120,7 @@ AI-LifeOS/
 │  ├─ live_session.py
 │  ├─ session_store.py
 │  ├─ chat_gui_bridge.py
+│  ├─ kokoro_tts.py
 │  ├─ chat_gui_task.ps1
 │  ├─ memory_index.py
 │  ├─ search_memory.py
@@ -242,6 +244,18 @@ Tauri command から scripts/chat_gui_bridge.py を呼ぶ
 ```
 
 GUIの「整理して保存」は raw.md 作成と summary / journal / memory 更新に接続します。Git commit はGUIから自動実行しません。
+
+### GUIのKokoro読み上げ（任意）
+
+Kokoro TTSを導入しなくてもGUI本体は利用できます。既存のPython環境に影響させないため、assistant返答の「読み上げ」を初めて使う前に、Python 3.10〜3.12 でプロジェクト用の`.venv`を作成してください。
+
+```powershell
+python -m venv --system-site-packages .venv
+.\.venv\Scripts\python.exe -m pip install "kokoro==0.9.4" "misaki[ja]" soundfile
+.\.venv\Scripts\python.exe -m unidic download
+```
+
+`unidic download` は約526MBの日本語読み上げ辞書を取得します。`.venv`がある場合、GUIは自動的にそのPythonを使います。Kokoroモデルは初回利用時に `cache/tts/` へ、再生用WAVはOS一時フォルダへ保存され、いずれもGit管理しません。取得元・ライセンス・制約は [Kokoro TTS Read Aloud](docs/kokoro_tts_read_aloud.md) を参照してください。
 
 ### ChatGPT export import
 

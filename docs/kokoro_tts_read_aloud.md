@@ -4,9 +4,9 @@ RT-0019 は、Chat GUI の assistant メッセージを Kokoro TTS で読み上�
 
 ## Status
 
-Backlog. まだ実装しません。
+Implemented on 2026-07-12. Kokoro TTS は Chat GUI の任意依存です。
 
-Kokoro TTS を、AI-LifeOS の任意依存ローカル読み上げエンジンとして評価します。VOICEVOX / COEIROINK / AquesTalk は、クレジット表記や配布ライセンスの扱いが重くなるため、このチケットでは採用しません。
+assistant メッセージごとに読み上げ・停止ボタンと voice 選択を表示します。Kokoro が未導入のPCでは、チャット保存・セッション・finalizeに影響を与えず、セットアップコマンドを含むエラーだけを表示します。VOICEVOX / COEIROINK / AquesTalk はこのチケットの対象外です。
 
 ## Background
 
@@ -75,15 +75,17 @@ assistant message の読み上げボタン
 -> Tauri command
 -> scripts/chat_gui_bridge.py
 -> Kokoro TTS helper
--> 一時 wav を生成
--> GUI または OS の音声再生機能で再生
+-> 文ごとの OS 一時 WAV を生成
+-> Tauri Channel で各WAVをGUIへ通知
+-> GUI の Audio 再生キューへ追加
+-> 最初の文から再生し、後続文を生成完了順に続けて再生
 ```
 
-長い assistant 返答は、一括 wav 生成ではなく数文単位に分割して順次合成・再生する方針を検討します。これにより、体感待ち時間を短くします。
+`scripts/kokoro_tts.py` は本文を最大12,000文字に制限し、420文字以下の文単位に分割して合成します。最初のWAVができるとすぐGUIが再生を始め、後続WAVは合成完了順にキューへ追加します。停止要求は各文・音声チャンクの境界で確認し、再生中音声・未再生キュー・進行中合成を停止します。生成済みの WAV は再生終了または停止時に削除し、残った一時ファイルも次回要求時に1時間で掃除します。
 
 ## Dependency Policy
 
-Kokoro TTS は任意依存にします。
+Kokoro TTS は任意依存です。GUI本体の `npm run build`、通常の Python テスト、会話保存にKokoroの導入は不要です。
 
 推奨:
 
@@ -96,12 +98,32 @@ Kokoro TTS は任意依存にします。
 候補ディレクトリ:
 
 ```text
-cache/tts/
+cache/tts/                 # Kokoro / Hugging Face のモデルキャッシュ
+%TEMP%/AI-LifeOS/tts/      # 再生用の一時 WAV と停止マーカー
 logs/tts/
 ```
 
-ただし PublicEdition では、これらは `.gitignore` 対象にします。
-実装前に、Kokoro のPython package、モデル配布元、model card、ライセンス、voiceごとの利用条件、Windowsセットアップ手順を具体名で確認します。確認結果をREADMEまたはdocsへ記録するまで、GUI本体の必須依存にはしません。
+`cache/tts/` と `logs/tts/` は `.gitignore` 対象です。WAV は OS の一時ディレクトリにだけ置き、`conversations` / `journal` / `memory` には保存しません。TTSログには本文を書かず、request ID、voice、文字数、エラー種別だけを残します。
+
+### Windows セットアップ
+
+既存のPython環境への影響を避けるため、Python 3.10〜3.12 でプロジェクト用の`.venv`を作ってから、PowerShellで次を実行します。
+
+```powershell
+python -m venv --system-site-packages .venv
+.\.venv\Scripts\python.exe -m pip install "kokoro==0.9.4" "misaki[ja]" soundfile
+.\.venv\Scripts\python.exe -m unidic download
+```
+
+`unidic download` は約526MBの日本語辞書を取得します。初回の読み上げ時にはKokoroモデルもダウンロードされます。`scripts/chat_gui_task.ps1`とTauri GUIは`.venv\Scripts\python.exe`を自動優先します。実装は `KPipeline(lang_code="j")` と日本語 voice を使います。導入後も音声品質はローカル環境で確認してください。
+
+### 取得元とライセンス
+
+- Python package: [PyPI: kokoro 0.9.4](https://pypi.org/project/kokoro/)、Apache-2.0、Python 3.10以上・3.13未満
+- モデル・voice: [hexgrad/Kokoro-82M model card](https://huggingface.co/hexgrad/Kokoro-82M)、Apache-2.0
+- 日本語G2P: [hexgrad/misaki](https://github.com/hexgrad/misaki) の `ja` extra
+
+公開物に音声を含める場合は、このモデルカードと各依存パッケージのライセンスをその時点で再確認します。PublicEditionにはモデル・voice・生成音声を同梱しません。
 
 ## UI Requirements
 
@@ -120,7 +142,8 @@ logs/tts/
 - voice id を allowlist で検証する
 - 入力テキストの最大長を制限する
 - 長文は文単位で分割する
-- 生成 wav は一時ファイルとして扱う
+- 文ごとのWAVをTauri Channelで通知し、最初の文から再生キューへ追加する
+- 生成 wav は OS の一時ファイルとして扱う
 - 停止要求で再生または合成を中断できる
 
 ## Performance Notes
@@ -132,7 +155,7 @@ Kokoro は軽量寄りですが、初回ロードには時間がかかります�
 - 初回モデルロード: 数秒から十数秒
 - 初回モデルダウンロード: ネットワーク状況に依存
 - 短文読み上げ: CPU でも数秒以内を目標
-- 長文読み上げ: 数文ごとに分割して順次再生
+- 長文読み上げ: 最初の文が完成した時点で再生を始め、後続文を順次キューへ追加
 
 実装時に、AI-LifeOS の実機で `jf_alpha` の短文・中文・長文ベンチを記録します。
 
@@ -158,12 +181,10 @@ Kokoro は軽量寄りですが、初回ロードには時間がかかります�
 
 ## Dependencies
 
-- Kokoro TTS の任意依存セットアップ方針
-- 日本語 G2P 用依存の確認
-- Tauri からローカル wav を再生する方式の確認
-- `.gitignore` のキャッシュ・生成物除外確認
-- `cache/tts/` と `logs/tts/` がPublicEditionのGit管理対象外であることの確認
-- Kokoro package / model / voice の取得元、バージョン、ライセンス、Windows導入コマンドの確認
+- Kokoro TTS の任意依存セットアップ
+- 日本語 G2P の `misaki[ja]`
+- Tauri asset protocol による OS 一時 WAV の再生
+- `.gitignore` によるモデルキャッシュ・ログの除外
 
 ## Risks
 
@@ -175,6 +196,6 @@ Kokoro は軽量寄りですが、初回ロードには時間がかかります�
 
 ## Decision Notes
 
-RT-0019 は、読み上げ機能の第一候補を Kokoro TTS に固定して検証するためのチケットです。
+RT-0019 は、読み上げ機能を Kokoro TTS に固定して実装しました。`jf_alpha` をデフォルトにし、`jf_gongitsune`、`jf_nezumi`、`jf_tebukuro`、`jm_kumo` を allowlist から選べます。
 
-初期実装では、Kokoro TTS を同梱せず、任意依存として扱います。VOICEVOX や AquesTalk は、別チケットで再評価するまで入れません。
+Kokoro TTS は同梱せず、任意依存のままです。VOICEVOX や AquesTalk は、別チケットで再評価するまで入れません。

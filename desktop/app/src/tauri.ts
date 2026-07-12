@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core"
+import { open } from "@tauri-apps/plugin-dialog"
 
 import type {
   CancelMessageResult,
@@ -10,6 +11,13 @@ import type {
   StartOrganizeSessionsJobResult,
   AttachmentPayload,
   AssistantStreamEvent,
+  CancelReadAloudResult,
+  ChatGptImportApplyResult,
+  ChatGptImportPreviewResult,
+  DiscardReadAloudAudioResult,
+  ReadAloudResult,
+  ReadAloudStreamEvent,
+  ReadAloudStreamResult,
   ResumeSessionResult,
   SaveSessionResult,
   SendMessageResult,
@@ -26,6 +34,56 @@ export function isTauriRuntime() {
 
 export async function startSession() {
   return invoke<StartSessionResult>("start_session", { payload: defaultPayload })
+}
+
+export async function readAloud(text: string, voice: string, requestId: string) {
+  return invoke<ReadAloudResult>("read_aloud", {
+    payload: {
+      ...defaultPayload,
+      text,
+      voice,
+      request_id: requestId,
+    },
+  })
+}
+
+export async function readAloudStream(
+  text: string,
+  voice: string,
+  requestId: string,
+  onAudio: (audio: ReadAloudStreamEvent["audio"]) => void,
+) {
+  const onEvent = new Channel<ReadAloudStreamEvent>()
+  onEvent.onmessage = (event) => {
+    if (event.type === "audio") {
+      onAudio(event.audio)
+    }
+  }
+  return invoke<ReadAloudStreamResult>("read_aloud_stream", {
+    payload: {
+      ...defaultPayload,
+      text,
+      voice,
+      request_id: requestId,
+    },
+    onEvent,
+  })
+}
+
+export async function cancelReadAloud(requestId: string) {
+  return invoke<CancelReadAloudResult>("cancel_read_aloud", {
+    payload: {
+      request_id: requestId,
+    },
+  })
+}
+
+export async function discardReadAloudAudio(audioPath: string) {
+  return invoke<DiscardReadAloudAudioResult>("discard_read_aloud_audio", {
+    payload: {
+      audio_path: audioPath,
+    },
+  })
 }
 
 export async function sendMessage(
@@ -171,6 +229,42 @@ export async function openLocalDataFolder(folder: string) {
   return invoke<{ ok: boolean; folder: string; path: string }>("open_local_data_folder", {
     payload: {
       folder,
+    },
+  })
+}
+
+export async function chooseChatGptExportFile() {
+  const selected = await open({
+    title: "ChatGPTエクスポートを選択",
+    multiple: false,
+    filters: [
+      { name: "ChatGPT export", extensions: ["zip", "json"] },
+    ],
+  })
+  return typeof selected === "string" ? selected : null
+}
+
+export async function chooseChatGptExportFolder() {
+  const selected = await open({
+    title: "ChatGPTエクスポートフォルダを選択",
+    directory: true,
+    multiple: false,
+  })
+  return typeof selected === "string" ? selected : null
+}
+
+export async function previewChatGptImport(source: string) {
+  return invoke<ChatGptImportPreviewResult>("preview_chatgpt_import", {
+    payload: { source },
+  })
+}
+
+export async function applyChatGptImport(source: string, selectedIds: string[]) {
+  return invoke<ChatGptImportApplyResult>("apply_chatgpt_import", {
+    payload: {
+      source,
+      selected_ids: selectedIds,
+      confirmed: true,
     },
   })
 }

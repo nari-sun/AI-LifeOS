@@ -7,6 +7,42 @@ export interface ChatMessage {
   memory_context?: MemoryContextSummary | null
 }
 
+export interface ReadAloudResult {
+  request_id: string
+  voice: string
+  audio_file: string
+  audio_path: string
+}
+
+export interface ReadAloudAudioChunk {
+  request_id: string
+  voice: string
+  index: number
+  audio_file: string
+  audio_path: string
+}
+
+export interface ReadAloudStreamEvent {
+  type: "audio"
+  audio: ReadAloudAudioChunk
+}
+
+export interface ReadAloudStreamResult {
+  request_id: string
+  voice: string
+  chunk_count: number
+}
+
+export interface CancelReadAloudResult {
+  request_id: string
+  cancelled: boolean
+}
+
+export interface DiscardReadAloudAudioResult {
+  audio_file: string
+  removed: boolean
+}
+
 export interface MemoryContextReference {
   path: string
   document_type: string
@@ -258,4 +294,43 @@ export interface LocalDataReport {
 export interface LocalDataReportResult {
   ok: boolean
   report: LocalDataReport
+}
+
+export interface ChatGptImportConversation {
+  source_id: string
+  title: string
+  created_at: string | null
+  updated_at: string | null
+  message_count: number
+  duplicate: boolean
+}
+
+export interface ChatGptImportPreview {
+  source: string
+  total_count: number
+  new_count: number
+  duplicate_count: number
+  conversations: ChatGptImportConversation[]
+}
+
+export interface ChatGptImportPreviewResult {
+  ok: boolean
+  source: string
+  total_count: number
+  new_count: number
+  duplicate_count: number
+  conversations: ChatGptImportConversation[]
+}
+
+export interface ChatGptImportApplyResult {
+  ok: boolean
+  source: string
+  selected_count: number
+  imported_count: number
+  duplicate_count: number
+  imported: Array<{
+    source_id: string
+    title: string
+    raw_file: string | null
+  }>
 }

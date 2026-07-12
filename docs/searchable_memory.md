@@ -87,6 +87,49 @@ SQLite schema:
 
 FTS5は環境によって日本語トークン化が弱いため、MVPでは検索品質を優先してPython側の一致判定を使います。`documents_fts` が作成される環境でも、現在の検索結果ランキングの主経路はFTS5ではありません。
 
+### Metadata filter pushdown and search profile
+
+SQLite indexを使う検索では、候補をPythonへ読み込む前に次の条件をSQLiteのパラメータ化クエリで絞り込みます。
+
+* document type
+* tag
+* structured-memory category / status
+* exact date、開始日、終了日
+* relative-path substring
+
+```powershell
+python scripts\search_memory.py "検索語" --type summary --from-date 2026-01-01 --to-date 2026-12-31 --path conversations --profile
+python scripts\search_memory.py "" --type memory_item --category study_status --status active --tag 資格 --profile --json
+```
+
+`--profile`は検索結果を変えず、次を表示します。
+
+* `index load`: SQLite indexを開きschemaを確認する時間。`--no-index`ではMarkdown収集時間。
+* `filter`: SQLite側の絞り込みクエリ時間。`--no-index`では同じ条件のPython絞り込み時間。
+* `ranking`: 日本語部分一致のPython ranking時間。
+* candidates / results: ranking前の候補数と返却件数。
+
+`--json --profile`では従来の結果配列を`results`に保持し、同じJSONオブジェクトの`profile`で上記の計測値を返します。通常の`--json`出力形式は変わりません。
+
+### Long-term synthetic benchmark
+
+`scripts/search_benchmark.py`は、長期運用時の検索速度と日本語候補取得方式を比較するためのベンチマークです。現在の`conversations` / `journal` / `memory`や既存indexは読みません。毎回一時ディレクトリに合成文書とSQLite indexを作り、完了時に削除します。
+
+```powershell
+python scripts\search_benchmark.py
+python scripts\search_benchmark.py --sizes 100,1000,5000 --runs 7 --compare-japanese
+python scripts\search_benchmark.py --sizes 1000 --compare-japanese --json --output logs\search_benchmark.json
+```
+
+各文書数について、metadata filter付きのindex検索を複数回実行し、`index load`、SQLite `filter`、Python `ranking`、全体時間の中央値を出力します。`--compare-japanese`は同じ合成データで次を比較します。
+
+* 現行のPython部分一致 + ranking（本番baseline）
+* SQLite `LIKE`（候補取得のみ）
+* 一時的なSQLite bigram補助テーブル（候補取得のみ）
+* SQLite標準FTS5 tokenizer（利用可能な環境のみ、候補取得のみ）
+
+比較用bigram tableは一時DBだけに作られ、FTS5も本番検索経路へ切り替えません。`--output`の結果もGitへ追加せず、ローカル計測記録として扱います。
+
 `process_chat.py --run-codex` と `finalize_live_chat.py --run-codex` の完了後には、indexを自動再構築します。
 
 ### Phase3.4: Memory Retrieval for Answers
@@ -142,9 +185,11 @@ python scripts\search_memory.py "検索語" --json
 python scripts\search_memory.py "検索語" --type journal
 python scripts\search_memory.py "" --tag Phase3
 python scripts\search_memory.py "" --type memory_item --category study_status --status active --tag 資格
+python scripts\search_memory.py "検索語" --date 2026-07-05 --path conversations --profile
 python scripts\index_conversations.py
 python scripts\rebuild_index.py
 python scripts\build_answer_context.py "質問"
+python scripts\search_benchmark.py --compare-japanese
 ```
 
 ## 安全ルール

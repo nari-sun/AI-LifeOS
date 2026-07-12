@@ -345,23 +345,7 @@ def generate_assistant_reply_streaming_with_context(
     transient UI data and are never persisted by this function.
     """
     root = Path(root)
-    memory_context = ""
-    memory_context_result: AnswerContext | None = None
-    if include_memory_context:
-        memory_context_result = build_answer_context(root=root, question=_latest_user_content(messages))
-        memory_context = memory_context_result.text
-        _debug_log(
-            root,
-            "assistant_reply.streaming_memory_context "
-            f"enabled={memory_context_result.used_memory} "
-            f"score={memory_context_result.score}/{memory_context_result.threshold} "
-            f"references={len(memory_context_result.references)} results={len(memory_context_result.results)}",
-        )
-    prompt = build_codex_chat_prompt(
-        messages,
-        max_context_messages=max_context_messages,
-        memory_context=memory_context,
-    )
+    started_at = time.perf_counter()
 
     command = [codex_command, "app-server", "--stdio"]
     if fast_mode is not None:
@@ -442,6 +426,28 @@ def generate_assistant_reply_streaming_with_context(
         raise AppServerStreamingUnavailable("Codex app-serverの初期化がタイムアウトしました。")
 
     try:
+        # Process startup progresses while the read-only memory context is built.
+        # This removes an otherwise serial wait without changing the prompt or data flow.
+        memory_context = ""
+        memory_context_result: AnswerContext | None = None
+        memory_started_at = time.perf_counter()
+        if include_memory_context:
+            memory_context_result = build_answer_context(root=root, question=_latest_user_content(messages))
+            memory_context = memory_context_result.text
+            _debug_log(
+                root,
+                "assistant_reply.streaming_memory_context "
+                f"enabled={memory_context_result.used_memory} "
+                f"score={memory_context_result.score}/{memory_context_result.threshold} "
+                f"references={len(memory_context_result.references)} results={len(memory_context_result.results)}",
+            )
+        memory_elapsed_ms = round((time.perf_counter() - memory_started_at) * 1000)
+        prompt = build_codex_chat_prompt(
+            messages,
+            max_context_messages=max_context_messages,
+            memory_context=memory_context,
+        )
+
         send(
             {
                 "id": 1,
@@ -480,6 +486,7 @@ def generate_assistant_reply_streaming_with_context(
             turn_params["effort"] = reasoning_effort
         if service_tier:
             turn_params["serviceTier"] = service_tier
+        turn_started_at = time.perf_counter()
         send({"id": 3, "method": "turn/start", "params": turn_params})
         turn_result = wait_response(3, timeout_seconds=30.0)
         turn_id = str((turn_result.get("turn") or {}).get("id") or "")
@@ -488,6 +495,7 @@ def generate_assistant_reply_streaming_with_context(
 
         final_reply = ""
         interrupt_sent = False
+        first_delta_logged = False
         while True:
             if is_cancelled and is_cancelled() and not interrupt_sent:
                 send(
@@ -512,6 +520,15 @@ def generate_assistant_reply_streaming_with_context(
             if method == "item/agentMessage/delta":
                 delta = str(params.get("delta") or "")
                 if delta and not interrupt_sent:
+                    if not first_delta_logged:
+                        first_delta_logged = True
+                        _debug_log(
+                            root,
+                            "assistant_reply.streaming_first_delta "
+                            f"total_ms={round((time.perf_counter() - started_at) * 1000)} "
+                            f"turn_ms={round((time.perf_counter() - turn_started_at) * 1000)} "
+                            f"memory_ms={memory_elapsed_ms}",
+                        )
                     on_delta(delta)
             elif method == "item/completed":
                 item = params.get("item") or {}
@@ -532,6 +549,12 @@ def generate_assistant_reply_streaming_with_context(
                 final_reply = final_reply.strip()
                 if not final_reply:
                     raise RuntimeError("Codex app-server completed but returned an empty assistant reply.")
+                _debug_log(
+                    root,
+                    "assistant_reply.streaming_success "
+                    f"total_ms={round((time.perf_counter() - started_at) * 1000)} "
+                    f"memory_ms={memory_elapsed_ms} chars={len(final_reply)}",
+                )
                 return AssistantReplyResult(reply=final_reply, memory_context=memory_context_result)
     finally:
         _terminate_process(process)

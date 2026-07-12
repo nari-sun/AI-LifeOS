@@ -41,6 +41,7 @@ Tauri 2
 * `.txt` / `.md` / `.pdf` / `.xlsx` 添付MVP
 * ローカル個人データの読み取り専用管理画面
 * 管理 > データ整理から、未整理・整理失敗の再開可能セッションを古い順に逐次整理
+* 管理 > ChatGPTインポートから、エクスポートZIP、展開済みフォルダ、または `conversations.json` をdry-run確認して選択取り込み
 * エラー表示
 
 最初のGUIで扱わないこと:
@@ -156,7 +157,7 @@ RT-0008 では、日常的な ChatGPT 風利用に近づけるため、Chat GUI 
 
 * user 発言は Codex 呼び出し前に live JSONL へ保存されるため、停止しても user 発言は残ります。
 * user 発言のGUI即時表示は、RT-0018 の方針通り、保存済みメッセージではなくUI一時状態として扱います。bridge応答後は保存済み `messages` を正として置き換えます。
-* assistant 返答の読み上げは、Kokoro TTS を任意依存として使う方針を RT-0019 として `docs/kokoro_tts_read_aloud.md` で検討します。
+* assistant 返答の読み上げは RT-0019 として実装済みです。Kokoro TTS は任意依存であり、assistantメッセージごとの読み上げ・停止・voice選択を提供します。文ごとのWAVを生成できた順に再生キューへ追加するため、長文でも全文の合成完了を待ちません。モデルは `cache/tts/`、WAV はOS一時フォルダに置き、会話や記憶の保存処理には影響しません。セットアップ手順は `docs/kokoro_tts_read_aloud.md` を参照してください。
 * エラー時の「入力に戻す」は再送信ではありません。JSONLへの重複保存を避けるため、直前入力を下書きとして戻し、必要ならユーザーが修正して新規メッセージとして送信します。
 * Codex CLI や OS 側の都合でプロセス停止に時間がかかる場合、GUI は「停止中」と表示して bridge の終了を待ちます。
 * RT-0017で `codex app-server` の `item/agentMessage/delta` をTauri Channel経由で表示するストリーミングを追加しました。完了したassistant本文だけをJSONLへ1回保存し、停止時の部分出力は保存しません。app-server非対応時は従来の `codex.cmd exec --output-last-message` へフォールバックします。詳細は `docs/streaming_response_ui.md` を参照してください。
@@ -211,8 +212,11 @@ GUIはジョブIDをpollして、進捗、現在段階、完了結果、エラ�
 
 * 「ローカルデータ」は既存の読み取り専用データ管理画面を開く
 * 「データ整理」は、10日以内の再開可能セッションのうち未整理または整理失敗のものを古い順に1件ずつ整理する
+* 「ChatGPTインポート」は、エクスポートを読み取り専用で確認し、新規会話だけを個別選択または全選択してから最終確認を経て取り込む
 
 データ整理は確認後にだけ開始します。個別の失敗は記録して残りを続行し、停止した場合や失敗した場合は未処理のセッションを後で再実行できます。整理中は新規チャット、セッション切り替え、個別整理を無効化します。
+
+ChatGPTインポートは `raw.md` と `import_metadata.json` だけを作成します。summary、journal、memory、検索indexは更新せず、エクスポート元の絶対パスや会話本文をGUIログに残しません。詳細は `docs/chatgpt_export_import.md` を参照してください。
 
 ## RT-0014 Local Data Management
 

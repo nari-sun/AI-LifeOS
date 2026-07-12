@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import type { ReactNode } from "react"
+import { convertFileSrc } from "@tauri-apps/api/core"
 import {
   AlertTriangle,
   Archive,
@@ -10,6 +11,7 @@ import {
   Clipboard,
   ClipboardCheck,
   Database,
+  FileUp,
   FileText,
   FolderOpen,
   HardDrive,
@@ -22,6 +24,7 @@ import {
   Settings,
   Square,
   User,
+  Volume2,
   X,
 } from "lucide-react"
 
@@ -31,14 +34,21 @@ import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
 import {
   cancelMessage,
+  cancelReadAloud,
   cancelFinalizeJob,
   cancelOrganizeSessionsJob,
+  chooseChatGptExportFile,
+  chooseChatGptExportFolder,
+  discardReadAloudAudio,
+  applyChatGptImport,
   getFinalizeJob,
   getLocalDataReport,
   getOrganizeSessionsJob,
   isTauriRuntime,
   listResumableSessions,
   openLocalDataFolder,
+  previewChatGptImport,
+  readAloudStream,
   resumeSession,
   sendMessageStream,
   startFinalizeJob,
@@ -47,20 +57,23 @@ import {
 } from "@/tauri"
 import type {
   AttachmentPayload,
+  ChatGptImportPreview,
   ChatMessage,
   FinalizeJob,
   LocalDataReport,
   MemoryContextSummary,
+  ReadAloudAudioChunk,
   ResumeSession,
   OrganizeSessionsJob,
   SessionFile,
   SessionOrganization,
 } from "@/types"
 
-type BusyState = "idle" | "starting" | "generating" | "stopping" | "resuming" | "finalizing" | "refreshing"
+type BusyState = "idle" | "starting" | "generating" | "stopping" | "resuming" | "finalizing" | "refreshing" | "importing"
 type ReplyState = "idle" | "generating" | "stopping" | "stopped" | "failed" | "completed"
-type ViewMode = "chat" | "data" | "organize"
+type ViewMode = "chat" | "data" | "organize" | "import"
 type PendingMessageStatus = "sending" | "failed"
+type ReadAloudStatus = "synthesizing" | "playing" | "stopping"
 
 interface PendingUserMessage extends ChatMessage {
   pending_status: PendingMessageStatus
@@ -79,6 +92,14 @@ interface AttachmentDraft {
   truncated: boolean
 }
 
+interface ActiveReadAloud {
+  requestId: string
+  messageKey: string
+  status: ReadAloudStatus
+  audioPath: string | null
+  queuedCount: number
+}
+
 const busyLabel: Record<BusyState, string> = {
   idle: "",
   starting: "起動中",
@@ -87,6 +108,7 @@ const busyLabel: Record<BusyState, string> = {
   resuming: "再開中",
   finalizing: "整理中",
   refreshing: "更新中",
+  importing: "インポート中",
 }
 
 const replyStateLabel: Record<ReplyState, string> = {
@@ -104,6 +126,13 @@ const MAX_ATTACHMENT_TEXT_CHARS = 12_000
 const SUPPORTED_ATTACHMENT_EXTENSIONS = new Set(["txt", "md", "pdf", "xlsx"])
 const FINALIZE_JOB_STORAGE_KEY = "ai-lifeos.active-finalize-job"
 const ORGANIZE_SESSIONS_JOB_STORAGE_KEY = "ai-lifeos.organize-sessions-job"
+const TTS_VOICES = [
+  { id: "jf_alpha", label: "jf_alpha（女性）" },
+  { id: "jf_gongitsune", label: "jf_gongitsune（女性）" },
+  { id: "jf_nezumi", label: "jf_nezumi（女性）" },
+  { id: "jf_tebukuro", label: "jf_tebukuro（女性）" },
+  { id: "jm_kumo", label: "jm_kumo（男性）" },
+]
 
 function App() {
   const [session, setSession] = useState<SessionFile | null>(null)
@@ -126,10 +155,50 @@ function App() {
   const [organizeSessionsJob, setOrganizeSessionsJob] = useState<OrganizeSessionsJob | null>(null)
   const [localDataReport, setLocalDataReport] = useState<LocalDataReport | null>(null)
   const [localDataLoading, setLocalDataLoading] = useState(false)
+  const [chatGptImportSourcePath, setChatGptImportSourcePath] = useState<string | null>(null)
+  const [chatGptImportPreview, setChatGptImportPreview] = useState<ChatGptImportPreview | null>(null)
+  const [chatGptImportSelectedIds, setChatGptImportSelectedIds] = useState<string[]>([])
+  const [ttsVoice, setTtsVoice] = useState("jf_alpha")
+  const [activeReadAloud, setActiveReadAloud] = useState<ActiveReadAloud | null>(null)
+  const [readAloudError, setReadAloudError] = useState<string | null>(null)
   const viewportRef = useRef<HTMLDivElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const initializedRef = useRef(false)
   const activeRequestIdRef = useRef<string | null>(null)
+  const activeReadAloudRef = useRef<ActiveReadAloud | null>(null)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const readAloudQueueRef = useRef<ReadAloudAudioChunk[]>([])
+  const readAloudSynthesisFinishedRef = useRef(false)
+  const streamingTextRef = useRef("")
+  const streamingFrameRef = useRef<number | null>(null)
+
+  function clearStreamingAssistant() {
+    streamingTextRef.current = ""
+    if (streamingFrameRef.current !== null) {
+      window.cancelAnimationFrame(streamingFrameRef.current)
+      streamingFrameRef.current = null
+    }
+    setStreamingAssistant(null)
+  }
+
+  function queueStreamingDelta(requestId: string, delta: string, timestamp: string) {
+    streamingTextRef.current += delta
+    if (streamingFrameRef.current !== null) {
+      return
+    }
+
+    streamingFrameRef.current = window.requestAnimationFrame(() => {
+      streamingFrameRef.current = null
+      if (activeRequestIdRef.current !== requestId || !streamingTextRef.current) {
+        return
+      }
+      setStreamingAssistant({
+        role: "assistant",
+        content: streamingTextRef.current,
+        timestamp,
+      })
+    })
+  }
 
   const isBusy = busy !== "idle"
   const isFinalizeActive = finalizeJob?.status === "queued" || finalizeJob?.status === "running"
@@ -145,6 +214,7 @@ function App() {
   const finalizeButtonLabel = getFinalizeButtonLabel(organization)
   const statusLabel = organization?.label ?? "未開始"
   const eligibleSessionCount = sessions.filter((item) => item.organization.can_organize).length
+  const chatGptImportSelectedCount = chatGptImportSelectedIds.length
   const displayMessages = [
     ...messages,
     ...(pendingUserMessage ? [pendingUserMessage] : []),
@@ -172,12 +242,34 @@ function App() {
     void initialize()
   }, [])
 
+  useEffect(() => () => {
+    if (streamingFrameRef.current !== null) {
+      window.cancelAnimationFrame(streamingFrameRef.current)
+    }
+  }, [])
+
   useEffect(() => {
     const node = viewportRef.current
     if (node) {
       node.scrollTop = node.scrollHeight
     }
   }, [displayMessages, isGenerating])
+
+  useEffect(() => () => {
+    const active = activeReadAloudRef.current
+    const queuedAudio = readAloudQueueRef.current.splice(0)
+    audioRef.current?.pause()
+    audioRef.current = null
+    if (active?.requestId) {
+      void cancelReadAloud(active.requestId)
+    }
+    if (active?.audioPath) {
+      void discardReadAloudAudio(active.audioPath)
+    }
+    for (const audio of queuedAudio) {
+      void discardReadAloudAudio(audio.audio_path)
+    }
+  }, [])
 
   useEffect(() => {
     if (viewMode === "data" && !localDataReport && !localDataLoading && isTauriRuntime()) {
@@ -359,7 +451,7 @@ function App() {
     setLastMemoryContext(null)
     setInput("")
     setLastSubmittedText(content)
-    setStreamingAssistant(null)
+    clearStreamingAssistant()
     setPendingUserMessage({
       role: "user",
       content: buildPendingUserContent(content, attachments),
@@ -379,11 +471,7 @@ function App() {
           if (activeRequestIdRef.current !== requestId) {
             return
           }
-          setStreamingAssistant((current) => ({
-            role: "assistant",
-            content: `${current?.content ?? ""}${delta}`,
-            timestamp: current?.timestamp ?? streamTimestamp,
-          }))
+          queueStreamingDelta(requestId, delta, streamTimestamp)
         },
       )
       if (activeRequestIdRef.current !== requestId) {
@@ -394,7 +482,7 @@ function App() {
       const memoryContext = result.assistant ? result.memory_context : null
       setMessages(attachMemoryContextToLatestAssistant(result.messages, memoryContext))
       setPendingUserMessage(null)
-      setStreamingAssistant(null)
+      clearStreamingAssistant()
       setAttachments([])
       setLastMemoryContext(memoryContext)
       const attachmentNotice = formatAttachmentResultNotice(result.attachments)
@@ -416,7 +504,7 @@ function App() {
         setError(withNextAction(formatError(err)))
         setNotice("返答生成に失敗しました。")
         setPendingUserMessage((current) => (current ? { ...current, pending_status: "failed" } : current))
-        setStreamingAssistant(null)
+        clearStreamingAssistant()
       }
     } finally {
       if (activeRequestIdRef.current === requestId) {
@@ -613,6 +701,70 @@ function App() {
     }
   }
 
+  async function selectChatGptExportSource(kind: "file" | "folder") {
+    if (isBusy || isOrganizationActive) {
+      return
+    }
+
+    setBusy("importing")
+    setError(null)
+    try {
+      const source = kind === "file" ? await chooseChatGptExportFile() : await chooseChatGptExportFolder()
+      if (!source) {
+        setNotice("ChatGPTエクスポートの選択をキャンセルしました。")
+        return
+      }
+
+      const preview = await previewChatGptImport(source)
+      setChatGptImportSourcePath(source)
+      setChatGptImportPreview(preview)
+      setChatGptImportSelectedIds(preview.conversations.filter((item) => !item.duplicate).map((item) => item.source_id))
+      setNotice(`取り込み前確認を完了しました（新規 ${preview.new_count}件、重複 ${preview.duplicate_count}件）。`)
+    } catch (err) {
+      setError(`ChatGPTエクスポートを確認できませんでした: ${formatError(err)}`)
+    } finally {
+      setBusy("idle")
+    }
+  }
+
+  function toggleChatGptImportConversation(sourceId: string) {
+    setChatGptImportSelectedIds((current) => (
+      current.includes(sourceId) ? current.filter((item) => item !== sourceId) : [...current, sourceId]
+    ))
+  }
+
+  function selectChatGptImportConversations(sourceIds: string[]) {
+    setChatGptImportSelectedIds(sourceIds)
+  }
+
+  async function applySelectedChatGptImport() {
+    if (!chatGptImportSourcePath || !chatGptImportPreview || chatGptImportSelectedCount === 0 || isBusy || isOrganizationActive) {
+      return
+    }
+
+    const confirmed = window.confirm(
+      `選択した ${chatGptImportSelectedCount} 件を raw.md と import_metadata.json として取り込みます。summary、journal、memory、検索indexは更新しません。`,
+    )
+    if (!confirmed) {
+      return
+    }
+
+    setBusy("importing")
+    setError(null)
+    try {
+      const result = await applyChatGptImport(chatGptImportSourcePath, chatGptImportSelectedIds)
+      const refreshedPreview = await previewChatGptImport(chatGptImportSourcePath)
+      setChatGptImportPreview(refreshedPreview)
+      setChatGptImportSelectedIds([])
+      setLocalDataReport(null)
+      setNotice(`ChatGPT会話を ${result.imported_count}件取り込みました。重複 ${result.duplicate_count}件はスキップしました。記憶整理は必要な会話だけ後から実行してください。`)
+    } catch (err) {
+      setError(`ChatGPT会話の取り込みに失敗しました: ${formatError(err)}`)
+    } finally {
+      setBusy("idle")
+    }
+  }
+
   async function refreshLocalDataReport() {
     if (localDataLoading) {
       return
@@ -675,6 +827,160 @@ function App() {
     }
   }
 
+  function updateActiveReadAloud(next: ActiveReadAloud | null) {
+    activeReadAloudRef.current = next
+    setActiveReadAloud(next)
+  }
+
+  async function discardTemporaryReadAloudAudio(audioPath: string | null) {
+    if (!audioPath) {
+      return
+    }
+    try {
+      await discardReadAloudAudio(audioPath)
+    } catch {
+      // A stale temporary WAV is cleaned by the bridge on the next read-aloud request.
+    }
+  }
+
+  async function discardReadAloudChunks(chunks: ReadAloudAudioChunk[]) {
+    await Promise.all(chunks.map((chunk) => discardTemporaryReadAloudAudio(chunk.audio_path)))
+  }
+
+  async function finishReadAloud(requestId: string) {
+    const active = activeReadAloudRef.current
+    if (!active || active.requestId !== requestId) {
+      return
+    }
+
+    const queuedAudio = readAloudQueueRef.current.splice(0)
+    audioRef.current?.pause()
+    audioRef.current = null
+    readAloudSynthesisFinishedRef.current = false
+    updateActiveReadAloud(null)
+    await Promise.all([
+      discardTemporaryReadAloudAudio(active.audioPath),
+      discardReadAloudChunks(queuedAudio),
+    ])
+  }
+
+  async function playNextReadAloudChunk(requestId: string) {
+    const active = activeReadAloudRef.current
+    if (!active || active.requestId !== requestId || audioRef.current) {
+      return
+    }
+
+    const next = readAloudQueueRef.current.shift()
+    if (!next) {
+      if (readAloudSynthesisFinishedRef.current) {
+        await finishReadAloud(requestId)
+      }
+      return
+    }
+
+    const audio = new Audio(convertFileSrc(next.audio_path))
+    audio.preload = "auto"
+    let settled = false
+    const finishChunk = (playbackError?: string) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (audioRef.current === audio) {
+        audioRef.current = null
+      }
+      if (playbackError && activeReadAloudRef.current?.requestId === requestId) {
+        setReadAloudError(playbackError)
+      }
+      void discardTemporaryReadAloudAudio(next.audio_path)
+      void playNextReadAloudChunk(requestId)
+    }
+
+    audioRef.current = audio
+    updateActiveReadAloud({
+      ...active,
+      status: "playing",
+      audioPath: next.audio_path,
+      queuedCount: readAloudQueueRef.current.length,
+    })
+    audio.onended = () => finishChunk()
+    audio.onerror = () => finishChunk("読み上げ音声を再生できませんでした。")
+    try {
+      await audio.play()
+      if (activeReadAloudRef.current?.requestId === requestId) {
+        setNotice(`読み上げ中: ${next.voice}（${next.index + 1}文目）`)
+      }
+    } catch {
+      finishChunk("読み上げ音声を再生できませんでした。")
+    }
+  }
+
+  function enqueueReadAloudChunk(chunk: ReadAloudAudioChunk) {
+    const active = activeReadAloudRef.current
+    if (!active || active.requestId !== chunk.request_id) {
+      void discardTemporaryReadAloudAudio(chunk.audio_path)
+      return
+    }
+
+    readAloudQueueRef.current.push(chunk)
+    updateActiveReadAloud({ ...active, queuedCount: readAloudQueueRef.current.length })
+    void playNextReadAloudChunk(chunk.request_id)
+  }
+
+  async function stopReadAloud() {
+    const active = activeReadAloudRef.current
+    if (!active) {
+      return
+    }
+
+    updateActiveReadAloud({ ...active, status: "stopping" })
+    const queuedAudio = readAloudQueueRef.current.splice(0)
+    audioRef.current?.pause()
+    audioRef.current = null
+    readAloudSynthesisFinishedRef.current = false
+    updateActiveReadAloud(null)
+    try {
+      await cancelReadAloud(active.requestId)
+    } catch {
+      // Playback is already stopped in the WebView. The bridge cleanup is best-effort.
+    }
+    await Promise.all([
+      discardTemporaryReadAloudAudio(active.audioPath),
+      discardReadAloudChunks(queuedAudio),
+    ])
+  }
+
+  async function startReadAloud(messageKey: string, text: string) {
+    if (!isTauriRuntime() || !text.trim()) {
+      return
+    }
+
+    if (activeReadAloudRef.current) {
+      await stopReadAloud()
+    }
+
+    const requestId = createRequestId()
+    readAloudQueueRef.current = []
+    readAloudSynthesisFinishedRef.current = false
+    updateActiveReadAloud({ requestId, messageKey, status: "synthesizing", audioPath: null, queuedCount: 0 })
+    setReadAloudError(null)
+    setNotice("最初の文の読み上げ音声を準備しています。")
+    try {
+      await readAloudStream(text, ttsVoice, requestId, enqueueReadAloudChunk)
+      if (activeReadAloudRef.current?.requestId !== requestId) {
+        return
+      }
+      readAloudSynthesisFinishedRef.current = true
+      void playNextReadAloudChunk(requestId)
+    } catch (err) {
+      if (activeReadAloudRef.current?.requestId === requestId) {
+        setReadAloudError(formatError(err))
+        readAloudSynthesisFinishedRef.current = true
+        void playNextReadAloudChunk(requestId)
+      }
+    }
+  }
+
   return (
     <main className="flex h-screen min-h-0 bg-background text-foreground">
       <aside className="flex w-80 shrink-0 flex-col border-r border-border bg-sidebar">
@@ -695,7 +1001,7 @@ function App() {
           </Button>
           <Button
             className="w-full justify-start"
-            variant={viewMode === "data" || viewMode === "organize" ? "secondary" : "ghost"}
+            variant={viewMode === "data" || viewMode === "organize" || viewMode === "import" ? "secondary" : "ghost"}
             onClick={() => setManagementExpanded((current) => !current)}
           >
             <Settings className="h-4 w-4" />
@@ -726,6 +1032,17 @@ function App() {
                 <Archive className="h-4 w-4" />
                 データ整理
                 {eligibleSessionCount > 0 && <Badge variant="outline" className="ml-auto">{eligibleSessionCount}</Badge>}
+              </Button>
+              <Button
+                className="w-full justify-start"
+                variant={viewMode === "import" ? "secondary" : "ghost"}
+                onClick={() => {
+                  setManagementExpanded(true)
+                  setViewMode("import")
+                }}
+              >
+                <FileUp className="h-4 w-4" />
+                ChatGPTインポート
               </Button>
             </div>
           )}
@@ -775,10 +1092,10 @@ function App() {
         <header className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold">
-              {viewMode === "data" ? "ローカルデータ管理" : viewMode === "organize" ? "データ整理" : sessionTitle}
+              {viewMode === "data" ? "ローカルデータ管理" : viewMode === "organize" ? "データ整理" : viewMode === "import" ? "ChatGPTエクスポートを取り込む" : sessionTitle}
             </div>
             <div className="truncate text-xs text-muted-foreground">
-              {viewMode === "data" || viewMode === "organize" ? (localDataReport?.root ?? "AI-LifeOS root") : (session?.jsonl_file ?? "inbox/live")}
+              {viewMode === "data" || viewMode === "organize" || viewMode === "import" ? (localDataReport?.root ?? "AI-LifeOS root") : (session?.jsonl_file ?? "inbox/live")}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -794,6 +1111,11 @@ function App() {
               <>
                 <Badge variant="secondary">対象 {eligibleSessionCount}件</Badge>
                 {isOrganizeSessionsActive && <Badge>実行中</Badge>}
+              </>
+            ) : viewMode === "import" ? (
+              <>
+                <Badge variant="secondary">dry-run確認</Badge>
+                {chatGptImportPreview && <Badge variant="outline">選択 {chatGptImportSelectedCount}件</Badge>}
               </>
             ) : (
               <>
@@ -824,6 +1146,19 @@ function App() {
             onStart={organizeUnorganizedSessions}
             onCancel={cancelOrganizeSessions}
           />
+        ) : viewMode === "import" ? (
+          <ChatGptImportScreen
+            preview={chatGptImportPreview}
+            selectedIds={chatGptImportSelectedIds}
+            loading={busy === "importing"}
+            disabled={isBusy || isOrganizationActive}
+            onChooseFile={() => void selectChatGptExportSource("file")}
+            onChooseFolder={() => void selectChatGptExportSource("folder")}
+            onToggle={toggleChatGptImportConversation}
+            onSelectNew={selectChatGptImportConversations}
+            onClearSelection={() => setChatGptImportSelectedIds([])}
+            onApply={() => void applySelectedChatGptImport()}
+          />
         ) : (
           <>
         <div className="border-b border-border bg-muted/40 px-4 py-2">
@@ -852,6 +1187,12 @@ function App() {
           {organization?.last_error && !error && (
             <div className="mt-1 break-words text-xs text-destructive">{organization.last_error}</div>
           )}
+          {readAloudError && (
+            <div className="mt-2 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span className="break-words">読み上げ: {readAloudError}</span>
+            </div>
+          )}
           {finalizeJob && <FinalizeJobPanel job={finalizeJob} onCancel={cancelCurrentFinalizeJob} />}
           {lastMemoryContext && <MemoryContextDetails context={lastMemoryContext} className="mt-2" />}
         </div>
@@ -863,7 +1204,21 @@ function App() {
                 メッセージなし
               </div>
             ) : (
-              displayMessages.map((message, index) => <MessageBubble key={`${message.timestamp}-${index}`} message={message} />)
+              displayMessages.map((message, index) => {
+                const messageKey = `${message.timestamp}-${index}`
+                return (
+                  <MessageBubble
+                    key={messageKey}
+                    message={message}
+                    messageKey={messageKey}
+                    ttsVoice={ttsVoice}
+                    onTtsVoiceChange={setTtsVoice}
+                    readAloudStatus={activeReadAloud?.messageKey === messageKey ? activeReadAloud.status : null}
+                    onStartReadAloud={startReadAloud}
+                    onStopReadAloud={stopReadAloud}
+                  />
+                )
+              })
             )}
             {isGenerating && !streamingAssistant && <GeneratingRow stopping={busy === "stopping"} />}
           </div>
@@ -928,7 +1283,23 @@ function App() {
   )
 }
 
-function MessageBubble({ message }: { message: ChatMessage | PendingUserMessage }) {
+function MessageBubble({
+  message,
+  messageKey,
+  ttsVoice,
+  onTtsVoiceChange,
+  readAloudStatus,
+  onStartReadAloud,
+  onStopReadAloud,
+}: {
+  message: ChatMessage | PendingUserMessage
+  messageKey: string
+  ttsVoice: string
+  onTtsVoiceChange: (voice: string) => void
+  readAloudStatus: ReadAloudStatus | null
+  onStartReadAloud: (messageKey: string, text: string) => Promise<void>
+  onStopReadAloud: () => Promise<void>
+}) {
   const isUser = message.role === "user"
   const pendingStatus = "pending_status" in message ? message.pending_status : null
   return (
@@ -946,8 +1317,31 @@ function MessageBubble({ message }: { message: ChatMessage | PendingUserMessage 
           )}
         >
           {!isUser && (
-            <div className="mb-2 flex justify-end">
+            <div className="mb-2 flex flex-wrap items-center justify-end gap-2">
+              <label className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Volume2 className="h-3.5 w-3.5" />
+                <span className="sr-only">読み上げ音声</span>
+                <select
+                  value={ttsVoice}
+                  onChange={(event) => onTtsVoiceChange(event.target.value)}
+                  className="h-7 max-w-44 rounded-md border border-border bg-background px-2 text-xs text-foreground"
+                  aria-label="読み上げ音声"
+                >
+                  {TTS_VOICES.map((voice) => <option key={voice.id} value={voice.id}>{voice.label}</option>)}
+                </select>
+              </label>
               <CopyButton text={message.content} label="返答をコピー" />
+              {readAloudStatus ? (
+                <Button type="button" size="sm" variant="outline" onClick={() => void onStopReadAloud()}>
+                  {readAloudStatus === "synthesizing" || readAloudStatus === "stopping" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Square className="h-3.5 w-3.5" />}
+                  停止
+                </Button>
+              ) : (
+                <Button type="button" size="sm" variant="outline" onClick={() => void onStartReadAloud(messageKey, message.content)}>
+                  <Volume2 className="h-3.5 w-3.5" />
+                  読み上げ
+                </Button>
+              )}
             </div>
           )}
           {isUser ? <div className="whitespace-pre-wrap break-words">{message.content}</div> : <MarkdownContent content={message.content} />}
@@ -1098,6 +1492,182 @@ function OrganizeSessionsScreen({
               </div>
             )}
           </section>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function ChatGptImportScreen({
+  preview,
+  selectedIds,
+  loading,
+  disabled,
+  onChooseFile,
+  onChooseFolder,
+  onToggle,
+  onSelectNew,
+  onClearSelection,
+  onApply,
+}: {
+  preview: ChatGptImportPreview | null
+  selectedIds: string[]
+  loading: boolean
+  disabled: boolean
+  onChooseFile: () => void
+  onChooseFolder: () => void
+  onToggle: (sourceId: string) => void
+  onSelectNew: (sourceIds: string[]) => void
+  onClearSelection: () => void
+  onApply: () => void
+}) {
+  const [query, setQuery] = useState("")
+  const [fromDate, setFromDate] = useState("")
+  const [toDate, setToDate] = useState("")
+  const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds])
+  const filteredConversations = useMemo(() => {
+    if (!preview) {
+      return []
+    }
+    const normalizedQuery = query.trim().toLocaleLowerCase()
+    if (!normalizedQuery) {
+      return preview.conversations
+    }
+    return preview.conversations.filter((item) => {
+      const matchesQuery = !normalizedQuery
+        || item.title.toLocaleLowerCase().includes(normalizedQuery)
+        || item.source_id.toLocaleLowerCase().includes(normalizedQuery)
+      const createdDate = item.created_at?.slice(0, 10) ?? null
+      const matchesFromDate = !fromDate || (createdDate !== null && createdDate >= fromDate)
+      const matchesToDate = !toDate || (createdDate !== null && createdDate <= toDate)
+      return matchesQuery && matchesFromDate && matchesToDate
+    })
+  }, [preview, query, fromDate, toDate])
+  const filteredNewIds = filteredConversations.filter((item) => !item.duplicate).map((item) => item.source_id)
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
+      <div className="mx-auto flex max-w-5xl flex-col gap-5">
+        <section className="rounded-md border border-border p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2 text-sm font-semibold">
+                <FileUp className="h-4 w-4" />
+                ChatGPTエクスポートを確認して取り込む
+              </div>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
+                最初の確認ではファイルを書き換えません。会話を選択して最終確認した後だけ、raw.mdとimport_metadata.jsonを作成します。summary、journal、memory、検索indexは更新しません。
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" variant="outline" onClick={onChooseFolder} disabled={disabled}>
+                <FolderOpen className="h-4 w-4" />
+                フォルダを選択
+              </Button>
+              <Button type="button" onClick={onChooseFile} disabled={disabled}>
+                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileUp className="h-4 w-4" />}
+                ZIP / conversations.jsonを選択
+              </Button>
+            </div>
+          </div>
+        </section>
+
+        {!preview ? (
+          <section className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
+            ChatGPTのエクスポートZIP、展開済みフォルダ、または conversations.json を選択してください。
+          </section>
+        ) : (
+          <>
+            <section className="grid gap-3 sm:grid-cols-4">
+              <DataMetric icon={<FileText className="h-4 w-4" />} label="エクスポート内" value={`${preview.total_count}件`} />
+              <DataMetric icon={<CheckCircle2 className="h-4 w-4" />} label="新規" value={`${preview.new_count}件`} />
+              <DataMetric icon={<RotateCcw className="h-4 w-4" />} label="重複" value={`${preview.duplicate_count}件`} />
+              <DataMetric icon={<FileUp className="h-4 w-4" />} label="選択" value={`${selectedIds.length}件`} />
+            </section>
+
+            <section className="rounded-md border border-border p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium">{preview.source}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">重複済みの会話は選択できず、再取り込みされません。</div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button type="button" size="sm" variant="outline" onClick={() => onSelectNew(filteredNewIds)} disabled={disabled || filteredNewIds.length === 0}>
+                    表示中の新規を選択
+                  </Button>
+                  <Button type="button" size="sm" variant="ghost" onClick={onClearSelection} disabled={disabled || selectedIds.length === 0}>
+                    選択を解除
+                  </Button>
+                  <Button type="button" size="sm" onClick={onApply} disabled={disabled || selectedIds.length === 0}>
+                    {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileUp className="h-4 w-4" />}
+                    {selectedIds.length}件を取り込む
+                  </Button>
+                </div>
+              </div>
+
+              <div className="mt-4 grid gap-2 sm:grid-cols-[minmax(0,1fr)_150px_150px]">
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="タイトルまたは会話IDで絞り込み"
+                  className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                />
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  UTC開始
+                  <input
+                    type="date"
+                    value={fromDate}
+                    onChange={(event) => setFromDate(event.target.value)}
+                    aria-label="UTC作成日の開始日"
+                    className="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-sm text-foreground outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  />
+                </label>
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  UTC終了
+                  <input
+                    type="date"
+                    value={toDate}
+                    onChange={(event) => setToDate(event.target.value)}
+                    aria-label="UTC作成日の終了日"
+                    className="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-sm text-foreground outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  />
+                </label>
+              </div>
+
+              <div className="mt-3 overflow-hidden rounded-md border border-border">
+                <div className="grid grid-cols-[32px_minmax(0,1fr)_110px_80px] gap-3 border-b border-border bg-muted px-3 py-2 text-xs font-medium text-muted-foreground">
+                  <div></div>
+                  <div>会話</div>
+                  <div>作成日 (UTC)</div>
+                  <div>状態</div>
+                </div>
+                {filteredConversations.length === 0 ? (
+                  <div className="px-3 py-6 text-sm text-muted-foreground">一致する会話はありません。</div>
+                ) : (
+                  filteredConversations.map((item) => (
+                    <label key={item.source_id} className={cn("grid grid-cols-[32px_minmax(0,1fr)_110px_80px] gap-3 border-b border-border px-3 py-2 text-sm last:border-b-0", item.duplicate && "bg-muted/40 text-muted-foreground")}>
+                      <input
+                        type="checkbox"
+                        checked={selectedIdSet.has(item.source_id)}
+                        disabled={disabled || item.duplicate}
+                        onChange={() => onToggle(item.source_id)}
+                        className="mt-1 h-4 w-4"
+                      />
+                      <div className="min-w-0">
+                        <div className="truncate font-medium">{item.title}</div>
+                        <div className="mt-1 truncate font-mono text-xs text-muted-foreground">{item.source_id}</div>
+                      </div>
+                      <div className="text-xs text-muted-foreground">{formatImportDate(item.created_at)}</div>
+                      <div>
+                        <Badge variant={item.duplicate ? "outline" : "secondary"}>{item.duplicate ? "重複" : `${item.message_count}発言`}</Badge>
+                      </div>
+                    </label>
+                  ))
+                )}
+              </div>
+            </section>
+          </>
         )}
       </div>
     </div>
@@ -1667,6 +2237,22 @@ function formatDateTime(value: string) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+  }).format(date)
+}
+
+function formatImportDate(value: string | null) {
+  if (!value) {
+    return "不明"
+  }
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+  return new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "UTC",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
   }).format(date)
 }
 

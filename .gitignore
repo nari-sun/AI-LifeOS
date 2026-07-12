@@ -46,6 +46,8 @@ imports/**
 conversations.json
 
 cache/
+# Kokoro TTS のモデル、生成した一時 WAV、停止要求マーカー
+cache/tts/
 
 # Local questionnaires and private answers
 questionnaire/

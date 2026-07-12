@@ -15,6 +15,11 @@ $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $appDir = Join-Path $root "desktop\app"
 $logDir = Join-Path $root "logs"
 $logFile = Join-Path $logDir "chat_gui_task.log"
+$venvPython = Join-Path $root ".venv\Scripts\python.exe"
+
+if (Test-Path -LiteralPath $venvPython) {
+    $env:AI_LIFEOS_PYTHON = $venvPython
+}
 $env:AI_LIFEOS_GUI_LOG = Join-Path $logDir "chat_gui_bridge.log"
 $env:AI_LIFEOS_TAURI_LOG = Join-Path $logDir "chat_gui_tauri.log"
 

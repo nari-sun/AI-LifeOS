@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 import traceback
-from datetime import date, datetime, time as datetime_time
+from datetime import date, datetime, time as datetime_time, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -21,8 +21,24 @@ from codex_conversation import (
     generate_assistant_reply_with_context,
 )
 from finalize_live_chat import finalize_live_chat
+from import_chatgpt_export import (
+    ExportConversation,
+    find_imported_source_ids,
+    import_conversations,
+    load_export,
+)
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from local_data_report import build_local_data_report
+from kokoro_tts import (
+    DEFAULT_VOICE,
+    KokoroSynthesisCancelled,
+    KokoroTtsError,
+    SUPPORTED_VOICES,
+    cleanup_temp_audio,
+    synthesize_to_wav,
+    synthesize_to_wav_chunks,
+    temporary_audio_dir,
+)
 from session_store import get_session_organization, list_resumable_sessions, load_resume_session, save_session
 
 GUI_LOG_ENV = "AI_LIFEOS_GUI_LOG"
@@ -42,6 +58,7 @@ FINALIZE_ACTIVE_STATUSES = {"queued", "running"}
 FINALIZE_TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 FINALIZE_WORKER_START_GRACE_SECONDS = 5.0
 ORGANIZE_SESSIONS_JOB_NAME = "organize-sessions"
+READ_ALOUD_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class AssistantGenerationCancelled(RuntimeError):
@@ -174,6 +191,117 @@ def handle_send_message(
     }
 
 
+def handle_read_aloud(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload).resolve()
+    request_id = _read_aloud_request_id(payload.get("request_id"))
+    voice = str(payload.get("voice") or DEFAULT_VOICE).strip()
+    if voice not in SUPPORTED_VOICES:
+        raise ValueError("選択した読み上げ voice は利用できません。")
+
+    cancel_file = _read_aloud_cancel_file(root, request_id)
+    cancel_file.parent.mkdir(parents=True, exist_ok=True)
+    if cancel_file.exists():
+        cancel_file.unlink(missing_ok=True)
+        raise KokoroSynthesisCancelled("読み上げを停止しました。")
+    _tts_log(root, f"read_aloud.start request_id={request_id} voice={voice} chars={len(str(payload.get('text') or ''))}")
+    try:
+        audio_path = synthesize_to_wav(
+            root=root,
+            text=str(payload.get("text") or ""),
+            voice=voice,
+            request_id=request_id,
+            is_cancelled=cancel_file.exists,
+        )
+    except KokoroSynthesisCancelled:
+        _tts_log(root, f"read_aloud.cancelled request_id={request_id}")
+        raise
+    except KokoroTtsError as exc:
+        _tts_log(root, f"read_aloud.failed request_id={request_id} type={type(exc).__name__}")
+        raise
+    finally:
+        cancel_file.unlink(missing_ok=True)
+
+    _tts_log(root, f"read_aloud.done request_id={request_id} voice={voice}")
+    return {
+        "request_id": request_id,
+        "voice": voice,
+        "audio_file": _display_path(audio_path, root),
+        "audio_path": str(audio_path.resolve()),
+    }
+
+
+def handle_read_aloud_stream(payload: dict[str, Any], on_audio: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    root = _payload_root(payload).resolve()
+    request_id = _read_aloud_request_id(payload.get("request_id"))
+    voice = str(payload.get("voice") or DEFAULT_VOICE).strip()
+    if voice not in SUPPORTED_VOICES:
+        raise ValueError("選択した読み上げ voice は利用できません。")
+
+    cancel_file = _read_aloud_cancel_file(root, request_id)
+    cancel_file.parent.mkdir(parents=True, exist_ok=True)
+    if cancel_file.exists():
+        cancel_file.unlink(missing_ok=True)
+        raise KokoroSynthesisCancelled("読み上げを停止しました。")
+    _tts_log(root, f"read_aloud_stream.start request_id={request_id} voice={voice} chars={len(str(payload.get('text') or ''))}")
+
+    def publish_audio(audio_path: Path, index: int) -> None:
+        on_audio(
+            {
+                "request_id": request_id,
+                "voice": voice,
+                "index": index,
+                "audio_file": _display_path(audio_path, root),
+                "audio_path": str(audio_path.resolve()),
+            }
+        )
+        _tts_log(root, f"read_aloud_stream.chunk request_id={request_id} index={index}")
+
+    try:
+        audio_paths = synthesize_to_wav_chunks(
+            root=root,
+            text=str(payload.get("text") or ""),
+            voice=voice,
+            request_id=request_id,
+            is_cancelled=cancel_file.exists,
+            on_chunk=publish_audio,
+        )
+    except KokoroSynthesisCancelled:
+        _tts_log(root, f"read_aloud_stream.cancelled request_id={request_id}")
+        raise
+    except KokoroTtsError as exc:
+        _tts_log(root, f"read_aloud_stream.failed request_id={request_id} type={type(exc).__name__}")
+        raise
+    finally:
+        cancel_file.unlink(missing_ok=True)
+
+    _tts_log(root, f"read_aloud_stream.done request_id={request_id} chunks={len(audio_paths)}")
+    return {"request_id": request_id, "voice": voice, "chunk_count": len(audio_paths)}
+
+
+def handle_cancel_read_aloud(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload).resolve()
+    request_id = _read_aloud_request_id(payload.get("request_id"))
+    cancel_file = _read_aloud_cancel_file(root, request_id)
+    cancel_file.parent.mkdir(parents=True, exist_ok=True)
+    cancel_file.write_text("cancel\n", encoding="utf-8")
+    _tts_log(root, f"read_aloud.cancel_requested request_id={request_id}")
+    return {"request_id": request_id, "cancelled": True}
+
+
+def handle_discard_read_aloud_audio(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload).resolve()
+    audio_path = _read_aloud_audio_path(root, payload.get("audio_path"))
+    removed = False
+    try:
+        audio_path.unlink(missing_ok=True)
+        removed = True
+    except OSError:
+        removed = False
+    cleanup_temp_audio(_read_aloud_runtime_dir())
+    _tts_log(root, f"read_aloud.discard file={audio_path.name} removed={removed}")
+    return {"audio_file": _display_path(audio_path, root), "removed": removed}
+
+
 def handle_cancel_message(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
     request_id = _required_request_id(payload.get("request_id"))
@@ -280,6 +408,70 @@ def handle_open_local_data_folder(payload: dict[str, Any]) -> dict[str, Any]:
     _open_folder(path)
     _gui_log(root, f"open_local_data_folder.done folder={folder}")
     return {"folder": folder, "path": _display_path(path, root)}
+
+
+def handle_preview_chatgpt_import(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    source_path = _resolve_chatgpt_export_source(payload.get("source"))
+    source = _load_chatgpt_export_source(source_path)
+    duplicate_ids = find_imported_source_ids(root / "conversations")
+    conversations = [
+        _serialize_chatgpt_import_conversation(item, duplicate=item.source_id in duplicate_ids)
+        for item in source.conversations
+    ]
+    duplicate_count = sum(1 for item in conversations if item["duplicate"])
+    _gui_log(
+        root,
+        f"chatgpt_import.preview conversations={len(conversations)} new={len(conversations) - duplicate_count} duplicates={duplicate_count}",
+    )
+    return {
+        "source": source.display_name,
+        "total_count": len(conversations),
+        "new_count": len(conversations) - duplicate_count,
+        "duplicate_count": duplicate_count,
+        "conversations": conversations,
+    }
+
+
+def handle_apply_chatgpt_import(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("confirmed") is not True:
+        raise ValueError("取り込みにはGUIでの最終確認が必要です。")
+
+    root = _payload_root(payload)
+    source_path = _resolve_chatgpt_export_source(payload.get("source"))
+    source = _load_chatgpt_export_source(source_path)
+    selected_ids = _selected_chatgpt_import_ids(payload.get("selected_ids"))
+    known_ids = {item.source_id for item in source.conversations}
+    unknown_ids = selected_ids - known_ids
+    if unknown_ids:
+        raise ValueError("選択した会話がエクスポート内に見つかりません。内容を再確認してください。")
+
+    selected = [item for item in source.conversations if item.source_id in selected_ids]
+    results = import_conversations(
+        selected,
+        conversations_dir=root / "conversations",
+        source_display_name=source.display_name,
+    )
+    imported = [item for item in results if not item.duplicate]
+    duplicate_count = len(results) - len(imported)
+    _gui_log(
+        root,
+        f"chatgpt_import.apply selected={len(selected)} imported={len(imported)} duplicates={duplicate_count}",
+    )
+    return {
+        "source": source.display_name,
+        "selected_count": len(selected),
+        "imported_count": len(imported),
+        "duplicate_count": duplicate_count,
+        "imported": [
+            {
+                "source_id": item.conversation.source_id,
+                "title": item.conversation.title,
+                "raw_file": _display_path(item.raw_file, root) if item.raw_file else None,
+            }
+            for item in imported
+        ],
+    }
 
 
 def handle_start_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -502,6 +694,10 @@ def handle_run_organize_sessions_job(payload: dict[str, Any]) -> dict[str, Any]:
 
 COMMANDS = {
     "start-session": handle_start_session,
+    "read-aloud": handle_read_aloud,
+    "read-aloud-stream": handle_read_aloud_stream,
+    "cancel-read-aloud": handle_cancel_read_aloud,
+    "discard-read-aloud-audio": handle_discard_read_aloud_audio,
     "send-message": handle_send_message,
     "send-message-stream": handle_send_message,
     "cancel-message": handle_cancel_message,
@@ -511,6 +707,8 @@ COMMANDS = {
     "finalize-session": handle_finalize_session,
     "local-data-report": handle_local_data_report,
     "open-local-data-folder": handle_open_local_data_folder,
+    "preview-chatgpt-import": handle_preview_chatgpt_import,
+    "apply-chatgpt-import": handle_apply_chatgpt_import,
     "start-finalize-job": handle_start_finalize_job,
     "get-finalize-job": handle_get_finalize_job,
     "cancel-finalize-job": handle_cancel_finalize_job,
@@ -538,6 +736,10 @@ def main() -> int:
             result = handle_send_message(payload, on_delta=_write_stream_delta)
             _write_json({"type": "result", "data": {"ok": True, **result}})
             return 0
+        if args.command == "read-aloud-stream":
+            result = handle_read_aloud_stream(payload, on_audio=_write_stream_audio)
+            _write_json({"type": "result", "data": {"ok": True, **result}})
+            return 0
         result = COMMANDS[args.command](payload)
         _gui_log(root, f"command.success name={args.command} result={_result_log_summary(result)}")
         _write_json({"ok": True, **result})
@@ -546,7 +748,7 @@ def main() -> int:
         _gui_log(root, f"command.error name={args.command} {_format_exception(exc)}")
         _gui_log(root, "command.traceback\n" + traceback.format_exc())
         error_result = {"ok": False, "error": str(exc), "type": type(exc).__name__}
-        if args.command == "send-message-stream":
+        if args.command in {"send-message-stream", "read-aloud-stream"}:
             _write_json({"type": "result", "data": error_result})
         else:
             _write_json(error_result)
@@ -578,6 +780,10 @@ def _write_json(value: dict[str, Any]) -> None:
 
 def _write_stream_delta(delta: str) -> None:
     _write_json({"type": "delta", "delta": delta})
+
+
+def _write_stream_audio(audio: dict[str, Any]) -> None:
+    _write_json({"type": "audio", "audio": audio})
 
 
 def _gui_log_path(root: Path | str | None = None) -> Path:
@@ -625,6 +831,8 @@ def _payload_log_summary(payload: dict[str, Any]) -> str:
         parts.append(f"no_ai={bool(payload.get('no_ai'))}")
     if payload.get("retention_days"):
         parts.append(f"retention_days={payload['retention_days']}")
+    if isinstance(payload.get("selected_ids"), list):
+        parts.append(f"selected_ids={len(payload['selected_ids'])}")
     return ",".join(parts) if parts else "-"
 
 
@@ -638,6 +846,10 @@ def _result_log_summary(result: dict[str, Any]) -> str:
         return f"request_id={result['request_id']}"
     if "raw_file" in result:
         return f"raw_file={result['raw_file']}"
+    if "imported_count" in result:
+        return f"imported_count={result['imported_count']}"
+    if "total_count" in result:
+        return f"total_count={result['total_count']}"
     return "-"
 
 
@@ -1487,6 +1699,103 @@ def _now_iso() -> str:
 def _payload_root(payload: dict[str, Any]) -> Path:
     root = payload.get("root")
     return Path(root) if root else ROOT
+
+
+def _read_aloud_request_id(value: Any) -> str:
+    request_id = str(value or "").strip()
+    if not READ_ALOUD_REQUEST_ID_PATTERN.fullmatch(request_id):
+        raise ValueError("読み上げ request_id が不正です。")
+    return request_id
+
+
+def _read_aloud_runtime_dir() -> Path:
+    return temporary_audio_dir().resolve()
+
+
+def _read_aloud_cancel_file(root: Path, request_id: str) -> Path:
+    del root
+    return _read_aloud_runtime_dir() / f"read-aloud-{request_id}.cancel"
+
+
+def _read_aloud_audio_path(root: Path, value: Any) -> Path:
+    raw_path = str(value or "").strip()
+    if not raw_path:
+        raise ValueError("読み上げ音声ファイルが指定されていません。")
+
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(_read_aloud_runtime_dir())
+    except (OSError, ValueError) as exc:
+        raise ValueError("読み上げ用の一時音声ファイルだけを削除できます。") from exc
+    if resolved.suffix.lower() != ".wav" or not resolved.name.startswith("read-aloud-"):
+        raise ValueError("読み上げ用の一時音声ファイルだけを削除できます。")
+    return resolved
+
+
+def _tts_log(root: Path, message: str) -> None:
+    try:
+        path = root / "logs" / "tts" / "kokoro_tts.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with path.open("a", encoding="utf-8") as file:
+            file.write(f"{timestamp} pid={os.getpid()} {message}\n")
+    except OSError:
+        pass
+
+
+def _resolve_chatgpt_export_source(value: Any) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("ChatGPTエクスポートのフォルダ、zip、または conversations.json を選択してください。")
+
+    try:
+        path = Path(text).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise FileNotFoundError("選択したChatGPTエクスポートが見つかりません。") from exc
+
+    if path.is_dir() or path.suffix.lower() == ".zip" or path.name.lower() == "conversations.json":
+        return path
+    raise ValueError("ChatGPTエクスポートのフォルダ、zip、または conversations.json を選択してください。")
+
+
+def _load_chatgpt_export_source(source_path: Path):
+    try:
+        return load_export(source_path)
+    except OSError as exc:
+        raise ValueError("ChatGPTエクスポートを読み取れません。ファイルのアクセス権を確認してください。") from exc
+
+
+def _selected_chatgpt_import_ids(value: Any) -> set[str]:
+    if not isinstance(value, list):
+        raise ValueError("取り込み対象の会話を選択してください。")
+    selected_ids = {str(item).strip() for item in value if str(item).strip()}
+    if not selected_ids:
+        raise ValueError("取り込み対象の会話を少なくとも1件選択してください。")
+    return selected_ids
+
+
+def _serialize_chatgpt_import_conversation(
+    conversation: ExportConversation,
+    *,
+    duplicate: bool,
+) -> dict[str, Any]:
+    return {
+        "source_id": conversation.source_id,
+        "title": conversation.title,
+        "created_at": _chatgpt_import_timestamp(conversation.created_at),
+        "updated_at": _chatgpt_import_timestamp(conversation.updated_at),
+        "message_count": len(conversation.messages),
+        "duplicate": duplicate,
+    }
+
+
+def _chatgpt_import_timestamp(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _optional_request_id(value: Any) -> str | None:

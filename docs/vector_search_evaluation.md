@@ -31,6 +31,20 @@ Phase3.5 では、ベクトル検索をすぐ導入せず、SQLite検索で不�
 * ローカルembedding生成の安全な方法が決まる。
 * SQLite indexだけでは回答用コンテキストの品質が明確に不足する。
 
+## RT-0020の比較方法
+
+検索経路を変更する前に、合成データだけを使って次を計測します。
+
+```powershell
+python scripts\search_benchmark.py --sizes 100,1000,5000 --runs 7 --compare-japanese
+```
+
+出力はmetadata filter付きのSQLite検索について、index読込、SQL filter、Python ranking、全体時間を分けます。日本語の候補取得は、現行Python部分一致、SQLite `LIKE`、一時bigram補助table、利用可能ならSQLite標準FTS5 tokenizerの候補件数と時間を比較します。bigram tableはベンチマーク用の一時DBだけで使い、本番schemaには追加しません。
+
+品質は速度だけで判定しません。`tests/test_phase3_memory.py`の代表クエリで、期待する構造化メモリ・journal・raw会話証拠が回答コンテキストに入ることを確認します。RT-0022でFTS5を主経路候補にするには、同じ代表クエリでPython baselineより候補漏れがなく、速度面の利点もベンチマークで確認できることが必要です。
+
+この比較でSQLite検索が十分な品質と速度を保つ限り、ベクトル検索は導入しません。類義語・文脈検索の候補漏れが継続的に確認され、SQLite/FTS5の改善でも解消できない場合だけ、ローカルembeddingを含むベクトル検索を再評価します。
+
 ## 導入する場合の条件
 
 * 個人情報を外部サービスへ送らない。

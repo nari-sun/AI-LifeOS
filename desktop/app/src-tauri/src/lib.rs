@@ -13,6 +13,26 @@ async fn start_session(payload: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn read_aloud(payload: Value) -> Result<Value, String> {
+    run_bridge("read-aloud", payload)
+}
+
+#[tauri::command]
+async fn read_aloud_stream(payload: Value, on_event: Channel<Value>) -> Result<Value, String> {
+    run_bridge_stream("read-aloud-stream", payload, on_event)
+}
+
+#[tauri::command]
+async fn cancel_read_aloud(payload: Value) -> Result<Value, String> {
+    run_bridge("cancel-read-aloud", payload)
+}
+
+#[tauri::command]
+async fn discard_read_aloud_audio(payload: Value) -> Result<Value, String> {
+    run_bridge("discard-read-aloud-audio", payload)
+}
+
+#[tauri::command]
 async fn send_message(payload: Value) -> Result<Value, String> {
     run_bridge("send-message", payload)
 }
@@ -87,10 +107,25 @@ async fn open_local_data_folder(payload: Value) -> Result<Value, String> {
     run_bridge("open-local-data-folder", payload)
 }
 
+#[tauri::command]
+async fn preview_chatgpt_import(payload: Value) -> Result<Value, String> {
+    run_bridge("preview-chatgpt-import", payload)
+}
+
+#[tauri::command]
+async fn apply_chatgpt_import(payload: Value) -> Result<Value, String> {
+    run_bridge("apply-chatgpt-import", payload)
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             start_session,
+            read_aloud,
+            read_aloud_stream,
+            cancel_read_aloud,
+            discard_read_aloud_audio,
             send_message,
             send_message_stream,
             cancel_message,
@@ -105,7 +140,9 @@ pub fn run() {
             get_organize_sessions_job,
             cancel_organize_sessions_job,
             local_data_report,
-            open_local_data_folder
+            open_local_data_folder,
+            preview_chatgpt_import,
+            apply_chatgpt_import
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI-LifeOS desktop app");
@@ -126,7 +163,7 @@ fn run_bridge(command_name: &str, payload: Value) -> Result<Value, String> {
         return Err(format!("Python bridge not found: {}", script.display()));
     }
 
-    let mut child = Command::new(python_command())
+    let mut child = Command::new(python_command(&root))
         .arg(&script)
         .arg(command_name)
         .current_dir(&root)
@@ -237,7 +274,7 @@ fn run_bridge_stream(
         return Err(format!("Python bridge not found: {}", script.display()));
     }
 
-    let mut child = Command::new(python_command())
+    let mut child = Command::new(python_command(&root))
         .arg(&script)
         .arg(command_name)
         .current_dir(&root)
@@ -269,7 +306,7 @@ fn run_bridge_stream(
         let event: Value = serde_json::from_str(&line)
             .map_err(|error| format!("Python bridge returned invalid stream JSON: {error}"))?;
         match event.get("type").and_then(Value::as_str) {
-            Some("delta") => on_event
+            Some("delta") | Some("audio") => on_event
                 .send(event)
                 .map_err(|error| format!("Failed to send stream event to GUI: {error}"))?,
             Some("result") => result = event.get("data").cloned(),
@@ -330,8 +367,17 @@ fn bridge_error(value: &Value, stderr: &str) -> String {
         })
 }
 
-fn python_command() -> String {
-    env::var("AI_LIFEOS_PYTHON").unwrap_or_else(|_| "python".to_string())
+fn python_command(root: &Path) -> String {
+    if let Ok(command) = env::var("AI_LIFEOS_PYTHON") {
+        return command;
+    }
+
+    let project_venv_python = root.join(".venv").join("Scripts").join("python.exe");
+    if project_venv_python.is_file() {
+        return project_venv_python.to_string_lossy().into_owned();
+    }
+
+    "python".to_string()
 }
 
 fn project_root() -> Result<PathBuf, String> {

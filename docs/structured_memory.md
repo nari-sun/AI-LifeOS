@@ -81,7 +81,7 @@ python scripts\build_answer_context.py "安全確保支援士の学習状況を�
 
 ## RT-0020 / RT-0022との境界
 
-RT-0020本体の長期ベンチマークと検索最適化は未完です。RT-0023着手前提として、次の評価軸とカテゴリ代表クエリだけを先に固定しました。
+RT-0020では、合成データのみを使う長期ベンチマーク、`search_memory.py --profile`、SQLite metadata filter pushdownを実装しました。RT-0023では、その共通評価軸とカテゴリ代表クエリを使って検索品質を維持します。
 
 評価軸:
 
@@ -89,7 +89,7 @@ RT-0020本体の長期ベンチマークと検索最適化は未完です。RT-0
 * category / status / tagのAND絞り込みに無関係な項目が混ざらないこと。
 * indexあり・`--no-index`でカテゴリ絞り込みの結果集合が一致すること。
 * 回答コンテキストが記憶参照を起動し、構造化項目をjournal / raw / summaryより先に配置すること。
-* RT-0020の将来ベンチマークでは、文書数別にindex読込、SQL filter、Python ranking、全体時間を分けて測ること。
+* RT-0020の`search_benchmark.py`で、文書数別にindex読込、SQL filter、Python ranking、全体時間を分けて測ること。
 
 代表クエリ:
 

@@ -13,6 +13,7 @@ sys.path.insert(0, str(SCRIPTS))
 import build_answer_context  # noqa: E402
 import memory_index  # noqa: E402
 import memory_items  # noqa: E402
+import search_benchmark  # noqa: E402
 
 
 class Phase3MemoryTests(unittest.TestCase):
@@ -188,6 +189,85 @@ class Phase3MemoryTests(unittest.TestCase):
                 {str(result.path.relative_to(root)) for result in indexed},
                 {str(result.path.relative_to(root)) for result in direct},
             )
+
+    def test_profile_reports_sql_pushdown_for_metadata_filters(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            memory_items.create_memory_item(
+                root,
+                memory_items.StructuredMemoryItem(
+                    id="mem_20260706_001",
+                    category="study_status",
+                    category_label="学習状況",
+                    status="active",
+                    source="conversations/2026/07/other/raw.md",
+                    source_date="2026-07-06",
+                    confidence="explicit",
+                    tags=("security", "資格"),
+                    created_at="2026-07-06T10:10:00+09:00",
+                    updated_at="2026-07-06T10:10:00+09:00",
+                    content="- 別の日付の学習メモ。",
+                ),
+            )
+            memory_index.rebuild_index(root)
+
+            indexed, profile = memory_index.search_memory_with_profile(
+                root=root,
+                query="",
+                document_types=("memory_item",),
+                tag="資格",
+                category="study_status",
+                status="active",
+                date="2026-07-05",
+                date_from="2026-07-01",
+                date_to="2026-07-05",
+                path="memory/items/mem_20260705",
+            )
+            direct, direct_profile = memory_index.search_memory_with_profile(
+                root=root,
+                query="",
+                document_types=("memory_item",),
+                tag="資格",
+                category="study_status",
+                status="active",
+                date="2026-07-05",
+                date_from="2026-07-01",
+                date_to="2026-07-05",
+                path="memory/items/mem_20260705",
+                use_index=False,
+            )
+
+            self.assertEqual(1, len(indexed))
+            self.assertEqual(
+                {str(result.path.relative_to(root)) for result in indexed},
+                {str(result.path.relative_to(root)) for result in direct},
+            )
+            self.assertEqual("sqlite", profile.source)
+            self.assertEqual(1, profile.candidate_count)
+            self.assertEqual(
+                ("document_type", "tag", "category", "status", "date", "date_from", "date_to", "path"),
+                profile.filters,
+            )
+            self.assertEqual("markdown", direct_profile.source)
+            self.assertGreaterEqual(profile.total_ms, profile.ranking_ms)
+
+    def test_synthetic_search_benchmark_never_uses_personal_documents(self):
+        result = search_benchmark.run_benchmark(
+            document_count=20,
+            query="長期検索",
+            runs=1,
+            compare_japanese=True,
+        )
+
+        self.assertEqual(20, result.document_count)
+        self.assertEqual(2, result.candidate_count)
+        self.assertEqual(2, result.result_count)
+        self.assertTrue(result.japanese_comparison)
+        baseline = next(
+            item for item in result.japanese_comparison if item.method == "python_partial_match_rank"
+        )
+        self.assertTrue(baseline.available)
+        self.assertEqual(2, baseline.matched_documents)
 
     def test_legacy_index_remains_searchable_before_rebuild(self):
         with tempfile.TemporaryDirectory() as temp_dir:

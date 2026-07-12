@@ -284,6 +284,32 @@ class CodexConversationTests(unittest.TestCase):
         self.assertNotIn("serviceTier", thread_start["params"])
         self.assertNotIn("serviceTier", turn_start["params"])
 
+    def test_streaming_starts_app_server_before_building_memory_context(self):
+        process = FakeAppServerProcess()
+        call_order = []
+        original_build = codex_conversation.build_answer_context
+
+        def fake_build(**kwargs):
+            call_order.append("memory")
+            return codex_conversation.AnswerContext(should_use_memory=False, text="", results=())
+
+        def fake_popen(*args, **kwargs):
+            call_order.append("popen")
+            return process
+
+        codex_conversation.build_answer_context = fake_build
+        try:
+            codex_conversation.generate_assistant_reply_streaming_with_context(
+                root=ROOT,
+                messages=[create_live_message("user", "Hello")],
+                on_delta=lambda _: None,
+                popen=fake_popen,
+            )
+        finally:
+            codex_conversation.build_answer_context = original_build
+
+        self.assertLess(call_order.index("popen"), call_order.index("memory"))
+
     def test_streaming_app_server_interrupt_suppresses_delta_and_raises(self):
         process = FakeAppServerProcess(complete_status="interrupted")
         deltas = []

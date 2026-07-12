@@ -20,10 +20,118 @@ sys.path.insert(0, str(SCRIPTS))
 import chat_gui_bridge  # noqa: E402
 import build_answer_context  # noqa: E402
 import codex_conversation  # noqa: E402
+import kokoro_tts  # noqa: E402
 from live_session import create_live_session  # noqa: E402
 
 
 class ChatGuiBridgeTests(unittest.TestCase):
+    def test_read_aloud_passes_only_temporary_audio_metadata_and_does_not_log_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio_path = root / "temporary.wav"
+            audio_path.write_bytes(b"RIFF")
+            private_text = "PRIVATE_READ_ALOUD_TEXT"
+
+            with mock.patch.object(chat_gui_bridge, "synthesize_to_wav", return_value=audio_path) as synthesize:
+                result = chat_gui_bridge.handle_read_aloud(
+                    {
+                        "root": str(root),
+                        "request_id": "tts-test",
+                        "voice": "jf_alpha",
+                        "text": private_text,
+                    }
+                )
+
+            self.assertEqual("tts-test", result["request_id"])
+            self.assertEqual("jf_alpha", result["voice"])
+            self.assertEqual(str(audio_path.resolve()), result["audio_path"])
+            self.assertEqual(private_text, synthesize.call_args.kwargs["text"])
+            self.assertEqual("jf_alpha", synthesize.call_args.kwargs["voice"])
+            log_text = (root / "logs" / "tts" / "kokoro_tts.log").read_text(encoding="utf-8")
+            self.assertNotIn(private_text, log_text)
+
+    def test_read_aloud_rejects_voice_outside_allowlist(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "voice"):
+                chat_gui_bridge.handle_read_aloud(
+                    {
+                        "root": temp_dir,
+                        "request_id": "tts-test",
+                        "voice": "unknown",
+                        "text": "テスト",
+                    }
+                )
+
+    def test_read_aloud_stream_publishes_each_audio_chunk_without_logging_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.wav"
+            second = root / "second.wav"
+            first.write_bytes(b"RIFF")
+            second.write_bytes(b"RIFF")
+            events = []
+
+            def fake_synthesize(**kwargs):
+                kwargs["on_chunk"](first, 0)
+                kwargs["on_chunk"](second, 1)
+                return [first, second]
+
+            with mock.patch.object(chat_gui_bridge, "synthesize_to_wav_chunks", side_effect=fake_synthesize):
+                result = chat_gui_bridge.handle_read_aloud_stream(
+                    {
+                        "root": str(root),
+                        "request_id": "tts-stream",
+                        "voice": "jf_alpha",
+                        "text": "PRIVATE_STREAM_TEXT",
+                    },
+                    events.append,
+                )
+
+            self.assertEqual(2, result["chunk_count"])
+            self.assertEqual([0, 1], [event["index"] for event in events])
+            self.assertEqual([str(first.resolve()), str(second.resolve())], [event["audio_path"] for event in events])
+            log_text = (root / "logs" / "tts" / "kokoro_tts.log").read_text(encoding="utf-8")
+            self.assertNotIn("PRIVATE_STREAM_TEXT", log_text)
+
+    def test_read_aloud_honors_a_stop_request_that_arrives_before_synthesis_starts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_dir = root / "runtime-tts"
+            runtime_dir.mkdir()
+            cancel_file = runtime_dir / "read-aloud-tts-test.cancel"
+            cancel_file.write_text("cancel\n", encoding="utf-8")
+
+            with mock.patch.object(chat_gui_bridge, "_read_aloud_runtime_dir", return_value=runtime_dir):
+                with self.assertRaisesRegex(kokoro_tts.KokoroSynthesisCancelled, "停止"):
+                    chat_gui_bridge.handle_read_aloud(
+                        {
+                            "root": str(root),
+                            "request_id": "tts-test",
+                            "voice": "jf_alpha",
+                            "text": "テスト",
+                        }
+                    )
+
+            self.assertFalse(cancel_file.exists())
+
+    def test_cancel_and_discard_read_aloud_are_limited_to_runtime_temp_audio(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_dir = root / "runtime-tts"
+            runtime_dir.mkdir()
+            audio_path = runtime_dir / "read-aloud-tts-test.wav"
+            audio_path.write_bytes(b"RIFF")
+
+            with mock.patch.object(chat_gui_bridge, "_read_aloud_runtime_dir", return_value=runtime_dir):
+                cancelled = chat_gui_bridge.handle_cancel_read_aloud({"root": str(root), "request_id": "tts-test"})
+                discarded = chat_gui_bridge.handle_discard_read_aloud_audio({"root": str(root), "audio_path": str(audio_path)})
+
+            self.assertTrue(cancelled["cancelled"])
+            self.assertTrue(discarded["removed"])
+            self.assertFalse(audio_path.exists())
+            with self.assertRaisesRegex(ValueError, "一時音声"):
+                chat_gui_bridge.handle_discard_read_aloud_audio({"root": str(root), "audio_path": str(root / "outside.wav")})
+
     def test_start_session_returns_live_jsonl_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -33,6 +141,81 @@ class ChatGuiBridgeTests(unittest.TestCase):
             self.assertEqual(result["messages"], [])
             self.assertTrue(result["session"]["jsonl_file"].startswith("inbox"))
             self.assertTrue((root / result["session"]["jsonl_file"]).parent.exists())
+
+    def test_chatgpt_import_preview_and_apply_require_explicit_selection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "lifeos"
+            source_dir = Path(temp_dir) / "chatgpt-export"
+            source_dir.mkdir()
+            source_path = source_dir / "conversations.json"
+            source_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "gui-import-1",
+                            "title": "GUI import conversation",
+                            "create_time": 1767225600,
+                            "update_time": 1767225660,
+                            "current_node": "assistant-node",
+                            "mapping": {
+                                "root": {"id": "root", "parent": None, "message": None},
+                                "user-node": {
+                                    "id": "user-node",
+                                    "parent": "root",
+                                    "message": {
+                                        "author": {"role": "user"},
+                                        "create_time": 1767225601,
+                                        "content": {"parts": ["GUIから取り込みたい"]},
+                                    },
+                                },
+                                "assistant-node": {
+                                    "id": "assistant-node",
+                                    "parent": "user-node",
+                                    "message": {
+                                        "author": {"role": "assistant"},
+                                        "create_time": 1767225602,
+                                        "content": {"parts": ["安全に確認します"]},
+                                    },
+                                },
+                            },
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            preview = chat_gui_bridge.handle_preview_chatgpt_import({"root": str(root), "source": str(source_path)})
+
+            self.assertEqual(1, preview["total_count"])
+            self.assertEqual(1, preview["new_count"])
+            self.assertFalse(preview["conversations"][0]["duplicate"])
+            self.assertFalse((root / "conversations").exists())
+            with self.assertRaisesRegex(ValueError, "最終確認"):
+                chat_gui_bridge.handle_apply_chatgpt_import(
+                    {"root": str(root), "source": str(source_path), "selected_ids": ["gui-import-1"]}
+                )
+
+            result = chat_gui_bridge.handle_apply_chatgpt_import(
+                {
+                    "root": str(root),
+                    "source": str(source_path),
+                    "selected_ids": ["gui-import-1"],
+                    "confirmed": True,
+                }
+            )
+
+            self.assertEqual(1, result["selected_count"])
+            self.assertEqual(1, result["imported_count"])
+            raw_file = root / result["imported"][0]["raw_file"]
+            self.assertTrue(raw_file.exists())
+            self.assertTrue((raw_file.parent / "import_metadata.json").exists())
+            self.assertFalse((root / "journal").exists())
+            self.assertFalse((root / "memory").exists())
+            refreshed_preview = chat_gui_bridge.handle_preview_chatgpt_import({"root": str(root), "source": str(source_path)})
+            self.assertTrue(refreshed_preview["conversations"][0]["duplicate"])
+            log_text = (root / "logs" / "chat_gui_bridge.log").read_text(encoding="utf-8")
+            self.assertNotIn(str(source_path), log_text)
 
     def test_send_message_saves_user_message_without_ai(self):
         with tempfile.TemporaryDirectory() as temp_dir:
