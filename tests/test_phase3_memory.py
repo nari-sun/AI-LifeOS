@@ -474,6 +474,119 @@ class Phase3MemoryTests(unittest.TestCase):
             self.assertIn("PERSONAL_SENTINEL", context.text)
             self.assertTrue(any(result.document_type == "raw_chunk" for result in context.results))
 
+    def test_role_aware_evidence_pairs_chatgpt_import_and_live_responses(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cases = (
+                (
+                    "chatgpt",
+                    ("Source: ChatGPT export", "Title: Imported role evidence"),
+                    "IMPORTED_USER_SENTINEL",
+                    "IMPORTED_ASSISTANT_CONCLUSION",
+                ),
+                (
+                    "live",
+                    ("Session: Live role evidence",),
+                    "LIVE_USER_SENTINEL",
+                    "LIVE_ASSISTANT_CONCLUSION",
+                ),
+            )
+            for index, (name, headers, user_marker, assistant_marker) in enumerate(cases, start=1):
+                session = root / "conversations" / "2026" / "07" / f"2026-07-11_12000{index}"
+                session.mkdir(parents=True)
+                (session / "raw.md").write_text(
+                    "\n".join(
+                        (
+                            "# Chat Log",
+                            "",
+                            "Date: 2026-07-11",
+                            *headers,
+                            "",
+                            "## User",
+                            "",
+                            "Timestamp: 2026-07-11T12:00:00+09:00",
+                            "",
+                            f"AI-LifeOS {user_marker}",
+                            "",
+                            "## Assistant",
+                            "",
+                            "Timestamp: 2026-07-11T12:01:00+09:00",
+                            "",
+                            assistant_marker,
+                            "",
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+
+            memory_index.rebuild_index(root)
+            for name, _, user_marker, assistant_marker in cases:
+                with self.subTest(source=name):
+                    context = build_answer_context.build_answer_context(
+                        root=root,
+                        question=f"AI-LifeOS {user_marker}",
+                    )
+
+                    raw_chunks = [item for item in context.results if item.document_type == "raw_chunk"]
+                    self.assertEqual(["user", "assistant"], [item.speaker_role for item in raw_chunks])
+                    self.assertEqual([1, 2], [item.message_number for item in raw_chunks])
+                    self.assertIn(user_marker, context.text)
+                    self.assertIn(assistant_marker, context.text)
+                    self.assertIn("Role: user", context.text)
+                    self.assertIn("Role: assistant", context.text)
+                    roles = [reference.speaker_role for reference in context.references if reference.document_type == "raw_chunk"]
+                    self.assertEqual(["user", "assistant"], roles)
+                    expected_title = "Imported role evidence" if name == "chatgpt" else "Live role evidence"
+                    self.assertTrue(all(expected_title in item.title for item in raw_chunks))
+
+    def test_role_aware_evidence_respects_user_and_assistant_queries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = root / "conversations" / "2026" / "07" / "2026-07-11_130000"
+            session.mkdir(parents=True)
+            (session / "raw.md").write_text(
+                "\n".join(
+                    (
+                        "# Chat Log",
+                        "",
+                        "Date: 2026-07-11",
+                        "Session: Role-specific evidence",
+                        "",
+                        "## User",
+                        "",
+                        "Timestamp: 2026-07-11T13:00:00+09:00",
+                        "",
+                        "AI-LifeOS ROLE_USER_SENTINEL",
+                        "",
+                        "## Assistant",
+                        "",
+                        "Timestamp: 2026-07-11T13:01:00+09:00",
+                        "",
+                        "ROLE_ASSISTANT_CONCLUSION",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            memory_index.rebuild_index(root)
+
+            user_context = build_answer_context.build_answer_context(
+                root=root,
+                question="AI-LifeOS what did I say ROLE_USER_SENTINEL",
+            )
+            user_chunks = [item for item in user_context.results if item.document_type == "raw_chunk"]
+            self.assertEqual(["user"], [item.speaker_role for item in user_chunks])
+            self.assertIn("ROLE_USER_SENTINEL", user_context.text)
+            self.assertNotIn("ROLE_ASSISTANT_CONCLUSION", user_context.text)
+
+            assistant_context = build_answer_context.build_answer_context(
+                root=root,
+                question="AI-LifeOS assistant response ROLE_USER_SENTINEL",
+            )
+            assistant_chunks = [item for item in assistant_context.results if item.document_type == "raw_chunk"]
+            self.assertEqual(["user", "assistant"], [item.speaker_role for item in assistant_chunks])
+            self.assertIn("ROLE_ASSISTANT_CONCLUSION", assistant_context.text)
+
     def test_answer_context_records_reference_sources(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = self.make_root(temp_dir)

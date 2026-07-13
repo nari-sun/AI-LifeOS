@@ -217,6 +217,18 @@ class ChatGuiBridgeTests(unittest.TestCase):
             log_text = (root / "logs" / "chat_gui_bridge.log").read_text(encoding="utf-8")
             self.assertNotIn(str(source_path), log_text)
 
+    def test_chatgpt_import_preview_accepts_split_conversation_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "lifeos"
+            source_path = Path(temp_dir) / "conversations-000.json"
+            source_path.write_text("[]", encoding="utf-8")
+
+            preview = chat_gui_bridge.handle_preview_chatgpt_import(
+                {"root": str(root), "source": str(source_path)}
+            )
+
+            self.assertEqual(0, preview["total_count"])
+
     def test_send_message_saves_user_message_without_ai(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -373,6 +385,23 @@ class ChatGuiBridgeTests(unittest.TestCase):
             self.assertGreaterEqual(result["memory_context"]["reference_count"], 1)
             paths = {reference["path"] for reference in result["memory_context"]["references"]}
             self.assertIn("memory/preferences.md", paths)
+
+    def test_memory_context_reference_serializes_speaker_role(self):
+        reference = build_answer_context.MemoryContextReference(
+            path="conversations/2026/07/example/raw.md",
+            document_type="raw_chunk",
+            title="Example / Assistant message 2",
+            date="2026-07-11",
+            snippet="ROLE_ASSISTANT_SENTINEL",
+            score=4,
+            speaker_role="assistant",
+            message_number=2,
+        )
+
+        result = chat_gui_bridge._serialize_memory_reference(reference)
+
+        self.assertEqual("assistant", result["speaker_role"])
+        self.assertEqual(2, result["message_number"])
 
     def test_send_message_uses_attachment_context_without_saving_body(self):
         with tempfile.TemporaryDirectory() as temp_dir:

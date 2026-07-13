@@ -160,6 +160,16 @@ python scripts\codex_conversation.py --no-memory-context
 
 CLI と GUI は回答生成後に `記憶参照: あり / なし` を表示します。参照ありの場合は、回答時に使った参照元ファイルパス、件数、短い抜粋を保持し、必要に応じて確認できます。通常の assistant 返答本文には出典パスを混ぜず、参照情報はメタデータとして表示します。
 
+### 会話発言の役割付き参照
+
+`raw.md` の `## User` / `## Assistant` 発言は、検索indexで `raw_chunk` として役割（`user` / `assistant`）と発言順を保持します。回答用memory contextは、関連するユーザー発言だけでなく、対応するAI応答も役割ラベル付きで参照します。
+
+* 「自分が何と言ったか」の照会では、user発言だけを根拠にします。
+* AIの回答・説明・結論を尋ねる照会では、対応するassistant応答を根拠にします。
+* 過去会話全体の照会では、対応するuser / assistant発言を役割付きで時系列順に参照します。
+
+この仕組みはChatGPT exportから取り込んだ会話と、AI-LifeOSのLive Conversation / Chat GUIから保存された会話の両方に適用されます。役割情報はSQLite indexの派生データなので、`python scripts\rebuild_index.py`で再生成できます。
+
 ### Phase3.5: Vector Search Evaluation
 
 ベクトル検索は本番導入していません。評価結果は `docs/vector_search_evaluation.md` にまとめています。

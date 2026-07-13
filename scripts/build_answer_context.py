@@ -7,6 +7,40 @@ from memory_items import load_categories
 
 
 MEMORY_SCORE_THRESHOLD = 3
+RAW_EVIDENCE_LIMIT = 2
+RELATED_RAW_CHUNK_LIMIT = 50
+
+USER_EVIDENCE_SIGNALS = (
+    "私が",
+    "俺が",
+    "僕が",
+    "自分が",
+    "私の発言",
+    "俺の発言",
+    "僕の発言",
+    "何と言った",
+    "what did i say",
+    "my message",
+)
+
+ASSISTANT_EVIDENCE_SIGNALS = (
+    "AIの回答",
+    "AIの応答",
+    "ChatGPTの回答",
+    "ChatGPTの応答",
+    "Codexの回答",
+    "Codexの応答",
+    "assistantの回答",
+    "assistantの応答",
+    "結論",
+    "提案",
+    "説明",
+    "答え",
+    "回答",
+    "what did ai",
+    "assistant response",
+    "conclusion",
+)
 
 
 @dataclass(frozen=True)
@@ -109,6 +143,8 @@ class MemoryContextReference:
     date: str | None
     snippet: str
     score: int
+    speaker_role: str | None = None
+    message_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -214,7 +250,12 @@ def build_answer_context(
         document_types=("raw_chunk",),
         use_index=use_index,
     )
-    raw_chunk_results = _prioritize_raw_user_evidence(raw_chunk_candidates, limit=min(max(max_results, 1), 2))
+    raw_chunk_results = _select_role_aware_raw_evidence(
+        root=root,
+        candidates=raw_chunk_candidates,
+        question=question,
+        use_index=use_index,
+    )
 
     lines = [
         "AI-LifeOS memory context (read-only).",
@@ -318,13 +359,21 @@ def _format_result(result: MemorySearchResult, root: Path) -> list[str]:
     lines = [
         f"- Date: {result.date or 'unknown'}",
         f"  Type: {result.document_type}",
-        f"  Source: {_display_path(result.path, root)}",
-        f"  Snippet: {result.snippet}",
     ]
+    if result.speaker_role:
+        lines.append(f"  Role: {result.speaker_role}")
+    if result.message_number is not None:
+        lines.append(f"  Message: {result.message_number}")
     if result.category:
-        lines.insert(2, f"  Category: {result.category} ({result.category_label or result.category})")
+        lines.append(f"  Category: {result.category} ({result.category_label or result.category})")
     if result.status:
-        lines.insert(3, f"  Status: {result.status}")
+        lines.append(f"  Status: {result.status}")
+    lines.extend(
+        [
+            f"  Source: {_display_path(result.path, root)}",
+            f"  Snippet: {result.snippet}",
+        ]
+    )
     if result.source:
         lines.append(f"  Evidence: {result.source}")
     return lines
@@ -384,11 +433,123 @@ def _search_structured_memory(
     return deduped[: max(max_results, 1)]
 
 
-def _prioritize_raw_user_evidence(
-    candidates: list[MemorySearchResult], limit: int
+def _select_role_aware_raw_evidence(
+    root: Path,
+    candidates: list[MemorySearchResult],
+    question: str,
+    use_index: bool,
 ) -> list[MemorySearchResult]:
-    user_messages = [result for result in candidates if " / user message " in result.title.lower()]
-    return (user_messages or candidates)[: max(limit, 1)]
+    if not candidates:
+        return []
+
+    scope = _raw_evidence_scope(question)
+    anchor = _select_raw_evidence_anchor(candidates, scope)
+    if anchor is None:
+        return []
+    if scope == "user":
+        return [anchor]
+
+    related = _related_raw_chunks(root, anchor, use_index)
+    if not related:
+        return [anchor]
+    return _paired_raw_evidence(anchor, related, limit=RAW_EVIDENCE_LIMIT)
+
+
+def _raw_evidence_scope(question: str) -> str:
+    normalized = question.lower()
+    if any(signal.lower() in normalized for signal in ASSISTANT_EVIDENCE_SIGNALS):
+        return "assistant"
+    if any(signal.lower() in normalized for signal in USER_EVIDENCE_SIGNALS):
+        return "user"
+    return "both"
+
+
+def _select_raw_evidence_anchor(
+    candidates: list[MemorySearchResult], scope: str
+) -> MemorySearchResult | None:
+    if scope == "user":
+        return next((result for result in candidates if result.speaker_role == "user"), None)
+    if scope == "assistant":
+        return next(
+            (result for result in candidates if result.speaker_role == "assistant"),
+            candidates[0],
+        )
+    return candidates[0]
+
+
+def _related_raw_chunks(
+    root: Path, anchor: MemorySearchResult, use_index: bool
+) -> list[MemorySearchResult]:
+    results = search_memory(
+        root=root,
+        query="",
+        limit=RELATED_RAW_CHUNK_LIMIT,
+        document_types=("raw_chunk",),
+        path=_display_path(anchor.path, root),
+        use_index=use_index,
+    )
+    return sorted(
+        results,
+        key=lambda result: (
+            result.message_number is None,
+            result.message_number if result.message_number is not None else 0,
+        ),
+    )
+
+
+def _paired_raw_evidence(
+    anchor: MemorySearchResult,
+    related: list[MemorySearchResult],
+    limit: int,
+) -> list[MemorySearchResult]:
+    if anchor.message_number is None:
+        return [anchor]
+
+    if anchor.speaker_role == "assistant":
+        preceding_user = _nearest_related_chunk(
+            related,
+            message_number=anchor.message_number,
+            speaker_role="user",
+            before=True,
+        )
+        pair = [item for item in (preceding_user, anchor) if item is not None]
+    else:
+        following_assistant = _nearest_related_chunk(
+            related,
+            message_number=anchor.message_number,
+            speaker_role="assistant",
+            before=False,
+        )
+        pair = [item for item in (anchor, following_assistant) if item is not None]
+
+    unique: list[MemorySearchResult] = []
+    seen: set[tuple[str, str | None, int | None]] = set()
+    for result in pair:
+        key = (str(result.path), result.speaker_role, result.message_number)
+        if key not in seen:
+            seen.add(key)
+            unique.append(result)
+    return unique[: max(limit, 1)]
+
+
+def _nearest_related_chunk(
+    related: list[MemorySearchResult],
+    message_number: int,
+    speaker_role: str,
+    before: bool,
+) -> MemorySearchResult | None:
+    eligible = [
+        result
+        for result in related
+        if result.speaker_role == speaker_role
+        and result.message_number is not None
+        and (result.message_number < message_number if before else result.message_number > message_number)
+    ]
+    if not eligible:
+        return None
+    return max(eligible, key=lambda result: result.message_number or 0) if before else min(
+        eligible, key=lambda result: result.message_number or 0
+    )
 
 
 def _reference_from_result(result: MemorySearchResult, root: Path) -> MemoryContextReference:
@@ -399,16 +560,24 @@ def _reference_from_result(result: MemorySearchResult, root: Path) -> MemoryCont
         date=result.date,
         snippet=result.snippet,
         score=result.score,
+        speaker_role=result.speaker_role,
+        message_number=result.message_number,
     )
 
 
 def _dedupe_references(references: list[MemoryContextReference]) -> list[MemoryContextReference]:
     result: list[MemoryContextReference] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str | None, int | None]] = set()
     for reference in references:
-        if reference.path in seen:
+        key = (
+            reference.path,
+            reference.document_type,
+            reference.speaker_role,
+            reference.message_number,
+        )
+        if key in seen:
             continue
-        seen.add(reference.path)
+        seen.add(key)
         result.append(reference)
     return result
 

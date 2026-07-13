@@ -55,7 +55,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - 保存済みの raw.md / summary.md / journal / memory を検索する
 - `memory/search_index.sqlite3` を再構築可能な検索indexとして生成する
 - 私的な質問や好みに関係する会話では、`memory/long_term.md` と `memory/preferences.md` を読み取り専用コンテキストとして回答に渡す
-- ChatGPT exportのフォルダ、zip、または `conversations.json` をCLIまたはGUIでdry-run確認してから、選択した会話だけをraw.mdへ取り込む
+- ChatGPT exportのフォルダ、zip、`conversations.json`、または分割された `conversations-*.json` をCLIまたはGUIでdry-run確認してから、選択した会話だけをraw.mdへ取り込む
 - `python -m unittest` で Python 側の保存・再開・GUIブリッジ処理をテストする
 
 ## Phase Overview

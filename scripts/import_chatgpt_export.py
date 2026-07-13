@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import zipfile
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from typing import Any, Iterable
 ROOT = Path(__file__).resolve().parents[1]
 VALID_ROLES = {"user", "assistant"}
 METADATA_FILE = "import_metadata.json"
+CONVERSATION_FILE_PATTERN = re.compile(r"^conversations(?:-(\d+))?\.json$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -51,19 +53,23 @@ def load_export(source: Path | str) -> ExportSource:
         raise FileNotFoundError(f"エクスポート元が見つかりません: {source_path}")
 
     if source_path.is_dir():
-        matches = sorted(path for path in source_path.rglob("conversations.json") if path.is_file())
+        matches = _find_conversation_files(source_path)
         if not matches:
-            raise FileNotFoundError("フォルダ内に conversations.json が見つかりません。")
-        if len(matches) > 1:
-            raise ValueError("conversations.json が複数あります。対象ファイルを直接指定してください。")
-        payload = _load_json_bytes(matches[0].read_bytes())
-        display_name = f"{source_path.name}/{matches[0].relative_to(source_path).as_posix()}"
+            raise FileNotFoundError("フォルダ内に conversations.json または conversations-*.json が見つかりません。")
+        file_names = [path.relative_to(source_path).as_posix() for path in matches]
+        payload = _merge_conversation_payloads(
+            (file_name, _load_json_bytes(path.read_bytes()))
+            for file_name, path in zip(file_names, matches)
+        )
+        display_name = _source_display_name(source_path.name, file_names)
     elif source_path.suffix.lower() == ".zip":
-        payload, member_name = _load_from_zip(source_path)
-        display_name = f"{source_path.name}/{member_name}"
+        payload, member_names = _load_from_zip(source_path)
+        display_name = _source_display_name(source_path.name, member_names)
     else:
-        if source_path.name.lower() != "conversations.json":
-            raise ValueError("JSONファイルを直接指定する場合は conversations.json を指定してください。")
+        if not CONVERSATION_FILE_PATTERN.fullmatch(source_path.name):
+            raise ValueError(
+                "JSONファイルを直接指定する場合は conversations.json または conversations-*.json を指定してください。"
+            )
         payload = _load_json_bytes(source_path.read_bytes())
         display_name = source_path.name
 
@@ -74,22 +80,77 @@ def load_export(source: Path | str) -> ExportSource:
     return ExportSource(display_name=display_name, conversations=conversations)
 
 
-def _load_from_zip(source_path: Path) -> tuple[Any, str]:
+def _find_conversation_files(source_path: Path) -> list[Path]:
+    matches = [
+        path
+        for path in source_path.rglob("*")
+        if path.is_file() and CONVERSATION_FILE_PATTERN.fullmatch(path.name)
+    ]
+    _require_single_conversation_location(
+        path.relative_to(source_path).as_posix() for path in matches
+    )
+    return sorted(matches, key=lambda path: _conversation_file_sort_key(path.name))
+
+
+def _load_from_zip(source_path: Path) -> tuple[list[Any], list[str]]:
     try:
         with zipfile.ZipFile(source_path) as archive:
             matches = [
                 info
                 for info in archive.infolist()
-                if not info.is_dir() and Path(info.filename.replace("\\", "/")).name.lower() == "conversations.json"
+                if not info.is_dir()
+                and CONVERSATION_FILE_PATTERN.fullmatch(
+                    Path(info.filename.replace("\\", "/")).name
+                )
             ]
             if not matches:
-                raise FileNotFoundError("zip内に conversations.json が見つかりません。")
-            if len(matches) > 1:
-                raise ValueError("zip内に conversations.json が複数あります。")
-            info = matches[0]
-            return _load_json_bytes(archive.read(info)), info.filename.replace("\\", "/")
+                raise FileNotFoundError("zip内に conversations.json または conversations-*.json が見つかりません。")
+            member_names = [info.filename.replace("\\", "/") for info in matches]
+            _require_single_conversation_location(member_names)
+            ordered = sorted(matches, key=lambda info: _conversation_file_sort_key(info.filename))
+            ordered_names = [info.filename.replace("\\", "/") for info in ordered]
+            return (
+                _merge_conversation_payloads(
+                    (name, _load_json_bytes(archive.read(info)))
+                    for name, info in zip(ordered_names, ordered)
+                ),
+                ordered_names,
+            )
     except zipfile.BadZipFile as exc:
         raise ValueError("有効なzipファイルではありません。") from exc
+
+
+def _require_single_conversation_location(file_names: Iterable[str]) -> None:
+    locations = {Path(file_name).parent.as_posix() for file_name in file_names}
+    if len(locations) > 1:
+        raise ValueError(
+            "会話データが複数のフォルダにあります。対象のエクスポートフォルダを直接指定してください。"
+        )
+
+
+def _conversation_file_sort_key(file_name: str) -> tuple[int, int, str]:
+    match = CONVERSATION_FILE_PATTERN.fullmatch(Path(file_name).name)
+    if match is None:
+        raise ValueError(f"対応していない会話データファイルです: {file_name}")
+    sequence = match.group(1)
+    if sequence is None:
+        return (0, 0, file_name.casefold())
+    return (1, int(sequence), file_name.casefold())
+
+
+def _source_display_name(source_name: str, file_names: list[str]) -> str:
+    if len(file_names) == 1:
+        return f"{source_name}/{file_names[0]}"
+    return f"{source_name}/" + ", ".join(file_names)
+
+
+def _merge_conversation_payloads(payloads: Iterable[tuple[str, Any]]) -> list[Any]:
+    conversations: list[Any] = []
+    for file_name, payload in payloads:
+        if not isinstance(payload, list):
+            raise ValueError(f"{file_name} のルートは配列である必要があります。")
+        conversations.extend(payload)
+    return conversations
 
 
 def _load_json_bytes(data: bytes) -> Any:
@@ -392,9 +453,13 @@ def _print_preview(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="ChatGPT exportのconversations.jsonを確認し、AI-LifeOS raw.mdへ安全に取り込みます。"
+        description="ChatGPT exportの会話データを確認し、AI-LifeOS raw.mdへ安全に取り込みます。"
     )
-    parser.add_argument("source", type=Path, help="exportフォルダ、zip、またはconversations.json")
+    parser.add_argument(
+        "source",
+        type=Path,
+        help="exportフォルダ、zip、conversations.json、またはconversations-*.json",
+    )
     parser.add_argument("--from-date", type=_parse_date, help="作成日がこの日以降（UTC）")
     parser.add_argument("--to-date", type=_parse_date, help="作成日がこの日以前（UTC）")
     parser.add_argument("--title", help="タイトルの部分一致（大文字小文字を区別しない）")

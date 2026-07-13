@@ -18,6 +18,10 @@ def format_result(result: MemorySearchResult, root: Path) -> str:
     ]
     if result.date:
         parts.append(f"  date: {result.date}")
+    if result.speaker_role:
+        parts.append(f"  role: {result.speaker_role}")
+    if result.message_number is not None:
+        parts.append(f"  message: {result.message_number}")
     if result.tags:
         parts.append(f"  tags: {', '.join(result.tags)}")
     if result.category:
@@ -148,6 +152,8 @@ def _result_to_dict(result: MemorySearchResult, root: Path) -> dict[str, object]
         "source": result.source,
         "source_date": result.source_date,
         "confidence": result.confidence,
+        "speaker_role": result.speaker_role,
+        "message_number": result.message_number,
         "snippet": result.snippet,
         "score": result.score,
     }
