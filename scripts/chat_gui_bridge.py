@@ -2018,6 +2018,7 @@ def _serialize_memory_context(context: AnswerContext | None) -> dict[str, Any]:
             "score": 0,
             "threshold": 0,
             "reasons": [],
+            "retrieval_modes": [],
             "reference_count": 0,
             "references": [],
         }
@@ -2028,6 +2029,7 @@ def _serialize_memory_context(context: AnswerContext | None) -> dict[str, Any]:
         "score": context.score,
         "threshold": context.threshold,
         "reasons": list(context.reasons),
+        "retrieval_modes": list(context.retrieval_modes),
         "reference_count": len(context.references),
         "references": [_serialize_memory_reference(reference) for reference in context.references],
     }

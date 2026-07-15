@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import sys
 import tempfile
@@ -394,7 +395,7 @@ class Phase3MemoryTests(unittest.TestCase):
                     self.assertIn(f"Category: {category}", context.text)
                     self.assertIn(expected_text, context.text)
 
-    def test_build_answer_context_skips_general_question(self):
+    def test_build_answer_context_uses_only_capped_core_memory_for_general_question(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = self.make_root(temp_dir)
 
@@ -405,7 +406,90 @@ class Phase3MemoryTests(unittest.TestCase):
             )
 
             self.assertFalse(context.should_use_memory)
-            self.assertEqual("", context.text)
+            self.assertTrue(context.used_memory)
+            self.assertEqual(("core",), context.retrieval_modes)
+            self.assertEqual((), context.results)
+            self.assertIn("Priority Memory", context.text)
+
+    def test_core_memory_is_capped_and_does_not_start_a_general_search(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            (root / "memory" / "long_term.md").write_text("# Long-Term\n\n" + "A" * 1400, encoding="utf-8")
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="SQLiteとは？",
+                max_memory_chars=5000,
+                use_index=False,
+            )
+
+            self.assertFalse(context.should_use_memory)
+            self.assertIn("...[truncated]", context.text)
+            self.assertNotIn("A" * 1100, context.text)
+            self.assertEqual((), context.results)
+
+    def test_self_reference_variants_and_follow_up_use_memory_without_writing_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            (root / "memory" / "long_term.md").write_text(
+                "# Long-Term Memory\n\n- ユーザーはiPhone 17を使用している。\n",
+                encoding="utf-8",
+            )
+            before = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+            cases = (
+                ("俺のスマホは？", (), "fallback"),
+                ("おれのスマホは？", (), "fallback"),
+                ("じゃあスマホは？", ("俺のスマホは？", "じゃあスマホは？"), "fallback"),
+                ("前に話した俺の端末は？", (), "fallback"),
+            )
+            for question, recent_user_messages, expected_mode in cases:
+                with self.subTest(question=question):
+                    context = build_answer_context.build_answer_context(
+                        root=root,
+                        question=question,
+                        recent_user_messages=recent_user_messages,
+                        use_index=False,
+                    )
+                    self.assertTrue(context.used_memory)
+                    self.assertIn("iPhone 17", context.text)
+                    self.assertIn(expected_mode, context.retrieval_modes)
+
+            after = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(before, after)
+
+    def test_past_fact_lookup_reads_unorganized_live_log_without_modifying_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            live_dir = root / "inbox" / "live"
+            live_dir.mkdir(parents=True)
+            live_file = live_dir / "2026-07-15_101010.jsonl"
+            records = [
+                {"role": "user", "timestamp": "2026-07-15T10:10:10+09:00", "content": "PAST_FACT_SENTINELを確認した。"},
+                {"role": "assistant", "timestamp": "2026-07-15T10:10:11+09:00", "content": "LIVE_ANSWER_SENTINELとして回答した。"},
+            ]
+            live_file.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
+            before = live_file.read_bytes()
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="前に PAST_FACT_SENTINEL について何て答えた？",
+                use_index=False,
+            )
+
+            self.assertIn("Unorganized Live Conversation Evidence", context.text)
+            self.assertIn("PAST_FACT_SENTINEL", context.text)
+            self.assertIn("LIVE_ANSWER_SENTINEL", context.text)
+            self.assertTrue(any(result.document_type == "live_message" for result in context.results))
+            self.assertEqual(before, live_file.read_bytes())
 
     def test_memory_need_scoring_combines_weak_signals(self):
         personal = build_answer_context.assess_memory_need("俺におすすめの本は？")

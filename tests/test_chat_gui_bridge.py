@@ -403,6 +403,18 @@ class ChatGuiBridgeTests(unittest.TestCase):
         self.assertEqual("assistant", result["speaker_role"])
         self.assertEqual(2, result["message_number"])
 
+    def test_memory_context_serializes_retrieval_modes(self):
+        context = build_answer_context.AnswerContext(
+            should_use_memory=True,
+            text="read-only",
+            results=(),
+            retrieval_modes=("core", "fallback"),
+        )
+
+        result = chat_gui_bridge._serialize_memory_context(context)
+
+        self.assertEqual(["core", "fallback"], result["retrieval_modes"])
+
     def test_send_message_uses_attachment_context_without_saving_body(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -590,7 +602,7 @@ class ChatGuiBridgeTests(unittest.TestCase):
     def test_resume_session_returns_messages(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            now = datetime(2026, 7, 3, 12, 0, tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc) - timedelta(days=1)
             session = create_live_session(root=root, started_at=now)
             session.append_message("user", "resume me", now)
             session.append_message("assistant", "ok", now + timedelta(seconds=2))

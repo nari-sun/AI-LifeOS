@@ -1792,6 +1792,7 @@ function MemoryContextDetails({
 }) {
   const label = context.used ? `記憶参照: あり (${context.reference_count}件)` : "記憶参照: なし"
   const scoreLabel = context.threshold > 0 ? `score ${context.score}/${context.threshold}` : "score -"
+  const modeLabel = context.retrieval_modes.length > 0 ? context.retrieval_modes.join(" / ") : "なし"
   const references = context.references.slice(0, 5)
 
   return (
@@ -1806,6 +1807,7 @@ function MemoryContextDetails({
         <Brain className={cn("h-3.5 w-3.5", context.used ? "text-primary" : "text-muted-foreground")} />
         <span className={cn("font-medium", context.used ? "text-foreground" : "text-muted-foreground")}>{label}</span>
         <span>{scoreLabel}</span>
+        <span>取得: {modeLabel}</span>
       </summary>
       <div className="mt-2 space-y-2">
         {context.used ? (

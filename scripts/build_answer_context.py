@@ -1,14 +1,20 @@
 import argparse
+import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from memory_index import ROOT, MemorySearchResult, search_memory
 from memory_items import load_categories
+from retrieval_feedback import classify_retrieval_features, feedback_bonus
 
 
 MEMORY_SCORE_THRESHOLD = 3
+CORE_MEMORY_CHAR_LIMIT = 1000
 RAW_EVIDENCE_LIMIT = 2
 RELATED_RAW_CHUNK_LIMIT = 50
+TOKYO_TIMEZONE = ZoneInfo("Asia/Tokyo")
 
 USER_EVIDENCE_SIGNALS = (
     "私が",
@@ -65,10 +71,13 @@ MEMORY_NEED_SIGNALS = (
     MemoryNeedSignal("履歴", 3, "past-conversation"),
     MemoryNeedSignal("なんだっけ", 3, "past-conversation"),
     MemoryNeedSignal("俺", 2, "self-reference"),
+    MemoryNeedSignal("おれ", 2, "self-reference"),
+    MemoryNeedSignal("オレ", 2, "self-reference"),
     MemoryNeedSignal("私", 2, "self-reference"),
-    MemoryNeedSignal("僕", 2, "self-reference"),
-    MemoryNeedSignal("自分", 2, "self-reference"),
     MemoryNeedSignal("わたし", 2, "self-reference"),
+    MemoryNeedSignal("僕", 2, "self-reference"),
+    MemoryNeedSignal("ぼく", 2, "self-reference"),
+    MemoryNeedSignal("自分", 2, "self-reference"),
     MemoryNeedSignal("好み", 3, "preference"),
     MemoryNeedSignal("好き", 2, "preference"),
     MemoryNeedSignal("嫌い", 2, "preference"),
@@ -95,10 +104,15 @@ MEMORY_NEED_SIGNALS = (
     MemoryNeedSignal("近く", 1, "local-context"),
     MemoryNeedSignal("ご飯", 1, "personal-topic"),
     MemoryNeedSignal("店", 1, "personal-topic"),
+    MemoryNeedSignal("スマホ", 1, "personal-topic"),
+    MemoryNeedSignal("携帯", 1, "personal-topic"),
+    MemoryNeedSignal("端末", 1, "personal-topic"),
+    MemoryNeedSignal("PC", 1, "personal-topic"),
+    MemoryNeedSignal("パソコン", 1, "personal-topic"),
     MemoryNeedSignal("おすすめ", 1, "recommendation"),
 )
 
-SELF_REFERENCES = ("俺", "私", "僕", "自分", "わたし")
+SELF_REFERENCES = ("俺", "おれ", "オレ", "私", "わたし", "僕", "ぼく", "自分")
 PERSONAL_TOPIC_SIGNALS = (
     "好み",
     "好き",
@@ -112,10 +126,17 @@ PERSONAL_TOPIC_SIGNALS = (
     "ルーティン",
     "ご飯",
     "店",
+    "スマホ",
+    "携帯",
+    "端末",
+    "PC",
+    "パソコン",
     "おすすめ",
 )
 PAST_SIGNALS = ("前回", "前に", "以前", "過去", "昔", "話した", "決めた", "ログ", "履歴", "なんだっけ")
 PROJECT_SIGNALS = ("AI-LifeOS", "プロジェクト", "Phase", "フェーズ", "方針", "journal", "memory")
+FOLLOW_UP_SIGNALS = ("じゃあ", "それで", "ちなみに", "それ", "前者", "後者")
+GENERIC_PAST_TERMS = ("前回", "前に", "以前", "過去", "昔", "話した", "決めた", "ログ", "履歴", "なんだっけ", "何て", "聞いた", "答えた")
 
 CATEGORY_QUERY_ALIASES = {
     "future_wishlist": ("やりたいこと", "いつか", "将来", "wishlist"),
@@ -156,17 +177,23 @@ class AnswerContext:
     score: int = 0
     threshold: int = MEMORY_SCORE_THRESHOLD
     reasons: tuple[str, ...] = ()
+    retrieval_modes: tuple[str, ...] = ()
 
     @property
     def used_memory(self) -> bool:
         return bool(self.text.strip() and self.references)
 
 
-def should_use_memory(question: str) -> bool:
-    return assess_memory_need(question).should_use_memory
+def should_use_memory(question: str, recent_user_messages: tuple[str, ...] = ()) -> bool:
+    return assess_memory_need(question, recent_user_messages=recent_user_messages).should_use_memory
 
 
-def assess_memory_need(question: str) -> MemoryNeedAssessment:
+def assess_memory_need(
+    question: str,
+    recent_user_messages: tuple[str, ...] = (),
+    learned_bonus: int = 0,
+    learned_reasons: tuple[str, ...] = (),
+) -> MemoryNeedAssessment:
     normalized = question.strip()
     if not normalized:
         return MemoryNeedAssessment(
@@ -192,6 +219,16 @@ def assess_memory_need(question: str) -> MemoryNeedAssessment:
         score += 2
         reasons.append("past-plus-project")
 
+    previous_messages = _recent_distinct_messages(question, recent_user_messages)
+    previous_text = "\n".join(previous_messages)
+    if _is_follow_up_question(normalized) and previous_text and _is_memory_related_text(previous_text):
+        score += 2
+        reasons.append("conversation-follow-up")
+
+    if learned_bonus:
+        score += max(learned_bonus, 0)
+        reasons.extend(learned_reasons)
+
     reasons_tuple = tuple(_dedupe(reasons))
     return MemoryNeedAssessment(
         should_use_memory=score >= MEMORY_SCORE_THRESHOLD,
@@ -204,58 +241,98 @@ def assess_memory_need(question: str) -> MemoryNeedAssessment:
 def build_answer_context(
     root: Path | str = ROOT,
     question: str = "",
-    max_memory_chars: int = 3000,
+    max_memory_chars: int = CORE_MEMORY_CHAR_LIMIT,
     max_results: int = 5,
     use_index: bool = True,
+    recent_user_messages: tuple[str, ...] = (),
 ) -> AnswerContext:
     root = Path(root)
-    assessment = assess_memory_need(question)
-    if not assessment.should_use_memory:
-        return AnswerContext(
-            should_use_memory=False,
-            text="",
-            results=(),
-            score=assessment.score,
-            threshold=assessment.threshold,
-            reasons=assessment.reasons,
-        )
+    history = _recent_distinct_messages(question, recent_user_messages)
+    learned_bonus, learned_reasons = feedback_bonus(root=root, question=question)
+    assessment = assess_memory_need(
+        question,
+        recent_user_messages=history,
+        learned_bonus=learned_bonus,
+        learned_reasons=learned_reasons,
+    )
+    memory_sections, priority_references = _read_priority_memory(
+        root=root,
+        max_chars=min(max(max_memory_chars, 1), CORE_MEMORY_CHAR_LIMIT),
+    )
+    fallback = _should_use_fallback(question, history, learned_bonus)
+    should_search = assessment.should_use_memory or fallback
+    retrieval_modes: list[str] = ["core"] if priority_references else []
+    if should_search:
+        retrieval_modes.append("fallback" if fallback else "search")
 
-    memory_sections, priority_references = _read_priority_memory(root=root, max_chars=max_memory_chars)
-    inferred_categories = infer_memory_categories(root, question)
-    structured_results = _search_structured_memory(
-        root=root,
-        question=question,
-        categories=inferred_categories,
-        max_results=max_results,
-        use_index=use_index,
-    )
-    journal_results = search_memory(
-        root=root,
-        query=question,
-        limit=max_results,
-        document_types=("journal",),
-        use_index=use_index,
-    )
-    conversation_results = search_memory(
-        root=root,
-        query=question,
-        limit=max_results,
-        document_types=("summary", "raw"),
-        use_index=use_index,
-    )
-    raw_chunk_candidates = search_memory(
-        root=root,
-        query=question,
-        limit=max(max_results * 4, 8),
-        document_types=("raw_chunk",),
-        use_index=use_index,
-    )
-    raw_chunk_results = _select_role_aware_raw_evidence(
-        root=root,
-        candidates=raw_chunk_candidates,
-        question=question,
-        use_index=use_index,
-    )
+    structured_results: list[MemorySearchResult] = []
+    journal_results: list[MemorySearchResult] = []
+    conversation_results: list[MemorySearchResult] = []
+    raw_chunk_results: list[MemorySearchResult] = []
+    live_results: list[MemorySearchResult] = []
+    search_query = _search_query(question, history)
+    if should_search:
+        inferred_categories = infer_memory_categories(root, search_query)
+        structured_results = _search_structured_memory(
+            root=root,
+            question=search_query,
+            categories=inferred_categories,
+            max_results=max_results,
+            use_index=use_index,
+        )
+        journal_results = search_memory(
+            root=root,
+            query=search_query,
+            limit=max_results,
+            document_types=("journal",),
+            use_index=use_index,
+        )
+        conversation_results = search_memory(
+            root=root,
+            query=search_query,
+            limit=max_results,
+            document_types=("summary", "raw"),
+            use_index=use_index,
+        )
+        raw_chunk_candidates = search_memory(
+            root=root,
+            query=search_query,
+            limit=max(max_results * 4, 8),
+            document_types=("raw_chunk",),
+            use_index=use_index,
+        )
+        if _needs_past_conversation_evidence(question):
+            concrete_query = _concrete_query(question)
+            if concrete_query:
+                conversation_results = _merge_results(
+                    search_memory(
+                        root=root,
+                        query=concrete_query,
+                        limit=max_results,
+                        document_types=("summary", "raw"),
+                        use_index=use_index,
+                    ),
+                    conversation_results,
+                    limit=max_results,
+                )
+                raw_chunk_candidates = _merge_results(
+                    search_memory(
+                        root=root,
+                        query=concrete_query,
+                        limit=max(max_results * 4, 8),
+                        document_types=("raw_chunk",),
+                        use_index=use_index,
+                    ),
+                    raw_chunk_candidates,
+                    limit=max(max_results * 4, 8),
+                )
+                live_results = _search_unorganized_live(root, concrete_query, question)
+        raw_chunk_results = _select_role_aware_raw_evidence(
+            root=root,
+            candidates=raw_chunk_candidates,
+            question=question,
+            use_index=use_index,
+        )
 
     lines = [
         "AI-LifeOS memory context (read-only).",
@@ -296,6 +373,13 @@ def build_answer_context(
             lines.extend(_format_result(result, root))
         lines.append("")
 
+    if live_results:
+        lines.append("## Unorganized Live Conversation Evidence")
+        lines.append("These excerpts are read from an unorganized live JSONL file and are not saved or modified.")
+        for result in live_results:
+            lines.extend(_format_result(result, root))
+        lines.append("")
+
     references = _dedupe_references(
         [
             *priority_references,
@@ -303,25 +387,27 @@ def build_answer_context(
             *(_reference_from_result(result, root) for result in journal_results),
             *(_reference_from_result(result, root) for result in conversation_results),
             *(_reference_from_result(result, root) for result in raw_chunk_results),
+            *(_reference_from_result(result, root) for result in live_results),
         ]
     )
     context_text = "\n".join(lines).rstrip() if references else ""
 
     return AnswerContext(
-        should_use_memory=True,
+        should_use_memory=should_search,
         text=context_text,
-        results=tuple([*structured_results, *journal_results, *conversation_results, *raw_chunk_results]),
+        results=tuple([*structured_results, *journal_results, *conversation_results, *raw_chunk_results, *live_results]),
         references=tuple(references),
         score=assessment.score,
         threshold=assessment.threshold,
         reasons=assessment.reasons,
+        retrieval_modes=tuple(retrieval_modes),
     )
 
 
 def _read_priority_memory(root: Path, max_chars: int) -> tuple[list[str], list[MemoryContextReference]]:
     sections: list[str] = []
     references: list[MemoryContextReference] = []
-    remaining = max(max_chars, 1)
+    sources: list[tuple[Path, Path, str]] = []
     for relative in (Path("memory") / "long_term.md", Path("memory") / "preferences.md"):
         path = root / relative
         if not path.exists():
@@ -329,8 +415,15 @@ def _read_priority_memory(root: Path, max_chars: int) -> tuple[list[str], list[M
         content = path.read_text(encoding="utf-8").strip()
         if not content:
             continue
-        if len(content) > remaining:
-            content = content[:remaining].rstrip() + "\n...[truncated]"
+        sources.append((relative, path, content))
+
+    remaining = max(max_chars, 1)
+    for index, (relative, path, content) in enumerate(sources):
+        slots_left = len(sources) - index
+        limit = max(remaining // slots_left, 1)
+        if len(content) > limit:
+            suffix = "\n...[truncated]"
+            content = suffix[:limit] if limit <= len(suffix) else content[: limit - len(suffix)].rstrip() + suffix
         sections.extend([f"### {relative.as_posix()}", content, ""])
         references.append(
             MemoryContextReference(
@@ -343,9 +436,171 @@ def _read_priority_memory(root: Path, max_chars: int) -> tuple[list[str], list[M
             )
         )
         remaining -= len(content)
-        if remaining <= 0:
-            break
     return sections, references
+
+
+def _recent_distinct_messages(question: str, recent_user_messages: tuple[str, ...]) -> tuple[str, ...]:
+    latest = question.strip()
+    messages = [message.strip() for message in recent_user_messages if message and message.strip()]
+    if messages and messages[-1] == latest:
+        messages.pop()
+    return tuple(messages[-2:])
+
+
+def _is_follow_up_question(question: str) -> bool:
+    compact = "".join(question.split())
+    return len(compact) <= 32 and _has_any(compact, FOLLOW_UP_SIGNALS)
+
+
+def _is_memory_related_text(text: str) -> bool:
+    assessment = assess_memory_need(text)
+    return assessment.score >= 2 or (
+        _has_any(text, SELF_REFERENCES) and _has_any(text, PERSONAL_TOPIC_SIGNALS)
+    )
+
+
+def _should_use_fallback(question: str, history: tuple[str, ...], learned_bonus: int) -> bool:
+    features = set(classify_retrieval_features(question))
+    if {"self-reference", "owned-device-question"}.issubset(features):
+        return True
+    if "follow-up" in features and history and _is_memory_related_text("\n".join(history)):
+        return True
+    return bool(learned_bonus and "owned-device-question" in features)
+
+
+def _search_query(question: str, history: tuple[str, ...]) -> str:
+    # The current question remains the primary query.  Only a bounded amount of
+    # immediately preceding user context is added for short follow-up questions.
+    parts = [question.strip()]
+    if _is_follow_up_question(question):
+        parts = [*history[-2:], *parts]
+    return "\n".join(part for part in parts if part)[:800]
+
+
+def _needs_past_conversation_evidence(question: str) -> bool:
+    return _has_any(question, PAST_SIGNALS + ("いつ話した", "何て聞いた", "何て答えた"))
+
+
+def _concrete_query(question: str) -> str:
+    normalized = question
+    for value in GENERIC_PAST_TERMS:
+        normalized = normalized.replace(value, " ")
+    for value in ("について", "という", "から", "まで", "の", "は", "を", "に", "が", "で", "と", "や", "も", "へ"):
+        normalized = normalized.replace(value, " ")
+    terms = [term for term in normalized.replace("？", " ").replace("?", " ").split() if len(term) >= 2]
+    return " ".join(_dedupe(terms))
+
+
+def _merge_results(*groups: list[MemorySearchResult], limit: int) -> list[MemorySearchResult]:
+    merged: list[MemorySearchResult] = []
+    seen: set[tuple[str, str, str | None, int | None]] = set()
+    for group in groups:
+        for result in group:
+            key = (str(result.path), result.document_type, result.speaker_role, result.message_number)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(result)
+    return merged[: max(limit, 1)]
+
+
+def _search_unorganized_live(root: Path, query: str, question: str) -> list[MemorySearchResult]:
+    live_dir = root / "inbox" / "live"
+    if not live_dir.exists() or not query.strip():
+        return []
+
+    terms = _live_query_terms(query)
+    all_results: list[MemorySearchResult] = []
+    for path in sorted(live_dir.glob("*.jsonl")):
+        if not _is_unorganized_live(path):
+            continue
+        for message_number, record in enumerate(_read_live_records(path), start=1):
+            content = record.get("content", "")
+            score = _live_match_score(content, terms)
+            timestamp = _parse_local_timestamp(record.get("timestamp"))
+            all_results.append(
+                MemorySearchResult(
+                    document_type="live_message",
+                    path=path,
+                    title=f"Live session {path.stem} / {record['role']} message {message_number}",
+                    date=timestamp.date().isoformat() if timestamp else None,
+                    tags=(),
+                    snippet=_short_snippet(content, width=2200),
+                    score=score,
+                    speaker_role=record["role"],
+                    message_number=message_number,
+                )
+            )
+
+    candidates = sorted(
+        (result for result in all_results if result.score > 0),
+        key=lambda result: (result.score, result.date or "", str(result.path)),
+        reverse=True,
+    )
+    if not candidates:
+        return []
+    anchor = _select_raw_evidence_anchor(candidates, _raw_evidence_scope(question))
+    if anchor is None:
+        return []
+    if _raw_evidence_scope(question) == "user":
+        return [anchor]
+    related = [result for result in all_results if result.path == anchor.path]
+    return _paired_raw_evidence(anchor, related, limit=RAW_EVIDENCE_LIMIT)
+
+
+def _is_unorganized_live(path: Path) -> bool:
+    metadata_path = path.with_suffix(".session.json")
+    if not metadata_path.exists():
+        return True
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    organize = metadata.get("organize") if isinstance(metadata, dict) else None
+    return not isinstance(organize, dict) or not bool(organize.get("index_updated"))
+
+
+def _read_live_records(path: Path) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return records
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        role = value.get("role")
+        content = value.get("content")
+        timestamp = value.get("timestamp")
+        if role in {"user", "assistant"} and isinstance(content, str) and isinstance(timestamp, str):
+            records.append({"role": role, "content": content, "timestamp": timestamp})
+    return records
+
+
+def _parse_local_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=TOKYO_TIMEZONE)
+    return timestamp.astimezone(TOKYO_TIMEZONE)
+
+
+def _live_query_terms(query: str) -> tuple[str, ...]:
+    terms = [term for term in query.replace("？", " ").replace("?", " ").split() if len(term) >= 2]
+    return tuple(_dedupe(terms))
+
+
+def _live_match_score(content: str, terms: tuple[str, ...]) -> int:
+    lowered = content.lower()
+    return sum(lowered.count(term.lower()) for term in terms)
 
 
 def _display_path(path: Path, root: Path) -> str:
@@ -610,7 +865,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("question", help="Latest user question.")
     parser.add_argument("--root", default=ROOT, help="AI-LifeOS root directory.")
     parser.add_argument("--max-results", type=int, default=5, help="Maximum journal search results.")
-    parser.add_argument("--max-memory-chars", type=int, default=3000, help="Maximum priority memory characters.")
+    parser.add_argument(
+        "--max-memory-chars",
+        type=int,
+        default=CORE_MEMORY_CHAR_LIMIT,
+        help="Maximum core memory characters (capped at 1000).",
+    )
     parser.add_argument("--no-index", action="store_true", help="Search Markdown files directly.")
     return parser
 
