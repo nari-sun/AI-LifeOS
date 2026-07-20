@@ -449,7 +449,7 @@ DBは `memory/search_index.sqlite3` に作成されます。このDBはMarkdown�
 python scripts\build_answer_context.py "俺の好みに合う店は？"
 ```
 
-私的な質問、好み、生活、学習進捗、過去行動、AI-LifeOSの過去方針に関係する質問では、`memory/long_term.md` と `memory/preferences.md` を優先して読み、必要に応じて `journal` と `summary.md` / `raw.md` を検索した短い抜粋を返します。
+毎回、`memory/long_term.md` と `memory/preferences.md` を少量読み、記憶検索を行います。通常は構造化メモリ・`journal`・`summary.md`から関連する短い抜粋を最大2件だけ読み、私的な質問、好み、生活、学習進捗、過去行動、AI-LifeOSの過去方針に明確に関係する場合だけ、`raw.md`を含む広い検索へ拡張します。
 
 ### Chat GUIを起動する
 

@@ -395,7 +395,7 @@ class Phase3MemoryTests(unittest.TestCase):
                     self.assertIn(f"Category: {category}", context.text)
                     self.assertIn(expected_text, context.text)
 
-    def test_build_answer_context_uses_only_capped_core_memory_for_general_question(self):
+    def test_build_answer_context_uses_capped_core_memory_and_narrow_search_for_general_question(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = self.make_root(temp_dir)
 
@@ -405,13 +405,50 @@ class Phase3MemoryTests(unittest.TestCase):
                 use_index=False,
             )
 
-            self.assertFalse(context.should_use_memory)
+            self.assertTrue(context.should_use_memory)
             self.assertTrue(context.used_memory)
-            self.assertEqual(("core",), context.retrieval_modes)
+            self.assertEqual(("core", "narrow"), context.retrieval_modes)
             self.assertEqual((), context.results)
             self.assertIn("Priority Memory", context.text)
 
-    def test_core_memory_is_capped_and_does_not_start_a_general_search(self):
+    def test_general_question_reads_at_most_two_narrow_memory_matches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            question = "静かなラーメン店について教えて"
+
+            self.assertFalse(build_answer_context.assess_memory_need(question).should_use_memory)
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question=question,
+                use_index=False,
+            )
+
+            self.assertTrue(context.should_use_memory)
+            self.assertEqual(("core", "narrow"), context.retrieval_modes)
+            self.assertLessEqual(len(context.results), 2)
+            self.assertIn("Narrow Memory Matches", context.text)
+            self.assertIn("静かなラーメン店の候補", context.text)
+            self.assertNotIn("Journal Matches", context.text)
+
+    def test_narrow_search_caps_multiple_matching_documents_at_two(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            journal_dir = root / "journal" / "2026" / "07"
+            for day in (6, 7, 8):
+                (journal_dir / f"2026-07-{day:02d}.md").write_text(
+                    f"# 2026-07-{day:02d}\n\nNARROW_LIMIT_SENTINEL {day}\n",
+                    encoding="utf-8",
+                )
+
+            question = "NARROW_LIMIT_SENTINELについて教えて"
+            self.assertFalse(build_answer_context.assess_memory_need(question).should_use_memory)
+            context = build_answer_context.build_answer_context(root=root, question=question, use_index=False)
+
+            self.assertEqual(("core", "narrow"), context.retrieval_modes)
+            self.assertEqual(2, len(context.results))
+            self.assertTrue(all(result.document_type == "journal" for result in context.results))
+
+    def test_core_memory_is_capped_while_general_question_uses_narrow_search(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = self.make_root(temp_dir)
             (root / "memory" / "long_term.md").write_text("# Long-Term\n\n" + "A" * 1400, encoding="utf-8")
@@ -423,10 +460,11 @@ class Phase3MemoryTests(unittest.TestCase):
                 use_index=False,
             )
 
-            self.assertFalse(context.should_use_memory)
+            self.assertTrue(context.should_use_memory)
             self.assertIn("...[truncated]", context.text)
             self.assertNotIn("A" * 1100, context.text)
             self.assertEqual((), context.results)
+            self.assertEqual(("core", "narrow"), context.retrieval_modes)
 
     def test_self_reference_variants_and_follow_up_use_memory_without_writing_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -14,6 +14,8 @@ MEMORY_SCORE_THRESHOLD = 3
 CORE_MEMORY_CHAR_LIMIT = 1000
 RAW_EVIDENCE_LIMIT = 2
 RELATED_RAW_CHUNK_LIMIT = 50
+NARROW_SEARCH_RESULT_LIMIT = 2
+NARROW_SEARCH_DOCUMENT_TYPES = ("memory_item", "journal", "summary")
 TOKYO_TIMEZONE = ZoneInfo("Asia/Tokyo")
 
 USER_EVIDENCE_SIGNALS = (
@@ -259,19 +261,32 @@ def build_answer_context(
         root=root,
         max_chars=min(max(max_memory_chars, 1), CORE_MEMORY_CHAR_LIMIT),
     )
+    has_question = bool(question.strip())
     fallback = _should_use_fallback(question, history, learned_bonus)
-    should_search = assessment.should_use_memory or fallback
+    should_expand_search = assessment.should_use_memory or fallback
     retrieval_modes: list[str] = ["core"] if priority_references else []
-    if should_search:
+    if has_question and not should_expand_search:
+        retrieval_modes.append("narrow")
+    if should_expand_search:
         retrieval_modes.append("fallback" if fallback else "search")
 
+    narrow_results: list[MemorySearchResult] = []
     structured_results: list[MemorySearchResult] = []
     journal_results: list[MemorySearchResult] = []
     conversation_results: list[MemorySearchResult] = []
     raw_chunk_results: list[MemorySearchResult] = []
     live_results: list[MemorySearchResult] = []
     search_query = _search_query(question, history)
-    if should_search:
+    if has_question and not should_expand_search:
+        narrow_results = search_memory(
+            root=root,
+            query=question.strip()[:800],
+            limit=min(max(max_results, 1), NARROW_SEARCH_RESULT_LIMIT),
+            document_types=NARROW_SEARCH_DOCUMENT_TYPES,
+            use_index=use_index,
+        )
+
+    if should_expand_search:
         inferred_categories = infer_memory_categories(root, search_query)
         structured_results = _search_structured_memory(
             root=root,
@@ -348,6 +363,13 @@ def build_answer_context(
         lines.extend(memory_sections)
         lines.append("")
 
+    if narrow_results:
+        lines.append("## Narrow Memory Matches")
+        lines.append("Use at most two short, directly relevant memory excerpts for ordinary questions.")
+        for result in narrow_results:
+            lines.extend(_format_result(result, root))
+        lines.append("")
+
     if structured_results:
         lines.append("## Structured Memory Matches")
         for result in structured_results:
@@ -383,6 +405,7 @@ def build_answer_context(
     references = _dedupe_references(
         [
             *priority_references,
+            *(_reference_from_result(result, root) for result in narrow_results),
             *(_reference_from_result(result, root) for result in structured_results),
             *(_reference_from_result(result, root) for result in journal_results),
             *(_reference_from_result(result, root) for result in conversation_results),
@@ -393,9 +416,18 @@ def build_answer_context(
     context_text = "\n".join(lines).rstrip() if references else ""
 
     return AnswerContext(
-        should_use_memory=should_search,
+        should_use_memory=has_question,
         text=context_text,
-        results=tuple([*structured_results, *journal_results, *conversation_results, *raw_chunk_results, *live_results]),
+        results=tuple(
+            [
+                *narrow_results,
+                *structured_results,
+                *journal_results,
+                *conversation_results,
+                *raw_chunk_results,
+                *live_results,
+            ]
+        ),
         references=tuple(references),
         score=assessment.score,
         threshold=assessment.threshold,
