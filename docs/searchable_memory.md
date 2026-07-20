@@ -173,7 +173,7 @@ CLI と GUI は回答生成後に `記憶参照: あり / なし` を表示し�
 * AIの回答・説明・結論を尋ねる照会では、対応するassistant応答を根拠にします。
 * 過去会話全体の照会では、対応するuser / assistant発言を役割付きで時系列順に参照します。
 
-この仕組みはChatGPT exportから取り込んだ会話と、AI-LifeOSのLive Conversation / Chat GUIから保存された会話の両方に適用されます。役割情報はSQLite indexの派生データなので、`python scripts\rebuild_index.py`で再生成できます。
+この仕組みはChatGPT exportから取り込んだ会話と、AI-LifeOSのLive Conversation / Chat GUIから保存された会話の両方に適用されます。ChatGPT exportで個別発言の時刻が欠けていても、`## User` / `## Assistant` の見出しと出現順から役割情報を保持します。役割情報はSQLite indexの派生データなので、`python scripts\rebuild_index.py`で再生成できます。
 
 ### Phase3.5: Vector Search Evaluation
 

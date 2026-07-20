@@ -434,24 +434,34 @@ def _document_type(path: Path, root: Path) -> str | None:
 
 
 def _raw_message_documents(document: MemoryDocument) -> list[MemoryDocument]:
-    """Create searchable message-sized evidence from a finalized live-chat raw.md.
+    """Create searchable message-sized evidence from a role-headed raw.md.
 
     The complete raw file remains indexed for compatibility and manual search.
-    Pasted or imported files without the live-chat headings fall back to that
-    whole-document index entry.
+    ChatGPT exports can omit individual message timestamps, so a timestamp is
+    optional; role headings and their source order remain sufficient evidence.
+    Pasted files without role headings fall back to the whole-document index
+    entry.
     """
     pattern = re.compile(
-        r"^## (?P<role>User|Assistant)\s*\n\s*Timestamp:\s*(?P<timestamp>[^\n]+)\s*\n\s*"
-        r"(?P<content>.*?)(?=^## (?:User|Assistant)\s*$|\Z)",
+        r"^## (?P<role>User|Assistant)[ \t]*\n"
+        r"(?:[ \t]*\n)*"
+        r"(?:Timestamp:[ \t]*(?P<timestamp>[^\n]+)\n(?:[ \t]*\n)*)?"
+        r"(?P<content>.*?)(?=^## (?:User|Assistant)[ \t]*$|\Z)",
         re.MULTILINE | re.DOTALL,
     )
     chunks: list[MemoryDocument] = []
     for message_number, match in enumerate(pattern.finditer(document.content), start=1):
         role = match.group("role")
-        timestamp = match.group("timestamp").strip()
+        timestamp_value = match.group("timestamp")
+        timestamp = timestamp_value.strip() if timestamp_value else None
         content = match.group("content").strip()
         if not content:
             continue
+
+        chunk_lines = [f"Session: {document.title}", f"Role: {role}"]
+        if timestamp:
+            chunk_lines.append(f"Timestamp: {timestamp}")
+        chunk_lines.extend(("", content))
 
         chunks.append(
             MemoryDocument(
@@ -461,15 +471,7 @@ def _raw_message_documents(document: MemoryDocument) -> list[MemoryDocument]:
                 title=f"{document.title} / {role} message {message_number}",
                 date=document.date,
                 tags=document.tags,
-                content="\n".join(
-                    (
-                        f"Session: {document.title}",
-                        f"Role: {role}",
-                        f"Timestamp: {timestamp}",
-                        "",
-                        content,
-                    )
-                ),
+                content="\n".join(chunk_lines),
                 speaker_role=role.lower(),
                 message_number=message_number,
             )

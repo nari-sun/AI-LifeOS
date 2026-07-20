@@ -661,6 +661,46 @@ class Phase3MemoryTests(unittest.TestCase):
                     expected_title = "Imported role evidence" if name == "chatgpt" else "Live role evidence"
                     self.assertTrue(all(expected_title in item.title for item in raw_chunks))
 
+    def test_role_aware_evidence_keeps_chatgpt_messages_without_timestamps(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = root / "conversations" / "2026" / "07" / "2026-07-11_121500"
+            session.mkdir(parents=True)
+            (session / "raw.md").write_text(
+                "\n".join(
+                    (
+                        "# Chat Log",
+                        "",
+                        "Date: 2026-07-11",
+                        "Source: ChatGPT export",
+                        "Title: Imported messages without timestamps",
+                        "",
+                        "## User",
+                        "",
+                        "AI-LifeOS NO_TIMESTAMP_USER_SENTINEL",
+                        "",
+                        "## Assistant",
+                        "",
+                        "NO_TIMESTAMP_ASSISTANT_CONCLUSION",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            memory_index.rebuild_index(root)
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="AI-LifeOS NO_TIMESTAMP_USER_SENTINEL",
+            )
+
+            raw_chunks = [item for item in context.results if item.document_type == "raw_chunk"]
+            self.assertEqual(["user", "assistant"], [item.speaker_role for item in raw_chunks])
+            self.assertEqual([1, 2], [item.message_number for item in raw_chunks])
+            self.assertIn("NO_TIMESTAMP_USER_SENTINEL", context.text)
+            self.assertIn("NO_TIMESTAMP_ASSISTANT_CONCLUSION", context.text)
+            self.assertNotIn("Timestamp: None", context.text)
+
     def test_role_aware_evidence_respects_user_and_assistant_queries(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
