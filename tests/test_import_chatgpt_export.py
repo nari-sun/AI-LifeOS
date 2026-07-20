@@ -89,6 +89,41 @@ class ImportChatGPTExportTests(unittest.TestCase):
             self.assertEqual("conv-1", source.conversations[0].source_id)
             self.assertEqual([], list(root.glob("nested/*")))
 
+    def test_detects_split_conversation_files_in_folder_in_sequence_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            export = Path(temp_dir) / "export"
+            export.mkdir()
+            (export / "conversations-001.json").write_text(
+                json.dumps([conversation("second")]), encoding="utf-8"
+            )
+            (export / "conversations-000.json").write_text(
+                json.dumps([conversation("first")]), encoding="utf-8"
+            )
+
+            source = import_chatgpt_export.load_export(export)
+
+            self.assertEqual(["first", "second"], [item.source_id for item in source.conversations])
+            self.assertEqual(
+                "export/conversations-000.json, conversations-001.json", source.display_name
+            )
+
+    def test_detects_split_conversation_files_in_zip_without_extracting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive_path = root / "chatgpt-export.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("nested/conversations-001.json", json.dumps([conversation("second")]))
+                archive.writestr("nested/conversations-000.json", json.dumps([conversation("first")]))
+
+            source = import_chatgpt_export.load_export(archive_path)
+
+            self.assertEqual(["first", "second"], [item.source_id for item in source.conversations])
+            self.assertEqual(
+                "chatgpt-export.zip/nested/conversations-000.json, nested/conversations-001.json",
+                source.display_name,
+            )
+            self.assertEqual([], list(root.glob("nested/*")))
+
     def test_filters_by_period_title_and_id(self):
         items = [
             import_chatgpt_export._parse_conversation(conversation("a", "Alpha", 1767225600), 0),

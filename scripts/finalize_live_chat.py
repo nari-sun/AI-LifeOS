@@ -16,6 +16,7 @@ from process_chat import (
     run_codex_task,
 )
 from memory_index import rebuild_index
+from retrieval_feedback import record_confirmed_retrieval_feedback
 from session_store import get_session_organization, save_session
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -193,6 +194,11 @@ def finalize_live_chat(
             try:
                 _emit_progress(progress, 90, "Updating search index...")
                 rebuild_index(root=root)
+                record_confirmed_retrieval_feedback(
+                    root=root,
+                    records=records,
+                    session_id=jsonl_file.stem,
+                )
                 if write_session_metadata:
                     save_session(
                         root=root,

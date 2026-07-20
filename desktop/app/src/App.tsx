@@ -1566,7 +1566,7 @@ function ChatGptImportScreen({
               </Button>
               <Button type="button" onClick={onChooseFile} disabled={disabled}>
                 {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileUp className="h-4 w-4" />}
-                ZIP / conversations.jsonを選択
+                ZIP / 会話JSONを選択
               </Button>
             </div>
           </div>
@@ -1574,7 +1574,7 @@ function ChatGptImportScreen({
 
         {!preview ? (
           <section className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
-            ChatGPTのエクスポートZIP、展開済みフォルダ、または conversations.json を選択してください。
+            ChatGPTのエクスポートZIP、展開済みフォルダ、または conversations.json / conversations-*.json を選択してください。
           </section>
         ) : (
           <>
@@ -1792,6 +1792,7 @@ function MemoryContextDetails({
 }) {
   const label = context.used ? `記憶参照: あり (${context.reference_count}件)` : "記憶参照: なし"
   const scoreLabel = context.threshold > 0 ? `score ${context.score}/${context.threshold}` : "score -"
+  const modeLabel = context.retrieval_modes.length > 0 ? context.retrieval_modes.join(" / ") : "なし"
   const references = context.references.slice(0, 5)
 
   return (
@@ -1806,14 +1807,17 @@ function MemoryContextDetails({
         <Brain className={cn("h-3.5 w-3.5", context.used ? "text-primary" : "text-muted-foreground")} />
         <span className={cn("font-medium", context.used ? "text-foreground" : "text-muted-foreground")}>{label}</span>
         <span>{scoreLabel}</span>
+        <span>取得: {modeLabel}</span>
       </summary>
       <div className="mt-2 space-y-2">
         {context.used ? (
           references.map((reference) => (
-            <div key={reference.path} className="min-w-0">
+            <div key={`${reference.path}:${reference.document_type}:${reference.speaker_role ?? ""}:${reference.message_number ?? ""}`} className="min-w-0">
               <div className="break-all font-mono text-[11px] text-foreground">{reference.path}</div>
               <div className="mt-1 flex flex-wrap gap-2">
                 <span>{reference.document_type}</span>
+                {reference.speaker_role && <span>role: {reference.speaker_role}</span>}
+                {reference.message_number !== null && <span>message {reference.message_number}</span>}
                 {reference.date && <span>{reference.date}</span>}
                 {reference.score > 0 && <span>match {reference.score}</span>}
               </div>

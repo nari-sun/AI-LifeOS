@@ -31,6 +31,8 @@ class MemoryDocument:
     source: str | None = None
     source_date: str | None = None
     confidence: str | None = None
+    speaker_role: str | None = None
+    message_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,8 @@ class MemorySearchResult:
     source: str | None = None
     source_date: str | None = None
     confidence: str | None = None
+    speaker_role: str | None = None
+    message_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -430,24 +434,34 @@ def _document_type(path: Path, root: Path) -> str | None:
 
 
 def _raw_message_documents(document: MemoryDocument) -> list[MemoryDocument]:
-    """Create searchable message-sized evidence from a finalized live-chat raw.md.
+    """Create searchable message-sized evidence from a role-headed raw.md.
 
     The complete raw file remains indexed for compatibility and manual search.
-    Pasted or imported files without the live-chat headings fall back to that
-    whole-document index entry.
+    ChatGPT exports can omit individual message timestamps, so a timestamp is
+    optional; role headings and their source order remain sufficient evidence.
+    Pasted files without role headings fall back to the whole-document index
+    entry.
     """
     pattern = re.compile(
-        r"^## (?P<role>User|Assistant)\s*\n\s*Timestamp:\s*(?P<timestamp>[^\n]+)\s*\n\s*"
-        r"(?P<content>.*?)(?=^## (?:User|Assistant)\s*$|\Z)",
+        r"^## (?P<role>User|Assistant)[ \t]*\n"
+        r"(?:[ \t]*\n)*"
+        r"(?:Timestamp:[ \t]*(?P<timestamp>[^\n]+)\n(?:[ \t]*\n)*)?"
+        r"(?P<content>.*?)(?=^## (?:User|Assistant)[ \t]*$|\Z)",
         re.MULTILINE | re.DOTALL,
     )
     chunks: list[MemoryDocument] = []
     for message_number, match in enumerate(pattern.finditer(document.content), start=1):
         role = match.group("role")
-        timestamp = match.group("timestamp").strip()
+        timestamp_value = match.group("timestamp")
+        timestamp = timestamp_value.strip() if timestamp_value else None
         content = match.group("content").strip()
         if not content:
             continue
+
+        chunk_lines = [f"Session: {document.title}", f"Role: {role}"]
+        if timestamp:
+            chunk_lines.append(f"Timestamp: {timestamp}")
+        chunk_lines.extend(("", content))
 
         chunks.append(
             MemoryDocument(
@@ -457,24 +471,31 @@ def _raw_message_documents(document: MemoryDocument) -> list[MemoryDocument]:
                 title=f"{document.title} / {role} message {message_number}",
                 date=document.date,
                 tags=document.tags,
-                content="\n".join(
-                    (
-                        f"Session: {document.title}",
-                        f"Role: {role}",
-                        f"Timestamp: {timestamp}",
-                        "",
-                        content,
-                    )
-                ),
+                content="\n".join(chunk_lines),
+                speaker_role=role.lower(),
+                message_number=message_number,
             )
         )
     return chunks
+
+
+def _raw_chunk_metadata(document_key: str, document_type: str) -> tuple[str | None, int | None]:
+    if document_type != "raw_chunk":
+        return None, None
+    match = re.search(r"#message-(\d+)-(user|assistant)$", document_key, re.IGNORECASE)
+    if not match:
+        return None, None
+    return match.group(2).lower(), int(match.group(1))
 
 
 def _extract_title(content: str, path: Path) -> str:
     session = _field_value(content, "Session")
     if session:
         return session
+
+    imported_title = _field_value(content, "Title")
+    if imported_title:
+        return imported_title
 
     for line in content.splitlines():
         stripped = line.strip()
@@ -554,6 +575,8 @@ def _rank_documents(documents: list[MemoryDocument], query: str, limit: int) -> 
                 source=document.source,
                 source_date=document.source_date,
                 confidence=document.confidence,
+                speaker_role=document.speaker_role,
+                message_number=document.message_number,
             )
         )
 
@@ -665,6 +688,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             source TEXT,
             source_date TEXT,
             confidence TEXT,
+            speaker_role TEXT,
+            message_number INTEGER,
             content TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -702,9 +727,9 @@ def _insert_documents(connection: sqlite3.Connection, root: Path, documents: lis
             INSERT INTO documents(
                 document_key, document_type, path, title, date, tags_json,
                 category, category_label, status, source, source_date, confidence,
-                content, updated_at
+                speaker_role, message_number, content, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 document.document_key,
@@ -719,6 +744,8 @@ def _insert_documents(connection: sqlite3.Connection, root: Path, documents: lis
                 document.source,
                 document.source_date,
                 document.confidence,
+                document.speaker_role,
+                document.message_number,
                 document.content,
                 now,
             ),
@@ -755,7 +782,9 @@ def _load_documents_from_index(
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(documents)").fetchall()}
     index_load_ms = (perf_counter() - index_load_started_at) * 1000
     structured_columns = {"category", "category_label", "status", "source", "source_date", "confidence"}
+    message_columns = {"speaker_role", "message_number"}
     has_structured_columns = structured_columns.issubset(columns)
+    has_message_columns = message_columns.issubset(columns)
     if (category or status) and not has_structured_columns:
         return [], index_load_ms, 0.0
 
@@ -765,9 +794,10 @@ def _load_documents_from_index(
         if has_structured_columns
         else "NULL, NULL, NULL, NULL, NULL, NULL"
     )
+    message_select = "d.speaker_role, d.message_number" if has_message_columns else "NULL, NULL"
     query = [
         "SELECT d.document_key, d.document_type, d.path, d.title, d.date, d.tags_json,",
-        f"       {structured_select}, d.content",
+        f"       {structured_select}, {message_select}, d.content",
         "FROM documents d",
     ]
     params: list[object] = []
@@ -821,9 +851,12 @@ def _load_documents_from_index(
         source,
         source_date,
         confidence,
+        speaker_role,
+        message_number,
         content,
     ) in rows:
         tags = tuple(json.loads(tags_json))
+        fallback_role, fallback_number = _raw_chunk_metadata(str(document_key), str(document_type))
         documents.append(
             MemoryDocument(
                 document_key=str(document_key),
@@ -839,6 +872,8 @@ def _load_documents_from_index(
                 source=str(source) if source else None,
                 source_date=str(source_date) if source_date else None,
                 confidence=str(confidence) if confidence else None,
+                speaker_role=str(speaker_role) if speaker_role else fallback_role,
+                message_number=int(message_number) if message_number is not None else fallback_number,
             )
         )
     filter_ms = (perf_counter() - filter_started_at) * 1000

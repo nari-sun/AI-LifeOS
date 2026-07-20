@@ -156,6 +156,42 @@ class FinalizeLiveChatTests(unittest.TestCase):
             self.assertFalse(result.organization["can_organize"])
             self.assertTrue((root / "memory" / "search_index.sqlite3").exists())
 
+    def test_finalize_records_confirmed_retrieval_features_without_conversation_text(self):
+        def fake_run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            live_file = root / "inbox" / "live" / "2026-07-15_120000.jsonl"
+            records = [
+                {"role": "user", "timestamp": "2026-07-15T12:00:00+09:00", "content": "俺のスマホは？"},
+                {"role": "assistant", "timestamp": "2026-07-15T12:00:01+09:00", "content": "保存記録では確認できません。"},
+                {"role": "user", "timestamp": "2026-07-15T12:00:02+09:00", "content": "前に話したのが残ってるよ。"},
+            ]
+            live_file.write_text(
+                "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            memory = root / "memory"
+            memory.mkdir()
+            (memory / "long_term.md").write_text(
+                "# Long-Term Memory\n\n- ユーザーのスマホはiPhone 17。\n",
+                encoding="utf-8",
+            )
+
+            finalize_live_chat.finalize_live_chat(
+                root=root,
+                session_file=live_file,
+                run_codex=True,
+                run_command=fake_run,
+            )
+
+            feedback_text = (memory / "retrieval_feedback.jsonl").read_text(encoding="utf-8")
+            self.assertIn("confirmed-retrieval-miss", feedback_text)
+            self.assertIn("owned-device-question", feedback_text)
+            self.assertNotIn("俺のスマホ", feedback_text)
+            self.assertNotIn("iPhone 17", feedback_text)
+
     def test_finalize_live_chat_records_memory_failure_for_manual_resume(self):
         def fake_run(command, **kwargs):
             return subprocess.CompletedProcess(command, 7, stdout="bad", stderr="failed")

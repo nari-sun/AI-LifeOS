@@ -21,6 +21,12 @@ from finalize_live_chat import FinalizeLiveChatResult, finalize_live_chat
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from session_store import ResumeSession, list_resumable_sessions, load_resume_session
 
+
+if not sys.stdout.isatty() and hasattr(sys.stdout, "reconfigure"):
+    # Keep redirected CLI output compatible with callers that explicitly read it as UTF-8.
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
 DEBUG_LOG_ENV = "AI_LIFEOS_DEBUG_LOG"
 DEFAULT_CHAT_CODEX_MODEL = "gpt-5.6-luna"
 DEFAULT_CHAT_CODEX_REASONING_EFFORT = "medium"
@@ -243,8 +249,13 @@ def generate_assistant_reply_with_context(
     memory_context = ""
     memory_context_result: AnswerContext | None = None
     if include_memory_context:
-        latest_user = _latest_user_content(messages)
-        memory_context_result = build_answer_context(root=root, question=latest_user)
+        recent_user_messages = _recent_user_contents(messages)
+        latest_user = recent_user_messages[-1] if recent_user_messages else ""
+        memory_context_result = build_answer_context(
+            root=root,
+            question=latest_user,
+            recent_user_messages=recent_user_messages,
+        )
         memory_context = memory_context_result.text
         _debug_log(
             root,
@@ -432,7 +443,12 @@ def generate_assistant_reply_streaming_with_context(
         memory_context_result: AnswerContext | None = None
         memory_started_at = time.perf_counter()
         if include_memory_context:
-            memory_context_result = build_answer_context(root=root, question=_latest_user_content(messages))
+            recent_user_messages = _recent_user_contents(messages)
+            memory_context_result = build_answer_context(
+                root=root,
+                question=recent_user_messages[-1] if recent_user_messages else "",
+                recent_user_messages=recent_user_messages,
+            )
             memory_context = memory_context_result.text
             _debug_log(
                 root,
@@ -571,10 +587,13 @@ def _terminate_process(process: subprocess.Popen) -> None:
 
 
 def _latest_user_content(messages: list[LiveMessage]) -> str:
-    for message in reversed(messages):
-        if message.role == "user":
-            return message.content
-    return ""
+    recent = _recent_user_contents(messages, limit=1)
+    return recent[-1] if recent else ""
+
+
+def _recent_user_contents(messages: list[LiveMessage], limit: int = 2) -> tuple[str, ...]:
+    contents = [message.content for message in messages if message.role == "user" and message.content.strip()]
+    return tuple(contents[-max(limit, 1) :])
 
 
 def _display_path(path: Path, root: Path) -> str:

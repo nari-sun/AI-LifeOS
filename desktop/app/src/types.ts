@@ -50,6 +50,8 @@ export interface MemoryContextReference {
   date: string | null
   snippet: string
   score: number
+  speaker_role: string | null
+  message_number: number | null
 }
 
 export interface MemoryContextSummary {
@@ -58,6 +60,7 @@ export interface MemoryContextSummary {
   score: number
   threshold: number
   reasons: string[]
+  retrieval_modes: string[]
   reference_count: number
   references: MemoryContextReference[]
 }

@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import sys
 import tempfile
@@ -394,7 +395,7 @@ class Phase3MemoryTests(unittest.TestCase):
                     self.assertIn(f"Category: {category}", context.text)
                     self.assertIn(expected_text, context.text)
 
-    def test_build_answer_context_skips_general_question(self):
+    def test_build_answer_context_uses_capped_core_memory_and_narrow_search_for_general_question(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = self.make_root(temp_dir)
 
@@ -404,8 +405,129 @@ class Phase3MemoryTests(unittest.TestCase):
                 use_index=False,
             )
 
-            self.assertFalse(context.should_use_memory)
-            self.assertEqual("", context.text)
+            self.assertTrue(context.should_use_memory)
+            self.assertTrue(context.used_memory)
+            self.assertEqual(("core", "narrow"), context.retrieval_modes)
+            self.assertEqual((), context.results)
+            self.assertIn("Priority Memory", context.text)
+
+    def test_general_question_reads_at_most_two_narrow_memory_matches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            question = "静かなラーメン店について教えて"
+
+            self.assertFalse(build_answer_context.assess_memory_need(question).should_use_memory)
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question=question,
+                use_index=False,
+            )
+
+            self.assertTrue(context.should_use_memory)
+            self.assertEqual(("core", "narrow"), context.retrieval_modes)
+            self.assertLessEqual(len(context.results), 2)
+            self.assertIn("Narrow Memory Matches", context.text)
+            self.assertIn("静かなラーメン店の候補", context.text)
+            self.assertNotIn("Journal Matches", context.text)
+
+    def test_narrow_search_caps_multiple_matching_documents_at_two(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            journal_dir = root / "journal" / "2026" / "07"
+            for day in (6, 7, 8):
+                (journal_dir / f"2026-07-{day:02d}.md").write_text(
+                    f"# 2026-07-{day:02d}\n\nNARROW_LIMIT_SENTINEL {day}\n",
+                    encoding="utf-8",
+                )
+
+            question = "NARROW_LIMIT_SENTINELについて教えて"
+            self.assertFalse(build_answer_context.assess_memory_need(question).should_use_memory)
+            context = build_answer_context.build_answer_context(root=root, question=question, use_index=False)
+
+            self.assertEqual(("core", "narrow"), context.retrieval_modes)
+            self.assertEqual(2, len(context.results))
+            self.assertTrue(all(result.document_type == "journal" for result in context.results))
+
+    def test_core_memory_is_capped_while_general_question_uses_narrow_search(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            (root / "memory" / "long_term.md").write_text("# Long-Term\n\n" + "A" * 1400, encoding="utf-8")
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="SQLiteとは？",
+                max_memory_chars=5000,
+                use_index=False,
+            )
+
+            self.assertTrue(context.should_use_memory)
+            self.assertIn("...[truncated]", context.text)
+            self.assertNotIn("A" * 1100, context.text)
+            self.assertEqual((), context.results)
+            self.assertEqual(("core", "narrow"), context.retrieval_modes)
+
+    def test_self_reference_variants_and_follow_up_use_memory_without_writing_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            (root / "memory" / "long_term.md").write_text(
+                "# Long-Term Memory\n\n- ユーザーはiPhone 17を使用している。\n",
+                encoding="utf-8",
+            )
+            before = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+            cases = (
+                ("俺のスマホは？", (), "fallback"),
+                ("おれのスマホは？", (), "fallback"),
+                ("じゃあスマホは？", ("俺のスマホは？", "じゃあスマホは？"), "fallback"),
+                ("前に話した俺の端末は？", (), "fallback"),
+            )
+            for question, recent_user_messages, expected_mode in cases:
+                with self.subTest(question=question):
+                    context = build_answer_context.build_answer_context(
+                        root=root,
+                        question=question,
+                        recent_user_messages=recent_user_messages,
+                        use_index=False,
+                    )
+                    self.assertTrue(context.used_memory)
+                    self.assertIn("iPhone 17", context.text)
+                    self.assertIn(expected_mode, context.retrieval_modes)
+
+            after = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(before, after)
+
+    def test_past_fact_lookup_reads_unorganized_live_log_without_modifying_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            live_dir = root / "inbox" / "live"
+            live_dir.mkdir(parents=True)
+            live_file = live_dir / "2026-07-15_101010.jsonl"
+            records = [
+                {"role": "user", "timestamp": "2026-07-15T10:10:10+09:00", "content": "PAST_FACT_SENTINELを確認した。"},
+                {"role": "assistant", "timestamp": "2026-07-15T10:10:11+09:00", "content": "LIVE_ANSWER_SENTINELとして回答した。"},
+            ]
+            live_file.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
+            before = live_file.read_bytes()
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="前に PAST_FACT_SENTINEL について何て答えた？",
+                use_index=False,
+            )
+
+            self.assertIn("Unorganized Live Conversation Evidence", context.text)
+            self.assertIn("PAST_FACT_SENTINEL", context.text)
+            self.assertIn("LIVE_ANSWER_SENTINEL", context.text)
+            self.assertTrue(any(result.document_type == "live_message" for result in context.results))
+            self.assertEqual(before, live_file.read_bytes())
 
     def test_memory_need_scoring_combines_weak_signals(self):
         personal = build_answer_context.assess_memory_need("俺におすすめの本は？")
@@ -473,6 +595,159 @@ class Phase3MemoryTests(unittest.TestCase):
             self.assertIn("Raw Conversation Evidence", context.text)
             self.assertIn("PERSONAL_SENTINEL", context.text)
             self.assertTrue(any(result.document_type == "raw_chunk" for result in context.results))
+
+    def test_role_aware_evidence_pairs_chatgpt_import_and_live_responses(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cases = (
+                (
+                    "chatgpt",
+                    ("Source: ChatGPT export", "Title: Imported role evidence"),
+                    "IMPORTED_USER_SENTINEL",
+                    "IMPORTED_ASSISTANT_CONCLUSION",
+                ),
+                (
+                    "live",
+                    ("Session: Live role evidence",),
+                    "LIVE_USER_SENTINEL",
+                    "LIVE_ASSISTANT_CONCLUSION",
+                ),
+            )
+            for index, (name, headers, user_marker, assistant_marker) in enumerate(cases, start=1):
+                session = root / "conversations" / "2026" / "07" / f"2026-07-11_12000{index}"
+                session.mkdir(parents=True)
+                (session / "raw.md").write_text(
+                    "\n".join(
+                        (
+                            "# Chat Log",
+                            "",
+                            "Date: 2026-07-11",
+                            *headers,
+                            "",
+                            "## User",
+                            "",
+                            "Timestamp: 2026-07-11T12:00:00+09:00",
+                            "",
+                            f"AI-LifeOS {user_marker}",
+                            "",
+                            "## Assistant",
+                            "",
+                            "Timestamp: 2026-07-11T12:01:00+09:00",
+                            "",
+                            assistant_marker,
+                            "",
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+
+            memory_index.rebuild_index(root)
+            for name, _, user_marker, assistant_marker in cases:
+                with self.subTest(source=name):
+                    context = build_answer_context.build_answer_context(
+                        root=root,
+                        question=f"AI-LifeOS {user_marker}",
+                    )
+
+                    raw_chunks = [item for item in context.results if item.document_type == "raw_chunk"]
+                    self.assertEqual(["user", "assistant"], [item.speaker_role for item in raw_chunks])
+                    self.assertEqual([1, 2], [item.message_number for item in raw_chunks])
+                    self.assertIn(user_marker, context.text)
+                    self.assertIn(assistant_marker, context.text)
+                    self.assertIn("Role: user", context.text)
+                    self.assertIn("Role: assistant", context.text)
+                    roles = [reference.speaker_role for reference in context.references if reference.document_type == "raw_chunk"]
+                    self.assertEqual(["user", "assistant"], roles)
+                    expected_title = "Imported role evidence" if name == "chatgpt" else "Live role evidence"
+                    self.assertTrue(all(expected_title in item.title for item in raw_chunks))
+
+    def test_role_aware_evidence_keeps_chatgpt_messages_without_timestamps(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = root / "conversations" / "2026" / "07" / "2026-07-11_121500"
+            session.mkdir(parents=True)
+            (session / "raw.md").write_text(
+                "\n".join(
+                    (
+                        "# Chat Log",
+                        "",
+                        "Date: 2026-07-11",
+                        "Source: ChatGPT export",
+                        "Title: Imported messages without timestamps",
+                        "",
+                        "## User",
+                        "",
+                        "AI-LifeOS NO_TIMESTAMP_USER_SENTINEL",
+                        "",
+                        "## Assistant",
+                        "",
+                        "NO_TIMESTAMP_ASSISTANT_CONCLUSION",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            memory_index.rebuild_index(root)
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="AI-LifeOS NO_TIMESTAMP_USER_SENTINEL",
+            )
+
+            raw_chunks = [item for item in context.results if item.document_type == "raw_chunk"]
+            self.assertEqual(["user", "assistant"], [item.speaker_role for item in raw_chunks])
+            self.assertEqual([1, 2], [item.message_number for item in raw_chunks])
+            self.assertIn("NO_TIMESTAMP_USER_SENTINEL", context.text)
+            self.assertIn("NO_TIMESTAMP_ASSISTANT_CONCLUSION", context.text)
+            self.assertNotIn("Timestamp: None", context.text)
+
+    def test_role_aware_evidence_respects_user_and_assistant_queries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = root / "conversations" / "2026" / "07" / "2026-07-11_130000"
+            session.mkdir(parents=True)
+            (session / "raw.md").write_text(
+                "\n".join(
+                    (
+                        "# Chat Log",
+                        "",
+                        "Date: 2026-07-11",
+                        "Session: Role-specific evidence",
+                        "",
+                        "## User",
+                        "",
+                        "Timestamp: 2026-07-11T13:00:00+09:00",
+                        "",
+                        "AI-LifeOS ROLE_USER_SENTINEL",
+                        "",
+                        "## Assistant",
+                        "",
+                        "Timestamp: 2026-07-11T13:01:00+09:00",
+                        "",
+                        "ROLE_ASSISTANT_CONCLUSION",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            memory_index.rebuild_index(root)
+
+            user_context = build_answer_context.build_answer_context(
+                root=root,
+                question="AI-LifeOS what did I say ROLE_USER_SENTINEL",
+            )
+            user_chunks = [item for item in user_context.results if item.document_type == "raw_chunk"]
+            self.assertEqual(["user"], [item.speaker_role for item in user_chunks])
+            self.assertIn("ROLE_USER_SENTINEL", user_context.text)
+            self.assertNotIn("ROLE_ASSISTANT_CONCLUSION", user_context.text)
+
+            assistant_context = build_answer_context.build_answer_context(
+                root=root,
+                question="AI-LifeOS assistant response ROLE_USER_SENTINEL",
+            )
+            assistant_chunks = [item for item in assistant_context.results if item.document_type == "raw_chunk"]
+            self.assertEqual(["user", "assistant"], [item.speaker_role for item in assistant_chunks])
+            self.assertIn("ROLE_ASSISTANT_CONCLUSION", assistant_context.text)
 
     def test_answer_context_records_reference_sources(self):
         with tempfile.TemporaryDirectory() as temp_dir:

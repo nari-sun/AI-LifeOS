@@ -22,6 +22,7 @@ from codex_conversation import (
 )
 from finalize_live_chat import finalize_live_chat
 from import_chatgpt_export import (
+    CONVERSATION_FILE_PATTERN,
     ExportConversation,
     find_imported_source_ids,
     import_conversations,
@@ -1749,16 +1750,20 @@ def _tts_log(root: Path, message: str) -> None:
 def _resolve_chatgpt_export_source(value: Any) -> Path:
     text = str(value or "").strip()
     if not text:
-        raise ValueError("ChatGPTエクスポートのフォルダ、zip、または conversations.json を選択してください。")
+        raise ValueError(
+            "ChatGPTエクスポートのフォルダ、zip、conversations.json、または conversations-*.json を選択してください。"
+        )
 
     try:
         path = Path(text).expanduser().resolve(strict=True)
     except OSError as exc:
         raise FileNotFoundError("選択したChatGPTエクスポートが見つかりません。") from exc
 
-    if path.is_dir() or path.suffix.lower() == ".zip" or path.name.lower() == "conversations.json":
+    if path.is_dir() or path.suffix.lower() == ".zip" or CONVERSATION_FILE_PATTERN.fullmatch(path.name):
         return path
-    raise ValueError("ChatGPTエクスポートのフォルダ、zip、または conversations.json を選択してください。")
+    raise ValueError(
+        "ChatGPTエクスポートのフォルダ、zip、conversations.json、または conversations-*.json を選択してください。"
+    )
 
 
 def _load_chatgpt_export_source(source_path: Path):
@@ -2013,6 +2018,7 @@ def _serialize_memory_context(context: AnswerContext | None) -> dict[str, Any]:
             "score": 0,
             "threshold": 0,
             "reasons": [],
+            "retrieval_modes": [],
             "reference_count": 0,
             "references": [],
         }
@@ -2023,6 +2029,7 @@ def _serialize_memory_context(context: AnswerContext | None) -> dict[str, Any]:
         "score": context.score,
         "threshold": context.threshold,
         "reasons": list(context.reasons),
+        "retrieval_modes": list(context.retrieval_modes),
         "reference_count": len(context.references),
         "references": [_serialize_memory_reference(reference) for reference in context.references],
     }
@@ -2036,6 +2043,8 @@ def _serialize_memory_reference(reference: MemoryContextReference) -> dict[str, 
         "date": reference.date,
         "snippet": reference.snippet,
         "score": reference.score,
+        "speaker_role": reference.speaker_role,
+        "message_number": reference.message_number,
     }
 
 

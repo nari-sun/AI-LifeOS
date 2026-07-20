@@ -1,7 +1,7 @@
 # ChatGPT Export Import
 
 `scripts/import_chatgpt_export.py` は、ChatGPT のデータエクスポートに含まれる
-`conversations.json` を、AI-LifeOS の `conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md`
+`conversations.json` または分割された `conversations-*.json` を、AI-LifeOS の `conversations/YYYY/MM/YYYY-MM-DD_HHMMSS/raw.md`
 へローカルで変換します。ChatGPT 公式Webやデスクトップアプリは操作せず、OpenAI APIも使いません。
 
 ## 安全方針
@@ -9,7 +9,7 @@
 - 既定は dry-run で、ファイルを書きません。
 - 実取り込みは `--apply` に加え、`--all`、期間、タイトル、会話IDのいずれかを明示した場合だけ行います。
 - `summary.md`、journal、memory、検索indexは自動更新しません。
-- zip は展開せず、内部の `conversations.json` だけを読みます。
+- zip は展開せず、内部の `conversations.json` または連番の `conversations-*.json` を読みます。
 - `user` / `assistant` のテキスト発言だけを保存します。分岐情報がある場合は `current_node` につながる現在の枝を選びます。
 - source conversation ID を `import_metadata.json` に残し、同じIDの再取り込みをスキップします。IDがない場合は内容から安定したSHA-256識別子を作ります。
 - エクスポート元は `imports/`、変換結果は `conversations/` に置き、いずれもPublicEditionではGit管理しません。
@@ -22,12 +22,12 @@ ChatGPT の export zip を `imports/chatgpt_export/` に置いた例です。
 python scripts\import_chatgpt_export.py imports\chatgpt_export\export.zip
 ```
 
-exportを展開済みなら、フォルダまたは `conversations.json` を直接指定できます。dry-runには、
+exportを展開済みなら、フォルダ、`conversations.json`、または個別の `conversations-*.json` を直接指定できます。dry-runには、
 export内件数、選択件数、UTC期間、タイトル、会話ID、発言数、重複状態が表示されます。
 
 ### Chat GUIから確認する
 
-Chat GUIでは、左サイドバーの **管理 > ChatGPTインポート** から、export ZIP、展開済みフォルダ、または `conversations.json` を選択できます。
+Chat GUIでは、左サイドバーの **管理 > ChatGPTインポート** から、export ZIP、展開済みフォルダ、`conversations.json`、または個別の `conversations-*.json` を選択できます。
 
 最初の選択操作はdry-runで、会話一覧、新規件数、重複件数を表示するだけです。タイトル、会話ID、UTC作成日で絞り込み、取り込む会話にチェックを付けます。重複済みの会話は選択できません。
 

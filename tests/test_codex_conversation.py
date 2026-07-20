@@ -310,6 +310,39 @@ class CodexConversationTests(unittest.TestCase):
 
         self.assertLess(call_order.index("popen"), call_order.index("memory"))
 
+    def test_memory_context_receives_only_the_two_latest_user_messages(self):
+        captured = {}
+        original_build = codex_conversation.build_answer_context
+
+        def fake_build(**kwargs):
+            captured.update(kwargs)
+            return codex_conversation.AnswerContext(should_use_memory=False, text="", results=())
+
+        def fake_run(command, **kwargs):
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("reply", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        messages = [
+            create_live_message("user", "古い質問"),
+            create_live_message("assistant", "古い返答"),
+            create_live_message("user", "直前の質問"),
+            create_live_message("assistant", "直前の返答"),
+            create_live_message("user", "じゃあスマホは？"),
+        ]
+        codex_conversation.build_answer_context = fake_build
+        try:
+            codex_conversation.generate_assistant_reply_with_context(
+                root=ROOT,
+                messages=messages,
+                run_command=fake_run,
+            )
+        finally:
+            codex_conversation.build_answer_context = original_build
+
+        self.assertEqual("じゃあスマホは？", captured["question"])
+        self.assertEqual(("直前の質問", "じゃあスマホは？"), captured["recent_user_messages"])
+
     def test_streaming_app_server_interrupt_suppresses_delta_and_raises(self):
         process = FakeAppServerProcess(complete_status="interrupted")
         deltas = []
