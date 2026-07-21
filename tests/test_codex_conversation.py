@@ -1,5 +1,6 @@
 import json
 import io
+import inspect
 import os
 import queue
 import subprocess
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +18,15 @@ SCRIPT = ROOT / "scripts" / "codex_conversation.py"
 
 import codex_conversation  # noqa: E402
 from live_session import create_live_message  # noqa: E402
+
+
+def memory_mcp_inventory(include_personal_memory=True):
+    tools = {
+        name: {}
+        for name in codex_conversation.MEMORY_MCP_TOOLS
+        if include_personal_memory or name != "get_personal_memory"
+    }
+    return [{"name": codex_conversation.MEMORY_MCP_SERVER_NAME, "tools": tools}]
 
 
 class FakeAppServerOutput:
@@ -49,6 +60,13 @@ class FakeAppServerStdin:
         method = request.get("method")
         if method == "initialize":
             self.process.stdout.push({"id": request["id"], "result": {}})
+        elif method == "mcpServerStatus/list":
+            self.process.stdout.push(
+                {
+                    "id": request["id"],
+                    "result": {"data": self.process.mcp_inventory, "nextCursor": None},
+                }
+            )
         elif method == "thread/start":
             self.process.stdout.push({"id": request["id"], "result": {"thread": {"id": "thread-1"}}})
         elif method == "turn/start":
@@ -91,8 +109,9 @@ class FakeAppServerStdin:
 
 
 class FakeAppServerProcess:
-    def __init__(self, complete_status="completed"):
+    def __init__(self, complete_status="completed", mcp_inventory=None):
         self.requests = []
+        self.mcp_inventory = list(mcp_inventory or [])
         self.stdout = FakeAppServerOutput()
         self.stderr = io.StringIO("")
         self.stdin = FakeAppServerStdin(self, complete_status=complete_status)
@@ -115,6 +134,12 @@ class FakeAppServerProcess:
 
 
 class CodexConversationTests(unittest.TestCase):
+    def setUp(self):
+        self.original_mcp_inventory_reader = codex_conversation._list_configured_mcp_server_names
+        patcher = mock.patch.object(codex_conversation, "_list_configured_mcp_server_names", return_value=())
+        self.mock_mcp_inventory_reader = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def make_live_file(self, root: Path) -> Path:
         live_dir = root / "inbox" / "live"
         live_dir.mkdir(parents=True, exist_ok=True)
@@ -192,6 +217,109 @@ class CodexConversationTests(unittest.TestCase):
             self.assertEqual("user", records[0]["role"])
             self.assertEqual("Hello live chat.", records[0]["content"])
 
+    def test_temporary_cli_session_keeps_live_log_and_skips_archive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--root",
+                    str(root),
+                    "--temporary",
+                    "--no-ai",
+                ],
+                input="temporary note\n/exit\n",
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(0, completed.returncode)
+            live_files = list((root / "inbox" / "live").glob("*.jsonl"))
+            self.assertEqual(1, len(live_files))
+            metadata = json.loads(live_files[0].with_suffix(".session.json").read_text(encoding="utf-8"))
+            self.assertTrue(metadata["personalization"]["temporary"])
+            self.assertTrue(metadata["personalization"]["exclude_from_memory"])
+            self.assertFalse((root / "conversations").exists())
+
+    def test_new_cli_session_snapshots_global_personalization_but_resume_preserves_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            memory = root / "memory"
+            memory.mkdir()
+            settings_path = memory / "personalization_settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "memory_enabled": False,
+                        "past_chat_search_enabled": True,
+                        "project_scope": "Snapshot Scope",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            first = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--root",
+                    str(root),
+                    "--no-ai",
+                    "--no-finalize-on-exit",
+                ],
+                input="snapshot me\n/exit\n",
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(0, first.returncode)
+            live_file = next((root / "inbox" / "live").glob("*.jsonl"))
+            sidecar = live_file.with_suffix(".session.json")
+            snapshot = json.loads(sidecar.read_text(encoding="utf-8"))["personalization"]
+            self.assertFalse(snapshot["memory_enabled"])
+            self.assertTrue(snapshot["past_chat_search_enabled"])
+            self.assertEqual("Snapshot Scope", snapshot["project_scope"])
+
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "memory_enabled": True,
+                        "past_chat_search_enabled": False,
+                        "project_scope": "Changed Global Scope",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            resumed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--root",
+                    str(root),
+                    "--resume",
+                    str(live_file),
+                    "--resume-days",
+                    "9999",
+                    "--no-ai",
+                    "--no-finalize-on-exit",
+                ],
+                input="/exit\n",
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(0, resumed.returncode)
+            self.assertEqual(snapshot, json.loads(sidecar.read_text(encoding="utf-8"))["personalization"])
+
     def test_build_codex_chat_prompt_contains_recent_context_and_guardrails(self):
         messages = [
             create_live_message("user", "First"),
@@ -212,13 +340,111 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIsNone(args.chat_codex_service_tier)
         self.assertFalse(args.chat_codex_fast_mode)
 
+    def test_fail_closed_personalization_supplies_all_required_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with mock.patch.object(
+                codex_conversation,
+                "load_session_personalization",
+                side_effect=ValueError("private metadata body"),
+            ):
+                settings = codex_conversation._load_session_personalization_fail_closed(
+                    root, root / "inbox/live/x.jsonl"
+                )
+
+        self.assertTrue(settings.temporary)
+        self.assertTrue(settings.temporary_locked)
+        self.assertTrue(settings.exclude_from_memory)
+        self.assertFalse(settings.memory_enabled)
+        self.assertFalse(settings.past_chat_search_enabled)
+
+    def test_debug_argv_redacts_project_scope_forms(self):
+        sanitized = codex_conversation._sanitized_argv_for_debug(
+            ["--root", "C:/repo", "--project-scope", "Secret Project", "--project-scope=Other Secret"]
+        )
+
+        self.assertEqual(
+            ["--root", "C:/repo", "--project-scope", "<redacted>", "--project-scope=<redacted>"],
+            sanitized,
+        )
+        self.assertNotIn("Secret Project", repr(sanitized))
+        self.assertNotIn("Other Secret", repr(sanitized))
+
+    def test_memory_mcp_config_binds_scope_and_requires_startup(self):
+        options = codex_conversation._memory_mcp_config_options(
+            ROOT,
+            include_personal_memory=False,
+            project_scope="Private Project",
+        )
+        args_value = next(value for value in options if value.startswith("mcp_servers.ai_lifeos_memory.args="))
+
+        server_args = json.loads(args_value.split("=", 1)[1])
+        self.assertEqual("--project-scope", server_args[-2])
+        self.assertEqual("Private Project", server_args[-1])
+        self.assertIn("mcp_servers.ai_lifeos_memory.required=true", options)
+        enabled_tools = next(
+            value for value in options if value.startswith("mcp_servers.ai_lifeos_memory.enabled_tools=")
+        )
+        self.assertNotIn("get_personal_memory", enabled_tools)
+
+    def test_tool_isolation_disables_resolved_ambient_servers(self):
+        options = codex_conversation._codex_tool_isolation_options(
+            ("github", "node_repl", codex_conversation.MEMORY_MCP_SERVER_NAME)
+        )
+
+        self.assertIn("mcp_servers.github.enabled=false", options)
+        self.assertIn("mcp_servers.node_repl.enabled=false", options)
+        self.assertIn("mcp_servers.ai_lifeos_memory.enabled=false", options)
+        self.assertIn("features.shell_tool=false", options)
+        self.assertIn("features.apps=false", options)
+        self.assertIn('web_search="disabled"', options)
+
+    def test_mcp_inventory_reader_accepts_only_safe_names(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="\ufeff" + json.dumps([{"name": "github"}, {"name": "node_repl"}]),
+                stderr="ignored",
+            )
+
+        names = self.original_mcp_inventory_reader("codex.cmd", ROOT, run_command=fake_run)
+
+        self.assertEqual(("github", "node_repl"), names)
+        self.assertEqual(
+            [
+                "codex.cmd",
+                "mcp",
+                "list",
+                "--json",
+                "-c",
+                "features.plugins=false",
+                "-c",
+                "features.apps=false",
+                "-c",
+                "features.remote_plugin=false",
+            ],
+            calls[0][0],
+        )
+        self.assertEqual(10, calls[0][1]["timeout"])
+
+    def test_mcp_inventory_reader_fails_closed_on_unsafe_name(self):
+        def fake_run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout='[{"name":"bad.name"}]', stderr="")
+
+        with self.assertRaisesRegex(RuntimeError, "unsupported server name"):
+            self.original_mcp_inventory_reader("codex.cmd", ROOT, run_command=fake_run)
+
     def test_build_codex_chat_prompt_requires_grounded_memory_recall(self):
         memory_context = """AI-LifeOS memory context (read-only).
 
 ## Conversation Matches
-- Date: 2026-07-11
-  Source: conversations/2026/07/example/summary.md
-  Snippet: ユーザーは千昭の計画性のなさを指摘した。"""
+- Date: 2099-06-07
+  Source: conversations/2099/06/2099-06-07_080910/summary.md
+  Snippet: SYNTHETIC_OPINION_MARKER — ユーザーは架空人物アルファの合成上の判断を指摘した。"""
 
         prompt = codex_conversation.build_codex_chat_prompt(
             [create_live_message("user", "前に話した感想を覚えてる？")],
@@ -230,7 +456,21 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn("Do not fill gaps with general knowledge", prompt)
         self.assertIn("Do not reverse, soften, or strengthen a stored claim", prompt)
         self.assertIn("say that the stored records do not confirm it", prompt)
-        self.assertIn("ユーザーは千昭の計画性のなさを指摘した", prompt)
+        self.assertIn(
+            "SYNTHETIC_OPINION_MARKER — ユーザーは架空人物アルファの合成上の判断を指摘した",
+            prompt,
+        )
+
+    def test_build_codex_chat_prompt_instructs_agentic_memory_retry(self):
+        prompt = codex_conversation.build_codex_chat_prompt(
+            [create_live_message("user", "前に話した映画の感想を教えて")],
+            memory_tools_enabled=True,
+        )
+
+        self.assertIn("search_past_chats", prompt)
+        self.assertIn("zero-result first search is not proof", prompt)
+        self.assertIn("open_conversation", prompt)
+        self.assertIn("Never use these tools to write", prompt)
 
     def test_generate_assistant_reply_reads_codex_output_file(self):
         calls = []
@@ -256,20 +496,309 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn('model_reasoning_effort="medium"', command)
         self.assertNotIn('service_tier="fast"', command)
         self.assertIn("features.fast_mode=false", command)
+        self.assertIn("--json", command)
+        # Keep the resolved server definitions so per-server `enabled=false`
+        # overrides remain valid transports; every ambient server is disabled
+        # explicitly before the scoped Memory MCP is redefined below.
+        self.assertNotIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
+        self.assertIn("--ephemeral", command)
+        self.assertIn("features.shell_tool=false", command)
+        self.assertIn('web_search="disabled"', command)
+        self.assertIn("mcp_servers.ai_lifeos_memory.enabled=true", command)
+        self.assertIn("mcp_servers.ai_lifeos_memory.required=true", command)
+        self.assertTrue(any("memory_mcp_server.py" in value for value in command))
+        self.assertIn(
+            'mcp_servers.ai_lifeos_memory.enabled_tools=["search_past_chats", "open_conversation", '
+            '"get_personal_memory", "get_index_health"]',
+            command,
+        )
         self.assertIn("--sandbox", command)
         self.assertEqual("read-only", command[command.index("--sandbox") + 1])
         self.assertIn("User:\nHello", calls[0][1]["input"])
 
+    def test_generate_assistant_reply_can_disable_memory_mcp(self):
+        calls = []
+        self.mock_mcp_inventory_reader.return_value = (codex_conversation.MEMORY_MCP_SERVER_NAME,)
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("reply", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_conversation.generate_assistant_reply(
+                root=Path(temp_dir),
+                messages=[create_live_message("user", "Hello")],
+                include_memory_context=False,
+                run_command=fake_run,
+            )
+
+        command, kwargs = calls[0]
+        self.assertIn("mcp_servers.ai_lifeos_memory.enabled=false", command)
+        self.assertNotIn("mcp_servers.ai_lifeos_memory.enabled=true", command)
+        self.assertNotIn("search_past_chats", kwargs["input"])
+
+    def test_generate_assistant_reply_preserves_legacy_positional_runner_slot(self):
+        calls = []
+        self.mock_mcp_inventory_reader.return_value = (codex_conversation.MEMORY_MCP_SERVER_NAME,)
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("legacy reply", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reply = codex_conversation.generate_assistant_reply(
+                Path(temp_dir),
+                [create_live_message("user", "Hello")],
+                "codex.cmd",
+                "read-only",
+                "never",
+                None,
+                None,
+                None,
+                False,
+                20,
+                False,
+                fake_run,
+            )
+
+        self.assertEqual("legacy reply", reply)
+        self.assertEqual(1, len(calls))
+        self.assertIn("mcp_servers.ai_lifeos_memory.enabled=false", calls[0])
+
+    def test_nonzero_exec_error_does_not_expose_stdout_or_stderr(self):
+        def fake_run(command, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                7,
+                stdout='{"item":{"result":{"structured_content":{"content":"SECRET_MCP_BODY"}}}}',
+                stderr="SECRET_STDERR_BODY",
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(RuntimeError) as raised:
+                codex_conversation.generate_assistant_reply_with_context(
+                    root=Path(temp_dir),
+                    messages=[create_live_message("user", "Hello")],
+                    run_command=fake_run,
+                )
+
+        message = str(raised.exception)
+        self.assertEqual("Codex CLI failed with exit code 7.", message)
+        self.assertNotIn("SECRET_MCP_BODY", message)
+        self.assertNotIn("SECRET_STDERR_BODY", message)
+
+    def test_core_memory_toggle_removes_personal_memory_mcp_tool(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("reply", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_conversation.generate_assistant_reply(
+                root=Path(temp_dir),
+                messages=[create_live_message("user", "前の会話")],
+                include_memory_context=False,
+                enable_memory_mcp=True,
+                include_core_memory=False,
+                include_past_chats=True,
+                run_command=fake_run,
+            )
+
+        command, kwargs = calls[0]
+        enabled_tools = next(
+            value
+            for value in command
+            if value.startswith("mcp_servers.ai_lifeos_memory.enabled_tools=")
+        )
+        self.assertIn("search_past_chats", enabled_tools)
+        self.assertNotIn("get_personal_memory", enabled_tools)
+        self.assertNotIn("Use get_personal_memory", kwargs["input"])
+
+    def test_search_candidates_do_not_overstate_memory_as_used(self):
+        def fake_run(command, **kwargs):
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("source-grounded reply", encoding="utf-8")
+            event = {
+                "type": "item.completed",
+                "item": {
+                    "id": "item-1",
+                    "type": "mcp_tool_call",
+                    "server": "ai_lifeos_memory",
+                    "tool": "search_past_chats",
+                    "status": "completed",
+                    "result": {
+                        "structured_content": {
+                            "results": [
+                                {
+                                    "score": 91,
+                                    "excerpt": "作品についてのユーザー発言",
+                                    "source": {
+                                        "path": "conversations/2099/06/2099-06-07_080910/raw.md",
+                                        "document_type": "raw_chunk",
+                                        "title": "Example / user message 3",
+                                        "date": "2099-06-07",
+                                        "role": "user",
+                                        "message_number": 3,
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(event), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = codex_conversation.generate_assistant_reply_with_context(
+                root=Path(temp_dir),
+                messages=[create_live_message("user", "前の感想")],
+                include_memory_context=False,
+                enable_memory_mcp=True,
+                run_command=fake_run,
+            )
+
+        self.assertEqual("source-grounded reply", result.reply)
+        self.assertIsNone(result.memory_context)
+        self.assertEqual(1, len(result.memory_candidates))
+        reference = result.memory_candidates[0]
+        self.assertEqual("conversations/2099/06/2099-06-07_080910/raw.md", reference.path)
+        self.assertEqual("user", reference.speaker_role)
+        self.assertEqual(3, reference.message_number)
+
+    def test_opened_mcp_source_is_reported_as_used_primary_evidence(self):
+        def fake_run(command, **kwargs):
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("grounded reply", encoding="utf-8")
+            event = {
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "ai_lifeos_memory",
+                    "tool": "open_conversation",
+                    "status": "completed",
+                    "result": {
+                        "structured_content": {
+                            "source": {
+                                "path": "conversations/2099/06/2099-06-07_080910/raw.md",
+                                "document_type": "raw",
+                                "title": "Example",
+                                "date": "2099-06-07",
+                            },
+                            "messages": [
+                                {"role": "user", "message_number": 3, "text": "primary evidence"}
+                            ],
+                        }
+                    },
+                },
+            }
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(event), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = codex_conversation.generate_assistant_reply_with_context(
+                root=Path(temp_dir),
+                messages=[create_live_message("user", "recall it")],
+                include_memory_context=False,
+                enable_memory_mcp=True,
+                run_command=fake_run,
+            )
+
+        self.assertIsNotNone(result.memory_context)
+        self.assertTrue(result.memory_context.used_memory)
+        self.assertEqual(1, len(result.memory_context.references))
+        self.assertEqual((), result.memory_candidates)
+        self.assertEqual(1, len(result.memory_opened))
+        self.assertEqual("primary evidence", result.memory_context.references[0].snippet)
+
+    def test_active_live_session_is_forwarded_to_static_and_mcp_retrieval(self):
+        captured = {}
+        calls = []
+        original_build = codex_conversation.build_answer_context
+
+        def fake_build(**kwargs):
+            captured.update(kwargs)
+            return codex_conversation.AnswerContext(should_use_memory=False, text="", results=())
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("reply", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            active = root / "inbox" / "live" / "2099-01-02_030405.jsonl"
+            active.parent.mkdir(parents=True)
+            codex_conversation.build_answer_context = fake_build
+            try:
+                codex_conversation.generate_assistant_reply_with_context(
+                    root=root,
+                    messages=[create_live_message("user", "remember")],
+                    include_memory_context=True,
+                    enable_memory_mcp=True,
+                    exclude_live_session=active,
+                    run_command=fake_run,
+                )
+            finally:
+                codex_conversation.build_answer_context = original_build
+
+        self.assertEqual(active, captured["exclude_live_session"])
+        args_value = next(
+            value for value in calls[0] if value.startswith("mcp_servers.ai_lifeos_memory.args=")
+        )
+        server_args = json.loads(args_value.split("=", 1)[1])
+        index = server_args.index("--exclude-live-session")
+        self.assertEqual(str(active), server_args[index + 1])
+
+    def test_extracts_camel_case_app_server_mcp_result(self):
+        references = codex_conversation._memory_references_from_mcp_item(
+            {
+                "type": "mcpToolCall",
+                "server": "ai_lifeos_memory",
+                "tool": "get_personal_memory",
+                "status": "completed",
+                "result": {
+                    "structuredContent": {
+                        "sources": [
+                            {
+                                "path": "memory/preferences.md",
+                                "document_type": "memory",
+                                "title": "Preferences",
+                                "content": "SYNTHETIC_PREFERENCE_TOKEN",
+                            }
+                        ]
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(1, len(references))
+        self.assertEqual("memory/preferences.md", references[0].path)
+        self.assertIn("SYNTHETIC_PREFERENCE_TOKEN", references[0].snippet)
+
     def test_streaming_app_server_emits_only_agent_delta_and_returns_completed_text(self):
         process = FakeAppServerProcess()
         deltas = []
+        commands = []
+        self.mock_mcp_inventory_reader.return_value = (codex_conversation.MEMORY_MCP_SERVER_NAME,)
+
+        def fake_popen(command, **kwargs):
+            commands.append(command)
+            return process
 
         result = codex_conversation.generate_assistant_reply_streaming_with_context(
             root=ROOT,
             messages=[create_live_message("user", "Hello")],
             on_delta=deltas.append,
             include_memory_context=False,
-            popen=lambda *args, **kwargs: process,
+            popen=fake_popen,
         )
 
         self.assertEqual(["途中"], deltas)
@@ -283,9 +812,13 @@ class CodexConversationTests(unittest.TestCase):
         self.assertEqual("medium", turn_start["params"]["effort"])
         self.assertNotIn("serviceTier", thread_start["params"])
         self.assertNotIn("serviceTier", turn_start["params"])
+        self.assertIn("features.shell_tool=false", commands[0])
+        self.assertIn("mcp_servers.ai_lifeos_memory.enabled=false", commands[0])
+        self.assertNotIn("mcp_servers.ai_lifeos_memory.enabled=true", commands[0])
+        self.assertTrue(any(request.get("method") == "mcpServerStatus/list" for request in process.requests))
 
     def test_streaming_starts_app_server_before_building_memory_context(self):
-        process = FakeAppServerProcess()
+        process = FakeAppServerProcess(mcp_inventory=memory_mcp_inventory())
         call_order = []
         original_build = codex_conversation.build_answer_context
 
@@ -309,6 +842,40 @@ class CodexConversationTests(unittest.TestCase):
             codex_conversation.build_answer_context = original_build
 
         self.assertLess(call_order.index("popen"), call_order.index("memory"))
+
+    def test_streaming_fails_closed_when_memory_mcp_is_missing(self):
+        process = FakeAppServerProcess(mcp_inventory=[])
+
+        with self.assertRaisesRegex(
+            codex_conversation.AppServerStreamingUnavailable,
+            "unexpected MCP server",
+        ):
+            codex_conversation.generate_assistant_reply_streaming_with_context(
+                root=ROOT,
+                messages=[create_live_message("user", "Hello")],
+                on_delta=lambda _: None,
+                include_memory_context=True,
+                popen=lambda *args, **kwargs: process,
+            )
+
+        self.assertFalse(any(request.get("method") == "thread/start" for request in process.requests))
+
+    def test_streaming_fails_closed_when_ambient_mcp_remains_enabled(self):
+        process = FakeAppServerProcess(mcp_inventory=[{"name": "github", "tools": {"search": {}}}])
+
+        with self.assertRaisesRegex(
+            codex_conversation.AppServerStreamingUnavailable,
+            "unexpected MCP server",
+        ):
+            codex_conversation.generate_assistant_reply_streaming_with_context(
+                root=ROOT,
+                messages=[create_live_message("user", "Hello")],
+                on_delta=lambda _: None,
+                include_memory_context=False,
+                popen=lambda *args, **kwargs: process,
+            )
+
+        self.assertFalse(any(request.get("method") == "thread/start" for request in process.requests))
 
     def test_memory_context_receives_only_the_two_latest_user_messages(self):
         captured = {}
@@ -343,6 +910,36 @@ class CodexConversationTests(unittest.TestCase):
         self.assertEqual("じゃあスマホは？", captured["question"])
         self.assertEqual(("直前の質問", "じゃあスマホは？"), captured["recent_user_messages"])
 
+    def test_memory_context_receives_personalization_filters(self):
+        captured = {}
+        original_build = codex_conversation.build_answer_context
+
+        def fake_build(**kwargs):
+            captured.update(kwargs)
+            return codex_conversation.AnswerContext(should_use_memory=False, text="", results=())
+
+        def fake_run(command, **kwargs):
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("reply", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        codex_conversation.build_answer_context = fake_build
+        try:
+            codex_conversation.generate_assistant_reply_with_context(
+                root=ROOT,
+                messages=[create_live_message("user", "前の話")],
+                include_core_memory=False,
+                include_past_chats=True,
+                project_scope="AI-LifeOS",
+                run_command=fake_run,
+            )
+        finally:
+            codex_conversation.build_answer_context = original_build
+
+        self.assertFalse(captured["include_core_memory"])
+        self.assertTrue(captured["include_past_chats"])
+        self.assertEqual("AI-LifeOS", captured["project_scope"])
+
     def test_streaming_app_server_interrupt_suppresses_delta_and_raises(self):
         process = FakeAppServerProcess(complete_status="interrupted")
         deltas = []
@@ -362,6 +959,69 @@ class CodexConversationTests(unittest.TestCase):
         self.assertEqual("thread-1", interrupt["params"]["threadId"])
         self.assertEqual("turn-1", interrupt["params"]["turnId"])
 
+    def test_streaming_interrupt_timeout_forces_process_cleanup(self):
+        class SilentInterruptStdin(FakeAppServerStdin):
+            def write(self, raw):
+                request = json.loads(raw)
+                if request.get("method") == "turn/interrupt":
+                    self.process.requests.append(request)
+                    return len(raw)
+                return super().write(raw)
+
+        process = FakeAppServerProcess(complete_status="pending")
+        process.stdin = SilentInterruptStdin(process, complete_status="pending")
+
+        with mock.patch.object(codex_conversation, "APP_SERVER_INTERRUPT_TIMEOUT_SECONDS", 0.01):
+            with self.assertRaisesRegex(InterruptedError, "停止期限"):
+                codex_conversation.generate_assistant_reply_streaming_with_context(
+                    root=ROOT,
+                    messages=[create_live_message("user", "Hello")],
+                    on_delta=lambda _: None,
+                    is_cancelled=lambda: True,
+                    include_memory_context=False,
+                    popen=lambda *args, **kwargs: process,
+                )
+
+        self.assertTrue(any(request.get("method") == "turn/interrupt" for request in process.requests))
+        self.assertIsNotNone(process.returncode)
+
+    def test_windows_app_server_cleanup_kills_exact_process_tree(self):
+        class FakeProcessTree:
+            pid = 424242
+
+            def __init__(self):
+                self.waited = False
+                self.terminated = False
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                self.waited = True
+                return 0
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                raise AssertionError("taskkill success should not fall through")
+
+        process = FakeProcessTree()
+        completed = subprocess.CompletedProcess([], 0)
+        with mock.patch.object(codex_conversation.os, "name", "nt"), mock.patch.object(
+            codex_conversation.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            codex_conversation._terminate_process(process)
+
+        self.assertEqual(
+            ["taskkill", "/PID", "424242", "/T", "/F"],
+            run.call_args.args[0],
+        )
+        self.assertTrue(process.waited)
+        self.assertFalse(process.terminated)
+
     def test_generate_assistant_reply_includes_memory_context_for_private_question(self):
         calls = []
 
@@ -375,7 +1035,10 @@ class CodexConversationTests(unittest.TestCase):
             root = Path(temp_dir)
             (root / "memory").mkdir()
             (root / "memory" / "long_term.md").write_text("# Long-Term Memory\n\n- ユーザーはAI-LifeOSを作っている。\n", encoding="utf-8")
-            (root / "memory" / "preferences.md").write_text("# Preferences\n\n- ユーザーは静かな店を好む。\n", encoding="utf-8")
+            (root / "memory" / "preferences.md").write_text(
+                "# Preferences\n\n- SYNTHETIC_PREFERENCE_TOKEN\n",
+                encoding="utf-8",
+            )
 
             reply = codex_conversation.generate_assistant_reply(
                 root=root,
@@ -386,7 +1049,7 @@ class CodexConversationTests(unittest.TestCase):
         self.assertEqual("好みに合わせた返答です。", reply)
         prompt = calls[0][1]["input"]
         self.assertIn("AI-LifeOS memory context", prompt)
-        self.assertIn("静かな店を好む", prompt)
+        self.assertIn("SYNTHETIC_PREFERENCE_TOKEN", prompt)
 
     def test_generate_assistant_reply_with_context_returns_reference_metadata(self):
         def fake_run(command, **kwargs):
@@ -398,7 +1061,10 @@ class CodexConversationTests(unittest.TestCase):
             root = Path(temp_dir)
             (root / "memory").mkdir()
             (root / "memory" / "long_term.md").write_text("# Long-Term Memory\n\n- ユーザーはAI-LifeOSを作っている。\n", encoding="utf-8")
-            (root / "memory" / "preferences.md").write_text("# Preferences\n\n- ユーザーは静かな店を好む。\n", encoding="utf-8")
+            (root / "memory" / "preferences.md").write_text(
+                "# Preferences\n\n- SYNTHETIC_PREFERENCE_TOKEN\n",
+                encoding="utf-8",
+            )
 
             result = codex_conversation.generate_assistant_reply_with_context(
                 root=root,
@@ -452,6 +1118,19 @@ class CodexConversationTests(unittest.TestCase):
             self.assertIn((70, "Updating summary, journal, and memory..."), progress_events)
             self.assertEqual((100, "Exit processing complete."), progress_events[-1])
 
+    def test_new_options_follow_legacy_injection_parameters(self):
+        reply_params = list(inspect.signature(codex_conversation.generate_assistant_reply).parameters)
+        streaming_params = list(
+            inspect.signature(codex_conversation.generate_assistant_reply_streaming_with_context).parameters
+        )
+        finish_params = list(inspect.signature(codex_conversation.finish_session).parameters)
+        finish_exit_params = list(inspect.signature(codex_conversation.finish_session_for_exit).parameters)
+
+        self.assertLess(reply_params.index("run_command"), reply_params.index("enable_memory_mcp"))
+        self.assertLess(streaming_params.index("popen"), streaming_params.index("enable_memory_mcp"))
+        self.assertLess(finish_params.index("run_command"), finish_params.index("exclude_from_memory"))
+        self.assertLess(finish_exit_params.index("run_command"), finish_exit_params.index("exclude_from_memory"))
+
     def test_finish_session_skips_finalize_when_disabled(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -470,6 +1149,34 @@ class CodexConversationTests(unittest.TestCase):
             self.assertIsNone(result)
             self.assertIn("Saved 1 messages", status)
             self.assertTrue(session.path.exists())
+
+    def test_finish_session_excluded_from_memory_keeps_only_live_log(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = codex_conversation.create_live_session(root=root)
+            messages = [create_live_message("user", "一時的な会話")]
+
+            saved, status, result = codex_conversation.finish_session(
+                root=root,
+                session=session,
+                messages=messages,
+                has_new_messages=True,
+                exclude_from_memory=True,
+                run_command=fake_run,
+            )
+
+            self.assertTrue(saved)
+            self.assertIsNone(result)
+            self.assertIn("temporary live log", status)
+            self.assertTrue(session.path.exists())
+            self.assertFalse((root / "conversations").exists())
+            self.assertEqual([], calls)
 
     def test_finish_session_for_exit_handles_interrupt_during_finalize(self):
         def interrupted_run(command, **kwargs):

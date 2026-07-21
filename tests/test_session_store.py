@@ -63,6 +63,47 @@ class SessionStoreTests(unittest.TestCase):
             self.assertIsNone(metadata["finalized_message_count"])
             self.assertFalse(metadata["organize"]["raw_created"])
 
+    def test_save_session_preserves_extension_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_file = self.make_live_file(root)
+            metadata_file = live_file.with_suffix(".session.json")
+            personalization = {
+                "version": 1,
+                "temporary": True,
+                "exclude_from_memory": True,
+            }
+            metadata_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "session_id": "old-value",
+                        "personalization": personalization,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            session_store.save_session(root=root, session_file=live_file)
+
+            metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+            self.assertEqual(personalization, metadata["personalization"])
+            self.assertEqual(live_file.stem, metadata["session_id"])
+
+    def test_save_session_refuses_to_overwrite_corrupt_existing_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_file = self.make_live_file(root)
+            metadata_file = live_file.with_suffix(".session.json")
+            corrupt = b'{"personalization":{"temporary":true'
+            metadata_file.write_bytes(corrupt)
+
+            with self.assertRaisesRegex(ValueError, "上書きできません"):
+                session_store.save_session(root=root, session_file=live_file)
+
+            self.assertEqual(corrupt, metadata_file.read_bytes())
+
     def test_save_session_uses_title_override(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

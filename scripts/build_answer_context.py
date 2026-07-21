@@ -1,21 +1,30 @@
 import argparse
 import json
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from memory_index import ROOT, MemorySearchResult, search_memory
+from memory_index import (
+    ROOT,
+    IndexHealth,
+    MemorySearchResult,
+    expand_query_variants,
+    inspect_index_health,
+    search_memory,
+)
 from memory_items import load_categories
 from retrieval_feedback import classify_retrieval_features, feedback_bonus
 
 
-MEMORY_SCORE_THRESHOLD = 3
+DEEP_SEARCH_SCORE_THRESHOLD = 3
+# Backward-compatible display field for existing CLI/GUI consumers.  This is
+# no longer an on/off gate; it is the boundary between narrow and deep search.
+MEMORY_SCORE_THRESHOLD = DEEP_SEARCH_SCORE_THRESHOLD
 CORE_MEMORY_CHAR_LIMIT = 1000
 RAW_EVIDENCE_LIMIT = 2
-RELATED_RAW_CHUNK_LIMIT = 50
 NARROW_SEARCH_RESULT_LIMIT = 2
-NARROW_SEARCH_DOCUMENT_TYPES = ("memory_item", "journal", "summary")
 TOKYO_TIMEZONE = ZoneInfo("Asia/Tokyo")
 
 USER_EVIDENCE_SIGNALS = (
@@ -139,6 +148,32 @@ PAST_SIGNALS = ("前回", "前に", "以前", "過去", "昔", "話した", "決
 PROJECT_SIGNALS = ("AI-LifeOS", "プロジェクト", "Phase", "フェーズ", "方針", "journal", "memory")
 FOLLOW_UP_SIGNALS = ("じゃあ", "それで", "ちなみに", "それ", "前者", "後者")
 GENERIC_PAST_TERMS = ("前回", "前に", "以前", "過去", "昔", "話した", "決めた", "ログ", "履歴", "なんだっけ", "何て", "聞いた", "答えた")
+REQUEST_TERMS = (
+    "教えてください",
+    "教えて",
+    "聞かせて",
+    "知りたい",
+    "なんだっけ",
+    "覚えてる",
+    "覚えている",
+)
+FAILED_RETRIEVAL_SIGNALS = (
+    "具体的な感想は確認できない",
+    "具体的な感想を確認できない",
+    "記録上では確認できない",
+    "過去の会話を確認できない",
+    "見つけられませんでした",
+    "results=0",
+    "raw_chunks=0",
+)
+
+RAW_MESSAGE_PATTERN = re.compile(
+    r"^## (?P<role>User|Assistant)[ \t]*\n"
+    r"(?:[ \t]*\n)*"
+    r"(?:Timestamp:[ \t]*(?P<timestamp>[^\n]+)\n(?:[ \t]*\n)*)?"
+    r"(?P<content>.*?)(?=^## (?:User|Assistant)[ \t]*$|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
 
 CATEGORY_QUERY_ALIASES = {
     "future_wishlist": ("やりたいこと", "いつか", "将来", "wishlist"),
@@ -171,6 +206,38 @@ class MemoryContextReference:
 
 
 @dataclass(frozen=True)
+class RetrievalHealth:
+    """Explain which independent personalization layers contributed."""
+
+    index_status: str = "disabled"
+    index_reasons: tuple[str, ...] = ()
+    markdown_fallback_used: bool = False
+    retrieval_depth: str = "none"
+    query_variants: tuple[str, ...] = ()
+    core_enabled: bool = True
+    past_chats_enabled: bool = True
+    core_reference_count: int = 0
+    structured_memory_hit_count: int = 0
+    past_chat_hit_count: int = 0
+    project_scope: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "index_status": self.index_status,
+            "index_reasons": list(self.index_reasons),
+            "markdown_fallback_used": self.markdown_fallback_used,
+            "retrieval_depth": self.retrieval_depth,
+            "query_variants": list(self.query_variants),
+            "core_enabled": self.core_enabled,
+            "past_chats_enabled": self.past_chats_enabled,
+            "core_reference_count": self.core_reference_count,
+            "structured_memory_hit_count": self.structured_memory_hit_count,
+            "past_chat_hit_count": self.past_chat_hit_count,
+            "project_scope": self.project_scope,
+        }
+
+
+@dataclass(frozen=True)
 class AnswerContext:
     should_use_memory: bool
     text: str
@@ -180,6 +247,7 @@ class AnswerContext:
     threshold: int = MEMORY_SCORE_THRESHOLD
     reasons: tuple[str, ...] = ()
     retrieval_modes: tuple[str, ...] = ()
+    retrieval_health: RetrievalHealth = field(default_factory=RetrievalHealth)
 
     @property
     def used_memory(self) -> bool:
@@ -233,7 +301,10 @@ def assess_memory_need(
 
     reasons_tuple = tuple(_dedupe(reasons))
     return MemoryNeedAssessment(
-        should_use_memory=score >= MEMORY_SCORE_THRESHOLD,
+        # Retrieval is no longer gated on a fixed score.  Every non-empty
+        # question gets at least a narrow read-only search; the score only
+        # controls how deeply past-chat evidence is explored.
+        should_use_memory=True,
         score=score,
         threshold=MEMORY_SCORE_THRESHOLD,
         reasons=reasons_tuple,
@@ -247,25 +318,52 @@ def build_answer_context(
     max_results: int = 5,
     use_index: bool = True,
     recent_user_messages: tuple[str, ...] = (),
+    *,
+    include_core_memory: bool = True,
+    include_past_chats: bool = True,
+    project_scope: str | None = None,
+    exclude_live_session: Path | str | None = None,
 ) -> AnswerContext:
     root = Path(root)
     history = _recent_distinct_messages(question, recent_user_messages)
-    learned_bonus, learned_reasons = feedback_bonus(root=root, question=question)
+    retrieval_requested = include_core_memory or include_past_chats
+    learned_bonus, learned_reasons = (
+        feedback_bonus(root=root, question=question)
+        if retrieval_requested
+        else (0, ())
+    )
     assessment = assess_memory_need(
         question,
         recent_user_messages=history,
         learned_bonus=learned_bonus,
         learned_reasons=learned_reasons,
     )
-    memory_sections, priority_references = _read_priority_memory(
-        root=root,
-        max_chars=min(max(max_memory_chars, 1), CORE_MEMORY_CHAR_LIMIT),
+    normalized_scope = _normalize_project_scope(project_scope)
+    memory_sections, priority_references = (
+        _read_priority_memory(
+            root=root,
+            max_chars=min(max(max_memory_chars, 1), CORE_MEMORY_CHAR_LIMIT),
+            project_scope=normalized_scope,
+        )
+        if include_core_memory
+        else ([], [])
     )
     has_question = bool(question.strip())
+    search_enabled = retrieval_requested
     fallback = _should_use_fallback(question, history, learned_bonus)
-    should_expand_search = assessment.should_use_memory or fallback
+    should_expand_search = has_question and search_enabled and (
+        assessment.score >= DEEP_SEARCH_SCORE_THRESHOLD or fallback
+    )
+    retrieval_depth = "deep" if should_expand_search else "narrow" if has_question else "none"
+    if not search_enabled:
+        retrieval_depth = "none"
+    index_health = (
+        inspect_index_health(root)
+        if use_index and has_question and (include_core_memory or include_past_chats)
+        else IndexHealth(status="disabled")
+    )
     retrieval_modes: list[str] = ["core"] if priority_references else []
-    if has_question and not should_expand_search:
+    if has_question and search_enabled and not should_expand_search:
         retrieval_modes.append("narrow")
     if should_expand_search:
         retrieval_modes.append("fallback" if fallback else "search")
@@ -277,76 +375,103 @@ def build_answer_context(
     raw_chunk_results: list[MemorySearchResult] = []
     live_results: list[MemorySearchResult] = []
     search_query = _search_query(question, history)
+    narrow_document_types = tuple(
+        [
+            *(("memory_item",) if include_core_memory else ()),
+            *(("journal", "summary") if include_past_chats else ()),
+        ]
+    )
     if has_question and not should_expand_search:
-        narrow_results = search_memory(
-            root=root,
-            query=question.strip()[:800],
-            limit=min(max(max_results, 1), NARROW_SEARCH_RESULT_LIMIT),
-            document_types=NARROW_SEARCH_DOCUMENT_TYPES,
-            use_index=use_index,
-        )
+        narrow_limit = min(max(max_results, 1), NARROW_SEARCH_RESULT_LIMIT)
+        if narrow_document_types:
+            narrow_results = _search_scoped(
+                root=root,
+                query=question.strip()[:800],
+                limit=narrow_limit,
+                document_types=narrow_document_types,
+                use_index=use_index,
+                project_scope=normalized_scope,
+            )
 
     if should_expand_search:
-        inferred_categories = infer_memory_categories(root, search_query)
-        structured_results = _search_structured_memory(
-            root=root,
-            question=search_query,
-            categories=inferred_categories,
-            max_results=max_results,
-            use_index=use_index,
-        )
-        journal_results = search_memory(
-            root=root,
-            query=search_query,
-            limit=max_results,
-            document_types=("journal",),
-            use_index=use_index,
-        )
-        conversation_results = search_memory(
-            root=root,
-            query=search_query,
-            limit=max_results,
-            document_types=("summary", "raw"),
-            use_index=use_index,
-        )
-        raw_chunk_candidates = search_memory(
-            root=root,
-            query=search_query,
-            limit=max(max_results * 4, 8),
-            document_types=("raw_chunk",),
-            use_index=use_index,
-        )
-        if _needs_past_conversation_evidence(question):
+        if include_core_memory:
+            inferred_categories = infer_memory_categories(root, search_query)
+            structured_results = _search_structured_memory(
+                root=root,
+                question=search_query,
+                categories=inferred_categories,
+                max_results=max_results,
+                use_index=use_index,
+                project_scope=normalized_scope,
+            )
+        raw_chunk_candidates: list[MemorySearchResult] = []
+        if include_past_chats:
+            journal_results = _search_scoped(
+                root=root,
+                query=search_query,
+                limit=max_results,
+                document_types=("journal",),
+                use_index=use_index,
+                project_scope=normalized_scope,
+            )
+            conversation_results = _search_scoped(
+                root=root,
+                query=search_query,
+                limit=max_results,
+                document_types=("summary", "raw"),
+                use_index=use_index,
+                project_scope=normalized_scope,
+            )
+            raw_chunk_candidates = _search_scoped(
+                root=root,
+                query=search_query,
+                limit=max(max_results * 4, 8),
+                document_types=("raw_chunk",),
+                use_index=use_index,
+                project_scope=normalized_scope,
+            )
+        if include_past_chats and _needs_past_conversation_evidence(question):
             concrete_query = _concrete_query(question)
             if concrete_query:
                 conversation_results = _merge_results(
-                    search_memory(
+                    _search_scoped(
                         root=root,
                         query=concrete_query,
                         limit=max_results,
                         document_types=("summary", "raw"),
                         use_index=use_index,
+                        project_scope=normalized_scope,
                     ),
                     conversation_results,
                     limit=max_results,
                 )
                 raw_chunk_candidates = _merge_results(
-                    search_memory(
+                    _search_scoped(
                         root=root,
                         query=concrete_query,
                         limit=max(max_results * 4, 8),
                         document_types=("raw_chunk",),
                         use_index=use_index,
+                        project_scope=normalized_scope,
                     ),
                     raw_chunk_candidates,
                     limit=max(max_results * 4, 8),
                 )
-                live_results = _search_unorganized_live(root, concrete_query, question)
+                live_results = _search_unorganized_live(
+                    root,
+                    search_query,
+                    question,
+                    normalized_scope,
+                    exclude_live_session=exclude_live_session,
+                )
+        conversation_results = _exclude_failed_retrieval_messages(conversation_results)
+        raw_chunk_candidates = _exclude_failed_retrieval_messages(raw_chunk_candidates)
         raw_chunk_results = _select_role_aware_raw_evidence(
             root=root,
             candidates=raw_chunk_candidates,
             question=question,
             use_index=use_index,
+            project_scope=normalized_scope,
         )
 
     lines = [
@@ -433,20 +558,50 @@ def build_answer_context(
         threshold=assessment.threshold,
         reasons=assessment.reasons,
         retrieval_modes=tuple(retrieval_modes),
+        retrieval_health=RetrievalHealth(
+            index_status=index_health.status,
+            index_reasons=index_health.reasons,
+            markdown_fallback_used=index_health.needs_markdown_fallback,
+            retrieval_depth=retrieval_depth,
+            query_variants=expand_query_variants(search_query),
+            core_enabled=include_core_memory,
+            past_chats_enabled=include_past_chats,
+            core_reference_count=len(priority_references),
+            structured_memory_hit_count=len(structured_results)
+            + sum(result.document_type == "memory_item" for result in narrow_results),
+            past_chat_hit_count=len(journal_results)
+            + len(conversation_results)
+            + len(raw_chunk_results)
+            + len(live_results)
+            + sum(result.document_type in {"journal", "summary"} for result in narrow_results),
+            project_scope=normalized_scope,
+        ),
     )
 
 
-def _read_priority_memory(root: Path, max_chars: int) -> tuple[list[str], list[MemoryContextReference]]:
+def _read_priority_memory(
+    root: Path,
+    max_chars: int,
+    project_scope: str | None = None,
+) -> tuple[list[str], list[MemoryContextReference]]:
     sections: list[str] = []
     references: list[MemoryContextReference] = []
     sources: list[tuple[Path, Path, str]] = []
-    for relative in (Path("memory") / "long_term.md", Path("memory") / "preferences.md"):
+    for relative in (
+        Path("memory") / "long_term.md",
+        Path("memory") / "preferences.md",
+        Path("memory") / "projects.md",
+    ):
         path = root / relative
         if not path.exists():
             continue
         content = path.read_text(encoding="utf-8").strip()
         if not content:
             continue
+        if project_scope:
+            content = _project_scoped_memory_content(content, project_scope)
+            if not content:
+                continue
         sources.append((relative, path, content))
 
     remaining = max(max_chars, 1)
@@ -469,6 +624,34 @@ def _read_priority_memory(root: Path, max_chars: int) -> tuple[list[str], list[M
         )
         remaining -= len(content)
     return sections, references
+
+
+def _project_scoped_memory_content(content: str, project_scope: str) -> str:
+    """Return only matching lines or matching Markdown sections.
+
+    Passing an entire long-term-memory file because one line names a project
+    would cross the requested project boundary.  A heading that names the scope
+    owns its section; a non-heading match contributes only that factual line.
+    """
+
+    lines = content.splitlines()
+    selected: set[int] = set()
+    normalized_scope = "".join(project_scope.lower().split())
+    for index, line in enumerate(lines):
+        if normalized_scope not in "".join(line.lower().split()):
+            continue
+        heading = re.match(r"^(#{1,6})\s+", line)
+        if not heading:
+            selected.add(index)
+            continue
+        level = len(heading.group(1))
+        selected.add(index)
+        for following in range(index + 1, len(lines)):
+            next_heading = re.match(r"^(#{1,6})\s+", lines[following])
+            if next_heading and len(next_heading.group(1)) <= level:
+                break
+            selected.add(following)
+    return "\n".join(lines[index] for index in sorted(selected)).strip()
 
 
 def _recent_distinct_messages(question: str, recent_user_messages: tuple[str, ...]) -> tuple[str, ...]:
@@ -510,17 +693,170 @@ def _search_query(question: str, history: tuple[str, ...]) -> str:
 
 
 def _needs_past_conversation_evidence(question: str) -> bool:
-    return _has_any(question, PAST_SIGNALS + ("いつ話した", "何て聞いた", "何て答えた"))
+    return _has_any(question, PAST_SIGNALS + ("いつ話した", "何て聞いた", "何て答えた")) or (
+        _has_any(question, SELF_REFERENCES)
+        and _has_any(question, ("感想", "好み", "意見", "考え"))
+    )
 
 
 def _concrete_query(question: str) -> str:
     normalized = question
-    for value in GENERIC_PAST_TERMS:
+    for value in (*GENERIC_PAST_TERMS, *REQUEST_TERMS):
         normalized = normalized.replace(value, " ")
     for value in ("について", "という", "から", "まで", "の", "は", "を", "に", "が", "で", "と", "や", "も", "へ"):
         normalized = normalized.replace(value, " ")
     terms = [term for term in normalized.replace("？", " ").replace("?", " ").split() if len(term) >= 2]
     return " ".join(_dedupe(terms))
+
+
+def _normalize_project_scope(project_scope: str | None) -> str | None:
+    if project_scope is None:
+        return None
+    normalized = project_scope.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _scope_matches_text(project_scope: str, *values: str) -> bool:
+    needle = "".join(project_scope.lower().split())
+    return any(needle in "".join(value.lower().split()) for value in values if value)
+
+
+def _filter_project_scope(
+    results: list[MemorySearchResult],
+    project_scope: str | None,
+    root: Path,
+) -> list[MemorySearchResult]:
+    """Constrain results to an explicit project boundary.
+
+    Scope is matched against stable path/title/tags/category metadata and the
+    returned excerpt.  An empty match remains empty; it never broadens back to
+    unrelated personal history.
+    """
+
+    if not project_scope:
+        return results
+    content_cache: dict[Path, str] = {}
+    scoped: list[MemorySearchResult] = []
+    for result in results:
+        path_key = result.path.resolve()
+        if path_key not in content_cache:
+            try:
+                content_cache[path_key] = result.path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                content_cache[path_key] = ""
+        if _scope_matches_text(
+            project_scope,
+            _display_path(result.path, root),
+            result.title,
+            " ".join(result.tags),
+            result.category or "",
+            result.category_label or "",
+            result.source or "",
+            result.snippet,
+            content_cache[path_key],
+        ):
+            scoped.append(result)
+    return scoped
+
+
+def _search_scoped(
+    *,
+    root: Path,
+    query: str,
+    limit: int,
+    document_types: tuple[str, ...],
+    use_index: bool,
+    project_scope: str | None,
+    category: str | None = None,
+) -> list[MemorySearchResult]:
+    results = search_memory(
+        root=root,
+        query=query,
+        limit=limit,
+        document_types=document_types,
+        category=category,
+        scope=project_scope,
+        use_index=use_index,
+    )
+    return _filter_project_scope(results, project_scope, root)[: max(limit, 1)]
+
+
+def _contains_failed_retrieval_signal(content: str) -> bool:
+    normalized = content.casefold()
+    return any(signal.casefold() in normalized for signal in FAILED_RETRIEVAL_SIGNALS)
+
+
+def _exclude_failed_retrieval_messages(
+    results: list[MemorySearchResult],
+) -> list[MemorySearchResult]:
+    """Drop a failed reply and its immediate request, not the whole session.
+
+    A later assistant miss must not invalidate a correct user statement in the
+    same session. Conversely, the user request immediately before a failed
+    assistant reply is a retrieval request, not evidence of the user's stored
+    view, so that one adjacent request is excluded as well.
+    """
+
+    failure_cache: dict[Path, tuple[set[int], set[int]]] = {}
+    filtered: list[MemorySearchResult] = []
+    for result in results:
+        failed_assistants: set[int] = set()
+        failed_requests: set[int] = set()
+        if result.path.name.casefold() == "raw.md":
+            path_key = result.path.resolve()
+            if path_key not in failure_cache:
+                failure_cache[path_key] = _failed_retrieval_message_numbers(path_key)
+            failed_assistants, failed_requests = failure_cache[path_key]
+
+        # A whole raw document containing a failed assistant reply is too
+        # ambiguous to use as evidence. Safe message-level chunks from the
+        # same file remain eligible below.
+        if result.document_type == "raw" and failed_assistants:
+            continue
+        if result.message_number is not None:
+            if result.message_number in failed_assistants or result.message_number in failed_requests:
+                continue
+        elif _contains_failed_retrieval_signal(result.snippet):
+            continue
+        if result.speaker_role == "assistant" and _contains_failed_retrieval_signal(result.snippet):
+            continue
+        filtered.append(result)
+    return filtered
+
+
+def _failed_retrieval_message_numbers(path: Path) -> tuple[set[int], set[int]]:
+    records = _read_raw_message_records(path)
+    failed_assistants = {
+        int(record["message_number"])
+        for record in records
+        if record["role"] == "assistant"
+        and _contains_failed_retrieval_signal(str(record["content"]))
+    }
+    failed_requests: set[int] = set()
+    by_number = {int(record["message_number"]): record for record in records}
+    for number in failed_assistants:
+        preceding = by_number.get(number - 1)
+        if preceding is not None and preceding["role"] == "user":
+            failed_requests.add(number - 1)
+    return failed_assistants, failed_requests
+
+
+def _read_raw_message_records(path: Path) -> list[dict[str, object]]:
+    try:
+        raw_content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    return [
+        {
+            "message_number": message_number,
+            "role": match.group("role").lower(),
+            "content": match.group("content").strip(),
+        }
+        for message_number, match in enumerate(RAW_MESSAGE_PATTERN.finditer(raw_content), start=1)
+        if match.group("content").strip()
+    ]
 
 
 def _merge_results(*groups: list[MemorySearchResult], limit: int) -> list[MemorySearchResult]:
@@ -536,18 +872,49 @@ def _merge_results(*groups: list[MemorySearchResult], limit: int) -> list[Memory
     return merged[: max(limit, 1)]
 
 
-def _search_unorganized_live(root: Path, query: str, question: str) -> list[MemorySearchResult]:
+def _search_unorganized_live(
+    root: Path,
+    query: str,
+    question: str,
+    project_scope: str | None = None,
+    *,
+    exclude_live_session: Path | str | None = None,
+) -> list[MemorySearchResult]:
     live_dir = root / "inbox" / "live"
     if not live_dir.exists() or not query.strip():
         return []
 
     terms = _live_query_terms(query)
     all_results: list[MemorySearchResult] = []
+    excluded_path = _resolved_live_session_path(root, exclude_live_session)
+    if exclude_live_session is not None and excluded_path is None:
+        return []
     for path in sorted(live_dir.glob("*.jsonl")):
+        if excluded_path is not None and path.resolve() == excluded_path:
+            continue
         if not _is_unorganized_live(path):
             continue
-        for message_number, record in enumerate(_read_live_records(path), start=1):
+        scope_mode = _live_project_scope_mode(path, project_scope, root)
+        if scope_mode == "none":
+            continue
+        records = _read_live_records(path)
+        failed_assistants = {
+            number
+            for number, record in enumerate(records, start=1)
+            if record.get("role") == "assistant"
+            and _contains_failed_retrieval_signal(record.get("content", ""))
+        }
+        failed_requests = {
+            number - 1
+            for number in failed_assistants
+            if number > 1 and records[number - 2].get("role") == "user"
+        }
+        for message_number, record in enumerate(records, start=1):
             content = record.get("content", "")
+            if message_number in failed_assistants or message_number in failed_requests:
+                continue
+            if scope_mode == "messages" and project_scope and not _scope_matches_text(project_scope, content):
+                continue
             score = _live_match_score(content, terms)
             timestamp = _parse_local_timestamp(record.get("timestamp"))
             all_results.append(
@@ -580,6 +947,58 @@ def _search_unorganized_live(root: Path, query: str, question: str) -> list[Memo
     return _paired_raw_evidence(anchor, related, limit=RAW_EVIDENCE_LIMIT)
 
 
+def _resolved_live_session_path(
+    root: Path,
+    exclude_live_session: Path | str | None,
+) -> Path | None:
+    if exclude_live_session is None:
+        return None
+    path = Path(exclude_live_session)
+    if not path.is_absolute():
+        path = root / path
+    try:
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def _live_project_scope_mode(path: Path, project_scope: str | None, root: Path) -> str:
+    if not project_scope:
+        return "session"
+
+    metadata_path = path.with_suffix(".session.json")
+    metadata: dict[str, object] = {}
+    if metadata_path.exists():
+        try:
+            loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "none"
+        if not isinstance(loaded, dict):
+            return "none"
+        metadata = loaded
+        personalization = metadata.get("personalization")
+        if personalization is not None:
+            if not isinstance(personalization, dict):
+                return "none"
+            stored_scope = personalization.get("project_scope")
+            if stored_scope is not None:
+                if not isinstance(stored_scope, str):
+                    return "none"
+                normalized_stored = "".join(stored_scope.casefold().split())
+                if normalized_stored:
+                    normalized_requested = "".join(project_scope.casefold().split())
+                    return "session" if normalized_stored == normalized_requested else "none"
+
+    if _scope_matches_text(
+        project_scope,
+        _display_path(path, root),
+        str(metadata.get("title") or ""),
+        str(metadata.get("session_id") or ""),
+    ):
+        return "session"
+    return "messages"
+
+
 def _is_unorganized_live(path: Path) -> bool:
     metadata_path = path.with_suffix(".session.json")
     if not metadata_path.exists():
@@ -587,7 +1006,21 @@ def _is_unorganized_live(path: Path) -> bool:
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return True
+        # An existing but unreadable metadata file may contain a temporary-chat
+        # exclusion.  Fail closed rather than exposing that log as memory.
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    personalization = metadata.get("personalization")
+    if personalization is not None:
+        if not isinstance(personalization, dict):
+            return False
+        for field_name in ("temporary", "exclude_from_memory"):
+            value = personalization.get(field_name, False)
+            if not isinstance(value, bool):
+                return False
+            if value:
+                return False
     organize = metadata.get("organize") if isinstance(metadata, dict) else None
     return not isinstance(organize, dict) or not bool(organize.get("index_updated"))
 
@@ -626,7 +1059,12 @@ def _parse_local_timestamp(value: object) -> datetime | None:
 
 
 def _live_query_terms(query: str) -> tuple[str, ...]:
-    terms = [term for term in query.replace("？", " ").replace("?", " ").split() if len(term) >= 2]
+    terms = [
+        term
+        for variant in expand_query_variants(query)
+        for term in variant.replace("？", " ").replace("?", " ").split()
+        if len(term) >= 2
+    ]
     return tuple(_dedupe(terms))
 
 
@@ -685,27 +1123,30 @@ def _search_structured_memory(
     categories: tuple[str, ...],
     max_results: int,
     use_index: bool,
+    project_scope: str | None = None,
 ) -> list[MemorySearchResult]:
     results: list[MemorySearchResult] = []
     for category in categories:
         results.extend(
-            search_memory(
+            _search_scoped(
                 root=root,
                 query="",
                 limit=max_results,
                 document_types=("memory_item",),
-                category=category,
                 use_index=use_index,
+                project_scope=project_scope,
+                category=category,
             )
         )
     if not categories:
         results.extend(
-            search_memory(
+            _search_scoped(
                 root=root,
                 query=question,
                 limit=max_results,
                 document_types=("memory_item",),
                 use_index=use_index,
+                project_scope=project_scope,
             )
         )
 
@@ -725,6 +1166,7 @@ def _select_role_aware_raw_evidence(
     candidates: list[MemorySearchResult],
     question: str,
     use_index: bool,
+    project_scope: str | None = None,
 ) -> list[MemorySearchResult]:
     if not candidates:
         return []
@@ -736,7 +1178,7 @@ def _select_role_aware_raw_evidence(
     if scope == "user":
         return [anchor]
 
-    related = _related_raw_chunks(root, anchor, use_index)
+    related = _related_raw_chunks(root, anchor, use_index, project_scope=project_scope)
     if not related:
         return [anchor]
     return _paired_raw_evidence(anchor, related, limit=RAW_EVIDENCE_LIMIT)
@@ -744,6 +1186,10 @@ def _select_role_aware_raw_evidence(
 
 def _raw_evidence_scope(question: str) -> str:
     normalized = question.lower()
+    if _has_any(normalized, SELF_REFERENCES) and _has_any(
+        normalized, ("感想", "好み", "意見", "考え", "my thoughts", "my impression")
+    ):
+        return "user"
     if any(signal.lower() in normalized for signal in ASSISTANT_EVIDENCE_SIGNALS):
         return "assistant"
     if any(signal.lower() in normalized for signal in USER_EVIDENCE_SIGNALS):
@@ -765,23 +1211,71 @@ def _select_raw_evidence_anchor(
 
 
 def _related_raw_chunks(
-    root: Path, anchor: MemorySearchResult, use_index: bool
+    root: Path,
+    anchor: MemorySearchResult,
+    use_index: bool,
+    project_scope: str | None = None,
 ) -> list[MemorySearchResult]:
-    results = search_memory(
-        root=root,
-        query="",
-        limit=RELATED_RAW_CHUNK_LIMIT,
-        document_types=("raw_chunk",),
-        path=_display_path(anchor.path, root),
-        use_index=use_index,
+    """Read only the two source messages adjacent to the selected anchor.
+
+    An empty-query index read used to cap the session at its first ranked 50
+    chunks. In long sessions that could omit the anchor's real neighbor and
+    pair an unrelated later response. Reading the already-authorized raw path
+    gives an exact, bounded neighborhood independent of session length.
+    """
+
+    del use_index  # The source Markdown is authoritative for exact adjacency.
+    if anchor.message_number is None or anchor.path.suffix.lower() != ".md":
+        return []
+    try:
+        raw_content = anchor.path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    first_heading = re.search(
+        r"^## (?:User|Assistant)[ \t]*$",
+        raw_content,
+        flags=re.MULTILINE | re.IGNORECASE,
     )
-    return sorted(
-        results,
-        key=lambda result: (
-            result.message_number is None,
-            result.message_number if result.message_number is not None else 0,
-        ),
-    )
+    raw_header = raw_content[: first_heading.start()] if first_heading else raw_content
+    target_numbers = {anchor.message_number - 1, anchor.message_number + 1}
+    base_title = re.sub(
+        r"\s*/\s*(?:User|Assistant) message \d+\s*$",
+        "",
+        anchor.title,
+        flags=re.IGNORECASE,
+    ).strip() or anchor.title
+    related: list[MemorySearchResult] = []
+    for message_number, match in enumerate(RAW_MESSAGE_PATTERN.finditer(raw_content), start=1):
+        if message_number not in target_numbers:
+            continue
+        message_content = match.group("content").strip()
+        if not message_content or _contains_failed_retrieval_signal(message_content):
+            continue
+        if project_scope and not _scope_matches_text(
+            project_scope,
+            _display_path(anchor.path, root),
+            raw_header,
+            base_title,
+            " ".join(anchor.tags),
+            message_content,
+        ):
+            continue
+        role = match.group("role").lower()
+        related.append(
+            MemorySearchResult(
+                document_type="raw_chunk",
+                path=anchor.path,
+                title=f"{base_title} / {role.title()} message {message_number}",
+                date=anchor.date,
+                tags=anchor.tags,
+                snippet=_short_snippet(message_content, width=2200),
+                score=0,
+                speaker_role=role,
+                message_number=message_number,
+            )
+        )
+    return related
 
 
 def _paired_raw_evidence(
@@ -793,19 +1287,17 @@ def _paired_raw_evidence(
         return [anchor]
 
     if anchor.speaker_role == "assistant":
-        preceding_user = _nearest_related_chunk(
+        preceding_user = _adjacent_related_chunk(
             related,
-            message_number=anchor.message_number,
+            message_number=anchor.message_number - 1,
             speaker_role="user",
-            before=True,
         )
         pair = [item for item in (preceding_user, anchor) if item is not None]
     else:
-        following_assistant = _nearest_related_chunk(
+        following_assistant = _adjacent_related_chunk(
             related,
-            message_number=anchor.message_number,
+            message_number=anchor.message_number + 1,
             speaker_role="assistant",
-            before=False,
         )
         pair = [item for item in (anchor, following_assistant) if item is not None]
 
@@ -819,23 +1311,20 @@ def _paired_raw_evidence(
     return unique[: max(limit, 1)]
 
 
-def _nearest_related_chunk(
+def _adjacent_related_chunk(
     related: list[MemorySearchResult],
     message_number: int,
     speaker_role: str,
-    before: bool,
 ) -> MemorySearchResult | None:
-    eligible = [
-        result
-        for result in related
-        if result.speaker_role == speaker_role
-        and result.message_number is not None
-        and (result.message_number < message_number if before else result.message_number > message_number)
-    ]
-    if not eligible:
-        return None
-    return max(eligible, key=lambda result: result.message_number or 0) if before else min(
-        eligible, key=lambda result: result.message_number or 0
+    return next(
+        (
+            result
+            for result in related
+            if result.speaker_role == speaker_role
+            and result.message_number == message_number
+            and not _contains_failed_retrieval_signal(result.snippet)
+        ),
+        None,
     )
 
 
@@ -921,12 +1410,15 @@ def main() -> int:
         print("")
         print(
             f"Memory context used: yes ({len(context.references)} sources, "
-            f"score {context.score}/{context.threshold})"
+            f"depth score {context.score}; deep-search threshold {context.threshold})"
         )
         for reference in context.references:
             print(f"- {reference.path}")
     else:
-        print(f"No memory context needed. score={context.score}/{context.threshold}")
+        print(
+            f"No memory context used. depth-score={context.score}; "
+            f"deep-search-threshold={context.threshold}"
+        )
     return 0
 
 

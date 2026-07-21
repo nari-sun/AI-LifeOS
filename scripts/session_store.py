@@ -76,7 +76,9 @@ def save_session(
     started_at = records[0]["timestamp"]
     updated_at = records[-1]["timestamp"]
     metadata_file = jsonl_file.with_suffix(".session.json")
-    existing_metadata = _read_metadata_file(metadata_file)
+    # This is a mutating path.  If an existing sidecar is unreadable, treating
+    # it as an empty object could silently erase temporary/exclusion controls.
+    existing_metadata = _read_metadata_file(metadata_file, strict=True)
     organize = _merge_organize_state(
         existing_metadata=existing_metadata,
         update=organize_update,
@@ -85,7 +87,11 @@ def save_session(
         now=now,
     )
 
+    # Session-scoped extensions (for example personalization/privacy controls)
+    # belong to the live session and must survive routine save/finalize updates.
+    # Canonical session fields below remain authoritative.
     metadata = {
+        **existing_metadata,
         "version": 1,
         "session_id": session_id,
         "status": status,
@@ -316,16 +322,22 @@ def get_session_organization(root: Path | str = ROOT, session_file: Path | str |
     }
 
 
-def _read_metadata_file(metadata_file: Path) -> dict[str, Any]:
+def _read_metadata_file(metadata_file: Path, *, strict: bool = False) -> dict[str, Any]:
     if not metadata_file.exists():
         return {}
 
     try:
         data = json.loads(metadata_file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        if strict:
+            raise ValueError(f"既存のセッション情報が壊れているため上書きできません: {metadata_file.name}") from exc
         return {}
 
-    return data if isinstance(data, dict) else {}
+    if isinstance(data, dict):
+        return data
+    if strict:
+        raise ValueError(f"既存のセッション情報が不正なため上書きできません: {metadata_file.name}")
+    return {}
 
 
 def _merge_organize_state(

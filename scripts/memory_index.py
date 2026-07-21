@@ -2,11 +2,12 @@ import json
 import re
 import sqlite3
 from contextlib import closing
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Iterable
+from typing import Iterable, Protocol, Sequence
 
 from memory_items import read_memory_item
 
@@ -14,6 +15,46 @@ from memory_items import read_memory_item
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INDEX_PATH = Path("memory") / "search_index.sqlite3"
 SUPPORTED_MEMORY_FILES = {"long_term.md", "preferences.md", "projects.md"}
+RRF_K = 60
+INDEX_SCHEMA_VERSION = 1
+RAW_METADATA_PARSER_VERSION = 1
+INDEX_METADATA_TABLE = "index_metadata"
+INDEX_VERSION_METADATA = {
+    "schema_version": str(INDEX_SCHEMA_VERSION),
+    "raw_metadata_parser_version": str(RAW_METADATA_PARSER_VERSION),
+}
+
+REQUEST_EXPRESSIONS = (
+    "教えてください",
+    "教えて",
+    "教えてほしい",
+    "聞かせてください",
+    "聞かせて",
+    "知りたい",
+    "覚えてる",
+    "覚えている",
+    "なんだっけ",
+    "だっけ",
+    "please tell me",
+    "tell me",
+    "do you remember",
+)
+
+QUERY_STOP_TERMS = {
+    "教えて",
+    "教えてください",
+    "なんだっけ",
+    "だっけ",
+    "について",
+    "こと",
+    "これ",
+    "それ",
+    "あれ",
+    "して",
+    "ください",
+    "tell",
+    "please",
+}
 
 
 @dataclass(frozen=True)
@@ -35,6 +76,23 @@ class MemoryDocument:
     message_number: int | None = None
 
 
+class LocalSemanticBackend(Protocol):
+    """Optional interface for a future, entirely local semantic ranker.
+
+    Implementations receive the already metadata-filtered documents and return
+    stable ``document_key`` values in relevance order.  The default search does
+    not instantiate a backend and therefore adds no dependency or external
+    network access.
+    """
+
+    def rank(
+        self,
+        query: str,
+        documents: Sequence[MemoryDocument],
+        limit: int,
+    ) -> Sequence[str]: ...
+
+
 @dataclass(frozen=True)
 class MemorySearchResult:
     document_type: str
@@ -52,6 +110,36 @@ class MemorySearchResult:
     confidence: str | None = None
     speaker_role: str | None = None
     message_number: int | None = None
+
+
+@dataclass(frozen=True)
+class IndexHealth:
+    """Read-only freshness information for the derived SQLite index."""
+
+    status: str
+    reasons: tuple[str, ...] = ()
+    source_count: int = 0
+    indexed_source_count: int = 0
+    checked_at: str | None = None
+
+    @property
+    def needs_markdown_fallback(self) -> bool:
+        # Legacy indexes have no source manifest and may also contain metadata
+        # extracted from raw message bodies by an older parser. Even when the
+        # path set and timestamps happen to match, their title/tags are not a
+        # safe basis for scope filtering. Keep the derived DB untouched and use
+        # the current Markdown parser for this search instead.
+        return self.status in {"legacy", "missing", "stale", "unreadable"}
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "reasons": list(self.reasons),
+            "source_count": self.source_count,
+            "indexed_source_count": self.indexed_source_count,
+            "checked_at": self.checked_at,
+            "needs_markdown_fallback": self.needs_markdown_fallback,
+        }
 
 
 @dataclass(frozen=True)
@@ -75,6 +163,10 @@ class SearchProfile:
     candidate_count: int
     result_count: int
     filters: tuple[str, ...]
+    index_status: str = "disabled"
+    fallback_document_count: int = 0
+    query_variants: tuple[str, ...] = ()
+    retrieval_mode: str = "lexical"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -86,11 +178,153 @@ class SearchProfile:
             "candidate_count": self.candidate_count,
             "result_count": self.result_count,
             "filters": list(self.filters),
+            "index_status": self.index_status,
+            "fallback_document_count": self.fallback_document_count,
+            "query_variants": list(self.query_variants),
+            "retrieval_mode": self.retrieval_mode,
         }
 
 
 def default_index_path(root: Path | str = ROOT) -> Path:
     return Path(root) / DEFAULT_INDEX_PATH
+
+
+def inspect_index_health(
+    root: Path | str = ROOT,
+    db_path: Path | str | None = None,
+) -> IndexHealth:
+    """Inspect index freshness without rebuilding or modifying any file.
+
+    New indexes contain a path/mtime/size manifest. Legacy indexes still have
+    their path set and build timestamp inspected for diagnostics, but searches
+    always fall back to Markdown because their raw metadata cannot be trusted
+    for scope filtering. Missing or changed Markdown is also handled by direct
+    search later.
+    """
+
+    root = Path(root)
+    db_file = _resolve_db_path(root, db_path)
+    checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    source_stats = _source_stats(root)
+    if not db_file.exists():
+        return IndexHealth(
+            status="missing",
+            reasons=("index-missing",),
+            source_count=len(source_stats),
+            checked_at=checked_at,
+        )
+    try:
+        with closing(sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True)) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "documents" not in tables:
+                raise sqlite3.DatabaseError("documents table is missing")
+            indexed_paths = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT path FROM documents WHERE document_type != 'raw_chunk'"
+                ).fetchall()
+            }
+            version_reasons = _index_version_reasons(connection, tables)
+            if "indexed_sources" in tables:
+                manifest = {
+                    str(path): (int(mtime_ns), int(size))
+                    for path, mtime_ns, size in connection.execute(
+                        "SELECT path, mtime_ns, size FROM indexed_sources"
+                    ).fetchall()
+                }
+                reasons: list[str] = list(version_reasons)
+                if set(source_stats) - set(manifest):
+                    reasons.append("unindexed-source")
+                if set(manifest) - set(source_stats):
+                    reasons.append("deleted-source")
+                if any(manifest.get(path) != stat for path, stat in source_stats.items()):
+                    reasons.append("changed-source")
+                status = "legacy" if version_reasons else "stale" if reasons else "fresh"
+                return IndexHealth(
+                    status=status,
+                    reasons=tuple(_dedupe(reasons)),
+                    source_count=len(source_stats),
+                    indexed_source_count=len(manifest),
+                    checked_at=checked_at,
+                )
+
+            # Legacy indexes did not store source mtimes.  Path differences are
+            # still enough to detect the common stale-index failure where a new
+            # raw.md was finalized after the last rebuild.
+            source_reasons: list[str] = []
+            if set(source_stats) - indexed_paths:
+                source_reasons.append("unindexed-source")
+            if indexed_paths - set(source_stats):
+                source_reasons.append("deleted-source")
+            try:
+                index_mtime_ns = db_file.stat().st_mtime_ns
+            except OSError:
+                index_mtime_ns = 0
+            if any(mtime_ns > index_mtime_ns for mtime_ns, _ in source_stats.values()):
+                source_reasons.append("changed-source")
+            reasons = [*version_reasons, "source-manifest-unavailable", *source_reasons]
+            return IndexHealth(
+                status="stale" if source_reasons else "legacy",
+                reasons=tuple(_dedupe(reasons)),
+                source_count=len(source_stats),
+                indexed_source_count=len(indexed_paths),
+                checked_at=checked_at,
+            )
+    except (OSError, sqlite3.DatabaseError, sqlite3.OperationalError) as error:
+        return IndexHealth(
+            status="unreadable",
+            reasons=(f"index-unreadable:{type(error).__name__}",),
+            source_count=len(source_stats),
+            checked_at=checked_at,
+        )
+
+
+def _index_version_reasons(
+    connection: sqlite3.Connection,
+    tables: set[str],
+) -> tuple[str, ...]:
+    """Return compatibility reasons without trusting a source manifest alone.
+
+    A manifest proves that source files did not change after a build, but it
+    cannot prove which metadata parser produced raw titles/tags.  Scope checks
+    must therefore use SQLite only when both explicit build versions match.
+    """
+
+    if INDEX_METADATA_TABLE not in tables:
+        return ("index-version-metadata-missing",)
+    rows = connection.execute(
+        f"SELECT key, value FROM {INDEX_METADATA_TABLE}"
+    ).fetchall()
+    metadata = {
+        str(key): str(value)
+        for key, value in rows
+        if isinstance(key, str) and value is not None
+    }
+    reasons: list[str] = []
+    for key, expected in INDEX_VERSION_METADATA.items():
+        actual = metadata.get(key)
+        reason_prefix = "parser-version" if key == "raw_metadata_parser_version" else "schema-version"
+        if actual is None:
+            reasons.append(f"{reason_prefix}-missing")
+        elif actual != expected:
+            reasons.append(f"{reason_prefix}-mismatch")
+    return tuple(reasons)
+
+
+def _source_stats(root: Path) -> dict[str, tuple[int, int]]:
+    stats: dict[str, tuple[int, int]] = {}
+    for path in _candidate_paths(root):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        stats[_relative_path(path, root)] = (stat.st_mtime_ns, stat.st_size)
+    return stats
 
 
 def ensure_memory_files(root: Path | str = ROOT) -> None:
@@ -131,13 +365,18 @@ def collect_documents(root: Path | str = ROOT) -> list[MemoryDocument]:
             except ValueError:
                 continue
 
+        # Message bodies may contain strings such as ``Session:`` or tag-like
+        # headings.  They are evidence for that message, not immutable metadata
+        # for every sibling message in the raw transcript.
+        metadata_content = _raw_session_header(content) if document_type == "raw" else content
+
         document = MemoryDocument(
             document_key=relative,
             document_type=document_type,
             path=path,
-            title=structured.category_label if structured else _extract_title(content, path),
-            date=structured.source_date if structured else _extract_date(content, path, root, document_type),
-            tags=structured.tags if structured else tuple(_extract_tags(content)),
+            title=structured.category_label if structured else _extract_title(metadata_content, path),
+            date=structured.source_date if structured else _extract_date(metadata_content, path, root, document_type),
+            tags=structured.tags if structured else tuple(_extract_tags(metadata_content)),
             content=structured.content if structured else content,
             category=structured.category if structured else None,
             category_label=structured.category_label if structured else None,
@@ -165,6 +404,7 @@ def rebuild_index(root: Path | str = ROOT, db_path: Path | str | None = None) ->
     with closing(sqlite3.connect(db_file)) as connection:
         _create_schema(connection)
         _insert_documents(connection, root, documents)
+        _insert_source_manifest(connection, root)
         connection.commit()
 
     return db_file
@@ -184,6 +424,9 @@ def search_memory(
     date_to: str | None = None,
     path: str | None = None,
     use_index: bool = True,
+    scope: str | None = None,
+    semantic_backend: LocalSemanticBackend | None = None,
+    speaker_role: str | None = None,
 ) -> list[MemorySearchResult]:
     results, _ = search_memory_with_profile(
         root=root,
@@ -198,7 +441,10 @@ def search_memory(
         date_from=date_from,
         date_to=date_to,
         path=path,
+        scope=scope,
         use_index=use_index,
+        semantic_backend=semantic_backend,
+        speaker_role=speaker_role,
     )
     return results
 
@@ -217,6 +463,9 @@ def search_memory_with_profile(
     date_to: str | None = None,
     path: str | None = None,
     use_index: bool = True,
+    scope: str | None = None,
+    semantic_backend: LocalSemanticBackend | None = None,
+    speaker_role: str | None = None,
 ) -> tuple[list[MemorySearchResult], SearchProfile]:
     """Search memory and return the normal results together with timings.
 
@@ -230,8 +479,14 @@ def search_memory_with_profile(
     index_load_ms = 0.0
     filter_ms = 0.0
     source = "markdown"
+    fallback_document_count = 0
+    health = (
+        inspect_index_health(root=root, db_path=db_file)
+        if use_index
+        else IndexHealth(status="disabled")
+    )
 
-    if use_index and db_file.exists():
+    if use_index and db_file.exists() and not health.needs_markdown_fallback:
         source = "sqlite"
         documents, index_load_ms, filter_ms = _load_documents_from_index(
             root=root,
@@ -244,7 +499,19 @@ def search_memory_with_profile(
             date_from=date_from,
             date_to=date_to,
             path=path,
+            scope=scope,
+            speaker_role=speaker_role,
         )
+        if scope:
+            strict_filter_started_at = perf_counter()
+            normalized_scope = _normalize_scope(scope)
+            source_header_cache: dict[Path, str] = {}
+            documents = [
+                document
+                for document in documents
+                if _document_matches_scope(document, normalized_scope, root, source_header_cache)
+            ]
+            filter_ms += (perf_counter() - strict_filter_started_at) * 1000
         # Existing indexes predate message-level raw evidence.  Keep them usable
         # without requiring a manual rebuild before the first answer after an
         # upgrade.
@@ -267,6 +534,8 @@ def search_memory_with_profile(
                 date_from=date_from,
                 date_to=date_to,
                 path=path,
+                scope=scope,
+                speaker_role=speaker_role,
                 root=root,
             )
             filter_ms += (perf_counter() - filter_started_at) * 1000
@@ -286,12 +555,24 @@ def search_memory_with_profile(
             date_from=date_from,
             date_to=date_to,
             path=path,
+            scope=scope,
+            speaker_role=speaker_role,
             root=root,
         )
         filter_ms = (perf_counter() - filter_started_at) * 1000
+        fallback_document_count = len(documents) if use_index else 0
+        if use_index:
+            source = "sqlite+markdown-fallback"
 
     ranking_started_at = perf_counter()
-    results = _rank_documents(documents, query=query, limit=limit)
+    query_variants = expand_query_variants(query)
+    results = _rank_documents(
+        documents,
+        query=query,
+        limit=limit,
+        semantic_backend=semantic_backend,
+        query_variants=query_variants,
+    )
     ranking_ms = (perf_counter() - ranking_started_at) * 1000
     profile = SearchProfile(
         source=source,
@@ -310,7 +591,13 @@ def search_memory_with_profile(
             date_from=date_from,
             date_to=date_to,
             path=path,
+            scope=scope,
+            speaker_role=speaker_role,
         ),
+        index_status=health.status,
+        fallback_document_count=fallback_document_count,
+        query_variants=query_variants,
+        retrieval_mode="hybrid-local" if semantic_backend is not None else "hybrid-lexical",
     )
     return results, profile
 
@@ -325,6 +612,8 @@ def _filter_documents(
     date_from: str | None,
     date_to: str | None,
     path: str | None,
+    scope: str | None,
+    speaker_role: str | None,
     root: Path,
 ) -> list[MemoryDocument]:
     filtered = documents
@@ -349,7 +638,71 @@ def _filter_documents(
             for document in filtered
             if normalized_path in _normalize_path(_relative_path(document.path, root))
         ]
+    if speaker_role:
+        normalized_role = speaker_role.strip().lower()
+        filtered = [document for document in filtered if document.speaker_role == normalized_role]
+    if scope:
+        normalized_scope = _normalize_scope(scope)
+        source_header_cache: dict[Path, str] = {}
+        filtered = [
+            document
+            for document in filtered
+            if _document_matches_scope(document, normalized_scope, root, source_header_cache)
+        ]
     return filtered
+
+
+def _document_matches_scope(
+    document: MemoryDocument,
+    normalized_scope: str,
+    root: Path,
+    source_header_cache: dict[Path, str],
+) -> bool:
+    # A raw session is scoped by its immutable header and the current message,
+    # never by a different message elsewhere in the same transcript.
+    raw_header = ""
+    if document.document_type == "raw":
+        raw_header = _raw_session_header(document.content)
+    elif document.document_type == "raw_chunk":
+        path_key = document.path.resolve()
+        if path_key not in source_header_cache:
+            try:
+                source_header_cache[path_key] = _raw_session_header(
+                    document.path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeDecodeError):
+                source_header_cache[path_key] = ""
+        raw_header = source_header_cache[path_key]
+
+    stored_scope = _field_value(raw_header, "Project Scope") if raw_header else None
+    if stored_scope and _normalize_scope(stored_scope):
+        # An explicit session assignment is authoritative. Prefix/substring
+        # matches must not cross from (for example) Alpha into Alpha-Secret.
+        return _normalize_scope(stored_scope) == normalized_scope
+
+    content_for_scope = raw_header if document.document_type == "raw" else document.content
+    metadata_text = "\n".join(
+        (
+            _relative_path(document.path, root),
+            document.title,
+            " ".join(document.tags),
+            document.category or "",
+            document.category_label or "",
+            document.source or "",
+            content_for_scope,
+        )
+    )
+    if normalized_scope in _normalize_scope(metadata_text):
+        return True
+    if document.document_type != "raw_chunk":
+        return False
+
+    return normalized_scope in _normalize_scope(raw_header)
+
+
+def _raw_session_header(content: str) -> str:
+    match = re.search(r"^## (?:User|Assistant)[ \t]*$", content, flags=re.MULTILINE | re.IGNORECASE)
+    return content[: match.start()] if match else content
 
 
 def _filter_names(
@@ -361,6 +714,8 @@ def _filter_names(
     date_from: str | None,
     date_to: str | None,
     path: str | None,
+    scope: str | None,
+    speaker_role: str | None,
 ) -> tuple[str, ...]:
     names: list[str] = []
     if document_types:
@@ -379,6 +734,10 @@ def _filter_names(
         names.append("date_to")
     if path:
         names.append("path")
+    if scope:
+        names.append("scope")
+    if speaker_role:
+        names.append("speaker_role")
     return tuple(names)
 
 
@@ -386,8 +745,17 @@ def _normalize_path(value: str) -> str:
     return value.replace("\\", "/").lower()
 
 
+def _normalize_scope(value: str) -> str:
+    return "".join(value.lower().split())
+
+
 def _sql_contains_pattern(value: str) -> str:
     escaped = _normalize_path(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _sql_scope_pattern(value: str) -> str:
+    escaped = _normalize_scope(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
 
 
@@ -552,14 +920,121 @@ def _field_value(content: str, name: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
-def _rank_documents(documents: list[MemoryDocument], query: str, limit: int) -> list[MemorySearchResult]:
-    terms = _query_terms(query)
-    results: list[MemorySearchResult] = []
+def expand_query_variants(query: str) -> tuple[str, ...]:
+    """Return deterministic OR-style query reformulations.
 
-    for document in documents:
-        score = _score(document, terms)
-        if terms and score <= 0:
-            continue
+    Request wording is removed before matching so phrases such as ``教えて``
+    never become the strongest term.  A quoted/nested personal topic is kept as
+    a separate phrase. Product search deliberately has no fixed dictionary that
+    maps a user's private topic to related names or phrases; interactive MCP
+    callers handle genuine vocabulary mismatches through iterative queries.
+    """
+
+    stripped = query.strip()
+    if not stripped:
+        return ()
+
+    cleaned = stripped
+    for expression in REQUEST_EXPRESSIONS:
+        cleaned = re.sub(re.escape(expression), " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[?？!！]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    variants: list[str] = []
+    if cleaned:
+        variants.append(cleaned)
+
+    # ``俺のXの感想`` and its common variants preserve X as a complete topic;
+    # blindly splitting every Japanese particle can lose a multiword title.
+    topic_patterns = (
+        r"(?:俺|おれ|オレ|私|わたし|僕|ぼく|自分)の(.+?)の(?:感想|好み|意見|考え)",
+        r"[\u300e「](.+?)[\u300f」]",
+    )
+    for pattern in topic_patterns:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE)
+        if match and len(match.group(1).strip()) >= 2:
+            variants.append(match.group(1).strip())
+
+    # A term-only variant catches punctuation and polite-wording differences.
+    normalized_terms = _query_terms(cleaned)
+    if normalized_terms:
+        variants.append(" ".join(normalized_terms))
+    return tuple(_dedupe(variants))
+
+
+def _rank_documents(
+    documents: list[MemoryDocument],
+    query: str,
+    limit: int,
+    semantic_backend: LocalSemanticBackend | None = None,
+    query_variants: tuple[str, ...] | None = None,
+) -> list[MemorySearchResult]:
+    variants = query_variants if query_variants is not None else expand_query_variants(query)
+    if not variants and query.strip():
+        variants = (query.strip(),)
+
+    document_by_key = {document.document_key: document for document in documents}
+    base_scores: dict[str, int] = defaultdict(int)
+    rrf_scores: dict[str, float] = defaultdict(float)
+    matched_terms: dict[str, list[str]] = defaultdict(list)
+
+    if not variants:
+        for document in documents:
+            base_scores[document.document_key] = 1
+    else:
+        seen_term_sets: set[tuple[str, ...]] = set()
+        for variant in variants:
+            terms = _query_terms(variant)
+            term_key = tuple(term.lower() for term in terms)
+            if not terms or term_key in seen_term_sets:
+                continue
+            seen_term_sets.add(term_key)
+            ranked_variant: list[tuple[MemoryDocument, int, list[str]]] = []
+            for document in documents:
+                score, evidence_terms = _score_with_evidence(document, terms)
+                if score > 0:
+                    ranked_variant.append((document, score, evidence_terms))
+            ranked_variant.sort(
+                key=lambda item: (
+                    item[1],
+                    _document_evidence_quality(item[0]),
+                    item[0].date or "",
+                    item[0].document_key,
+                ),
+                reverse=True,
+            )
+            for rank, (document, score, evidence_terms) in enumerate(ranked_variant, start=1):
+                key = document.document_key
+                base_scores[key] = max(base_scores[key], score)
+                rrf_scores[key] += 1.0 / (RRF_K + rank)
+                matched_terms[key].extend(evidence_terms)
+
+    if semantic_backend is not None and query.strip():
+        semantic_keys = semantic_backend.rank(query, tuple(documents), max(limit * 4, 20))
+        seen_semantic: set[str] = set()
+        for rank, key in enumerate(semantic_keys, start=1):
+            if key in seen_semantic or key not in document_by_key:
+                continue
+            seen_semantic.add(key)
+            rrf_scores[key] += 1.0 / (RRF_K + rank)
+            base_scores.setdefault(key, 0)
+
+    ranked_keys = sorted(
+        base_scores,
+        key=lambda key: (
+            base_scores[key],
+            rrf_scores[key],
+            _document_evidence_quality(document_by_key[key]),
+            document_by_key[key].date or "",
+            key,
+        ),
+        reverse=True,
+    )
+    results: list[MemorySearchResult] = []
+    for key in ranked_keys[: max(limit, 1)]:
+        document = document_by_key[key]
+        terms = _dedupe(matched_terms.get(key, []))
+        score = base_scores[key] * 100 + round(rrf_scores[key] * 1000)
         results.append(
             MemorySearchResult(
                 document_type=document.document_type,
@@ -567,8 +1042,12 @@ def _rank_documents(documents: list[MemoryDocument], query: str, limit: int) -> 
                 title=document.title,
                 date=document.date,
                 tags=document.tags,
-                snippet=_snippet(document.content, terms, width=2200 if document.document_type == "raw_chunk" else 160),
-                score=score,
+                snippet=_snippet(
+                    document.content,
+                    terms,
+                    width=2200 if document.document_type == "raw_chunk" else 160,
+                ),
+                score=max(score, 1),
                 category=document.category,
                 category_label=document.category_label,
                 status=document.status,
@@ -579,19 +1058,29 @@ def _rank_documents(documents: list[MemoryDocument], query: str, limit: int) -> 
                 message_number=document.message_number,
             )
         )
-
-    results.sort(key=lambda result: (result.score, result.date or "", str(result.path)), reverse=True)
-    return results[: max(limit, 1)]
+    return results
 
 
-def _score(document: MemoryDocument, terms: list[str]) -> int:
+def _score_with_evidence(document: MemoryDocument, terms: list[str]) -> tuple[int, list[str]]:
     if not terms:
-        return 1
+        return 1, []
 
     text = f"{document.title}\n{' '.join(document.tags)}\n{document.content}".lower()
     score = 0
+    evidence_terms: list[str] = []
     for term in terms:
-        score += text.count(term.lower())
+        normalized_term = term.lower()
+        count = text.count(normalized_term)
+        if count:
+            # Exact lexical evidence must stay stronger than a partial n-gram
+            # resemblance (for example two different *_USER_SENTINEL values).
+            score += 4 + min(count, 3)
+            evidence_terms.append(term)
+            continue
+        ngram_score = _character_ngram_score(normalized_term, text)
+        if ngram_score:
+            score += ngram_score
+            evidence_terms.append(term)
 
     if document.document_type in {"memory", "memory_item"} and score:
         score += 3
@@ -604,7 +1093,43 @@ def _score(document: MemoryDocument, terms: list[str]) -> int:
         # that merely repeats the search wording.  Keep the bonus capped so a
         # long but weakly related transcript cannot dominate keyword matches.
         score += min(max((len(document.content) - 160) // 400, 0), 4)
-    return score
+    return score, evidence_terms
+
+
+def _document_evidence_quality(document: MemoryDocument) -> int:
+    """Tie-break toward first-party, substantive evidence."""
+
+    quality = 0
+    if document.document_type == "raw_chunk":
+        quality += 2 if document.speaker_role == "user" else 0
+        quality += min(len(document.content) // 300, 4)
+    elif document.document_type == "raw":
+        quality += min(len(document.content) // 600, 3)
+    return quality
+
+
+def _character_ngram_score(term: str, text: str) -> int:
+    """Return a conservative typo/orthography score using character trigrams."""
+
+    compact_term = _compact_search_text(term)
+    if len(compact_term) < 4:
+        return 0
+    query_ngrams = {
+        compact_term[index : index + 3]
+        for index in range(len(compact_term) - 2)
+    }
+    if len(query_ngrams) < 2:
+        return 0
+    compact_text = _compact_search_text(text)
+    overlap = sum(1 for ngram in query_ngrams if ngram in compact_text)
+    ratio = overlap / len(query_ngrams)
+    if overlap < 2 or ratio < 0.5:
+        return 0
+    return min(1 + overlap // 2, 2)
+
+
+def _compact_search_text(value: str) -> str:
+    return re.sub(r"[^0-9a-zA-Zぁ-んァ-ン一-鿿]+", "", value.lower())
 
 
 def _snippet(content: str, terms: list[str], width: int = 160) -> str:
@@ -635,19 +1160,24 @@ def _query_terms(query: str) -> list[str]:
     if not stripped:
         return []
 
+    normalized = stripped
+    for expression in REQUEST_EXPRESSIONS:
+        normalized = re.sub(re.escape(expression), " ", normalized, flags=re.IGNORECASE)
     terms = [
         term
-        for term in re.split(r"[\s、。,.!?！？「」『』（）()\[\]【】]+", stripped)
+        for term in re.split(r"[\s、。,.!?！？「」『』（）()\[\]【】:;：；]+", normalized)
         if term
     ]
     expanded: list[str] = []
     for term in terms:
+        if 2 <= len(term) <= 80 and term.lower() not in QUERY_STOP_TERMS:
+            expanded.append(term)
         expanded.extend(
             part
             for part in re.split(r"(?:の|は|を|に|が|で|と|や|も|へ|から|まで|です|ます)", term)
-            if len(part) >= 2
+            if len(part) >= 2 and part.lower() not in QUERY_STOP_TERMS
         )
-    return _dedupe(expanded or terms)
+    return _dedupe(expanded)
 
 
 def _dedupe(values: Iterable[str]) -> list[str]:
@@ -705,7 +1235,23 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX idx_documents_category ON documents(category);
         CREATE INDEX idx_documents_status ON documents(status);
         CREATE INDEX idx_tags_tag ON tags(tag);
+
+        CREATE TABLE indexed_sources (
+            path TEXT PRIMARY KEY,
+            mtime_ns INTEGER NOT NULL,
+            size INTEGER NOT NULL
+        );
+
+        CREATE TABLE index_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """
+    )
+
+    connection.executemany(
+        "INSERT INTO index_metadata(key, value) VALUES (?, ?)",
+        INDEX_VERSION_METADATA.items(),
     )
 
     try:
@@ -760,6 +1306,18 @@ def _insert_documents(connection: sqlite3.Connection, root: Path, documents: lis
             )
 
 
+def _insert_source_manifest(connection: sqlite3.Connection, root: Path) -> None:
+    for path in _candidate_paths(root):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        connection.execute(
+            "INSERT INTO indexed_sources(path, mtime_ns, size) VALUES (?, ?, ?)",
+            (_relative_path(path, root), stat.st_mtime_ns, stat.st_size),
+        )
+
+
 def _has_fts(connection: sqlite3.Connection) -> bool:
     cursor = connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='documents_fts'")
     return cursor.fetchone() is not None
@@ -776,6 +1334,8 @@ def _load_documents_from_index(
     date_from: str | None = None,
     date_to: str | None = None,
     path: str | None = None,
+    scope: str | None = None,
+    speaker_role: str | None = None,
 ) -> tuple[list[MemoryDocument], float, float]:
     index_load_started_at = perf_counter()
     with closing(sqlite3.connect(db_path)) as connection:
@@ -830,6 +1390,36 @@ def _load_documents_from_index(
     if path:
         where.append("LOWER(REPLACE(d.path, CHAR(92), '/')) LIKE ? ESCAPE '\\'")
         params.append(_sql_contains_pattern(path))
+    if speaker_role:
+        normalized_role = speaker_role.strip().lower()
+        if has_message_columns:
+            where.append("LOWER(COALESCE(d.speaker_role, '')) = ?")
+            params.append(normalized_role)
+        else:
+            # Legacy indexes did not have speaker_role but message chunks still
+            # encode it at the end of their stable document key.
+            where.append("LOWER(d.document_key) LIKE ?")
+            params.append(f"%-{normalized_role}")
+    if scope:
+        scope_columns = ["d.path", "d.title", "d.tags_json", "d.content"]
+        if has_structured_columns:
+            scope_columns.extend(("d.category", "d.category_label", "d.source"))
+        scope_clauses = [
+            "LOWER(REPLACE(REPLACE(REPLACE(REPLACE("
+            f"COALESCE({column}, ''), ' ', ''), CHAR(9), ''), CHAR(10), ''), CHAR(13), '')) "
+            "LIKE ? ESCAPE '\\'"
+            for column in scope_columns
+        ]
+        scope_clauses.append(
+            "EXISTS (SELECT 1 FROM documents scope_document "
+            "WHERE scope_document.path = d.path "
+            "AND scope_document.document_type != 'raw_chunk' "
+            "AND LOWER(REPLACE(REPLACE(REPLACE(REPLACE("
+            "COALESCE(scope_document.content, ''), ' ', ''), CHAR(9), ''), CHAR(10), ''), CHAR(13), '')) "
+            "LIKE ? ESCAPE '\\')"
+        )
+        where.append("(" + " OR ".join(scope_clauses) + ")")
+        params.extend(_sql_scope_pattern(scope) for _ in range(len(scope_columns) + 1))
     if where:
         query.append("WHERE " + " AND ".join(where))
     query.append("ORDER BY COALESCE(d.date, ''), d.path")

@@ -40,6 +40,16 @@ from kokoro_tts import (
     synthesize_to_wav_chunks,
     temporary_audio_dir,
 )
+from personalization_settings import (
+    build_memory_summary,
+    load_personalization_settings,
+    load_session_personalization,
+    personalization_settings_path,
+    serialize_personalization,
+    update_personalization_settings,
+    update_session_personalization,
+    validate_project_scope,
+)
 from session_store import get_session_organization, list_resumable_sessions, load_resume_session, save_session
 
 GUI_LOG_ENV = "AI_LIFEOS_GUI_LOG"
@@ -69,6 +79,15 @@ class AssistantGenerationCancelled(RuntimeError):
 def handle_start_session(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
     session = create_live_session(root=root)
+    settings = load_personalization_settings(root)
+    update_session_personalization(
+        root,
+        session.path,
+        temporary=(payload["temporary"] if "temporary" in payload else False),
+        memory_enabled=settings.memory_enabled,
+        past_chat_search_enabled=settings.past_chat_search_enabled,
+        project_scope=(payload["project_scope"] if "project_scope" in payload else settings.project_scope),
+    )
     _gui_log(root, f"start_session.created session={session.path.stem}")
     return {
         "session": _serialize_session_file(session.path, root),
@@ -107,8 +126,17 @@ def handle_send_message(
     messages.append(user_message)
     _save_session_metadata(root=root, session_file=session_file, status="saved")
 
+    # Read the effective snapshot only after the first user record is durable.
+    # A temporary-mode update that won the race before the append is therefore
+    # honored by this reply; one that loses the race is rejected by the settings
+    # layer because the session is now locked.
+    personalization = load_session_personalization(root, session_file)
+    retrieval_enabled = personalization.memory_enabled or personalization.past_chat_search_enabled
+
     assistant_message = None
     memory_context = None
+    memory_candidates: tuple[MemoryContextReference, ...] = ()
+    memory_opened: tuple[MemoryContextReference, ...] = ()
     error = None
     cancelled = False
     if not bool(payload.get("no_ai", False)):
@@ -122,6 +150,12 @@ def handle_send_message(
                 "sandbox": str(payload.get("codex_sandbox") or "read-only"),
                 "approval": str(payload.get("codex_approval") or "never"),
                 "max_context_messages": int(payload.get("max_context_messages") or 20),
+                "include_memory_context": retrieval_enabled,
+                "enable_memory_mcp": personalization.past_chat_search_enabled,
+                "include_core_memory": personalization.memory_enabled,
+                "include_past_chats": personalization.past_chat_search_enabled,
+                "project_scope": personalization.project_scope,
+                "exclude_live_session": session_file,
             }
             if on_delta is None:
                 reply_result = generate_assistant_reply_with_context(
@@ -147,6 +181,12 @@ def handle_send_message(
                     )
             reply = reply_result.reply
             memory_context = reply_result.memory_context
+            candidate_values = getattr(reply_result, "memory_candidates", ())
+            if isinstance(candidate_values, (list, tuple)):
+                memory_candidates = tuple(candidate_values)
+            opened_values = getattr(reply_result, "memory_opened", ())
+            if isinstance(opened_values, (list, tuple)):
+                memory_opened = tuple(opened_values)
             if memory_context is not None:
                 raw_chunk_count = sum(1 for result in memory_context.results if result.document_type == "raw_chunk")
                 _gui_log(
@@ -186,6 +226,8 @@ def handle_send_message(
         "messages": [_serialize_message(message) for message in messages],
         "assistant": _serialize_message(assistant_message) if assistant_message else None,
         "memory_context": _serialize_memory_context(memory_context),
+        "memory_candidates": [_serialize_memory_reference(reference) for reference in memory_candidates],
+        "memory_opened": [_serialize_memory_reference(reference) for reference in memory_opened],
         "attachments": [_serialize_attachment_report(attachment) for attachment in attachments],
         "error": error,
         "cancelled": cancelled,
@@ -354,11 +396,93 @@ def handle_resume_session(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def handle_get_personalization(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    settings = load_personalization_settings(root)
+    session_value = payload.get("session_file")
+    session_file = _resolve_session_path(root=root, value=session_value, must_exist=False) if session_value else None
+    session = load_session_personalization(root, session_file) if session_file else None
+    _gui_log(root, f"personalization.get session={Path(str(session_value)).stem if session_value else '-'}")
+    return {
+        "settings": serialize_personalization(settings),
+        "session": serialize_personalization(session) if session else None,
+        "session_state": _serialize_session_file(session_file, root) if session_file else None,
+        "settings_file": _display_path(personalization_settings_path(root), root),
+    }
+
+
+def handle_update_personalization(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    settings_payload = payload.get("settings")
+    session_payload = payload.get("session")
+    if settings_payload is None and session_payload is None:
+        raise ValueError("更新するパーソナライズ設定を指定してください。")
+
+    settings_fields = None
+    if settings_payload is not None:
+        settings_fields = _personalization_update_fields(
+            settings_payload,
+            allowed={"memory_enabled", "past_chat_search_enabled", "project_scope"},
+            label="settings",
+        )
+
+    session = None
+    session_file = None
+    session_fields = None
+    if session_payload is not None:
+        session_file = _resolve_session_path(root=root, value=payload.get("session_file"), must_exist=False)
+        session_fields = _personalization_update_fields(
+            session_payload,
+            allowed={"temporary", "memory_enabled", "past_chat_search_enabled", "project_scope"},
+            label="session",
+        )
+        if session_fields.get("temporary") is True and (
+            _find_active_finalize_job(root=root, session_file=session_file) is not None
+            or _find_active_organize_sessions_job(root) is not None
+        ):
+            raise RuntimeError("整理ジョブの実行中は一時チャットへ変更できません。整理完了後に新規セッションで指定してください。")
+        # The settings layer owns the immutable retention boundary check for
+        # both directions (normal -> temporary and temporary -> normal).
+
+    settings = (
+        update_personalization_settings(root, **settings_fields)
+        if settings_fields is not None
+        else load_personalization_settings(root)
+    )
+    if session_fields is not None and session_file is not None:
+        session = update_session_personalization(root, session_file, **session_fields)
+
+    _gui_log(
+        root,
+        "personalization.update "
+        f"settings={settings_payload is not None} session={session_payload is not None} "
+        f"temporary={session.temporary if session else '-'}",
+    )
+    return {
+        "settings": serialize_personalization(settings),
+        "session": serialize_personalization(session) if session else None,
+        "session_state": _serialize_session_file(session_file, root) if session is not None else None,
+        "settings_file": _display_path(personalization_settings_path(root), root),
+    }
+
+
+def handle_get_memory_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    summary = build_memory_summary(root)
+    _gui_log(
+        root,
+        "memory_summary.get "
+        f"sections={len(summary['sections'])} structured_items={len(summary['structured_items'])}",
+    )
+    return {"summary": summary}
+
+
 def handle_finalize_session(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
     if _find_active_organize_sessions_job(root) is not None:
         raise RuntimeError("データ整理が進行中です。完了または停止してから個別整理を実行してください。")
     session_file = _resolve_existing_session(root=root, value=payload.get("session_file"))
+    _ensure_session_can_be_organized(root, session_file)
     run_codex = bool(payload.get("run_codex", True))
     _gui_log(root, f"finalize_session.start session={session_file.stem} run_codex={run_codex}")
     result = finalize_live_chat(
@@ -480,6 +604,7 @@ def handle_start_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
     if _find_active_organize_sessions_job(root) is not None:
         raise RuntimeError("データ整理が進行中です。完了または停止してから個別整理を実行してください。")
     session_file = _resolve_existing_session(root=root, value=payload.get("session_file"))
+    _ensure_session_can_be_organized(root, session_file)
     existing = _find_active_finalize_job(root=root, session_file=session_file)
     if existing is not None:
         _gui_log(root, f"finalize_job.reused job_id={existing['job_id']} session={session_file.stem}")
@@ -705,6 +830,9 @@ COMMANDS = {
     "save-session": handle_save_session,
     "list-resumable": handle_list_resumable,
     "resume-session": handle_resume_session,
+    "get-personalization": handle_get_personalization,
+    "update-personalization": handle_update_personalization,
+    "get-memory-summary": handle_get_memory_summary,
     "finalize-session": handle_finalize_session,
     "local-data-report": handle_local_data_report,
     "open-local-data-folder": handle_open_local_data_folder,
@@ -1122,7 +1250,8 @@ def _organize_session_targets(root: Path, retention_days: int) -> list[Path]:
     targets = [
         session
         for session in sessions
-        if get_session_organization(root=root, session_file=session.jsonl_file).get("can_organize")
+        if not load_session_personalization(root, session.jsonl_file).exclude_from_memory
+        and get_session_organization(root=root, session_file=session.jsonl_file).get("can_organize")
     ]
     targets.sort(key=lambda session: session.last_user_at)
     return [session.jsonl_file for session in targets]
@@ -1412,6 +1541,7 @@ def _run_finalize_job(root: Path, payload: dict[str, Any], job_id: str) -> None:
         )
 
     try:
+        _ensure_session_can_be_organized(root, session_file)
         run_command = _cancelable_run_command(root=root, cancel_file=cancel_file)
         result = finalize_live_chat(
             root=root,
@@ -1540,6 +1670,11 @@ def _run_organize_sessions_job(root: Path, payload: dict[str, Any], job_id: str)
                 session_file = _resolve_existing_session(root=root, value=session_value)
             except FileNotFoundError:
                 skipped.append(Path(session_value).stem)
+                continue
+
+            if load_session_personalization(root, session_file).exclude_from_memory:
+                skipped.append(session_file.stem)
+                update_progress(index, session_file.stem, 100, "一時チャットのため整理対象から除外しました。")
                 continue
 
             organization = get_session_organization(root=root, session_file=session_file)
@@ -1700,6 +1835,28 @@ def _now_iso() -> str:
 def _payload_root(payload: dict[str, Any]) -> Path:
     root = payload.get("root")
     return Path(root) if root else ROOT
+
+
+def _personalization_update_fields(value: Any, *, allowed: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} はJSON objectで指定してください。")
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"{label} に未対応の項目があります: {', '.join(sorted(unknown))}")
+    if not value:
+        raise ValueError(f"{label} に更新項目を指定してください。")
+    fields = {key: value[key] for key in allowed if key in value}
+    for name in {"memory_enabled", "past_chat_search_enabled", "temporary"} & set(fields):
+        if not isinstance(fields[name], bool):
+            raise ValueError(f"{name} は true または false で指定してください。")
+    if "project_scope" in fields:
+        fields["project_scope"] = validate_project_scope(fields["project_scope"])
+    return fields
+
+
+def _ensure_session_can_be_organized(root: Path, session_file: Path) -> None:
+    if load_session_personalization(root, session_file).exclude_from_memory:
+        raise ValueError("一時チャットは記憶整理の対象外です。通常チャットとして新しいセッションを作成してください。")
 
 
 def _read_aloud_request_id(value: Any) -> str:
@@ -1923,7 +2080,17 @@ def _resolve_or_create_session(root: Path, value: Any) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
-    return create_live_session(root=root).path
+    session = create_live_session(root=root)
+    settings = load_personalization_settings(root)
+    update_session_personalization(
+        root,
+        session.path,
+        temporary=False,
+        memory_enabled=settings.memory_enabled,
+        past_chat_search_enabled=settings.past_chat_search_enabled,
+        project_scope=settings.project_scope,
+    )
+    return session.path
 
 
 def _resolve_existing_session(root: Path, value: Any) -> Path:
@@ -1999,6 +2166,7 @@ def _serialize_session_file(path: Path, root: Path) -> dict[str, Any]:
         "session_id": path.stem,
         "jsonl_file": _display_path(path, root),
         "organization": _serialize_organization(root=root, session_file=path),
+        "personalization": serialize_personalization(load_session_personalization(root, path)),
     }
 
 
@@ -2021,6 +2189,7 @@ def _serialize_memory_context(context: AnswerContext | None) -> dict[str, Any]:
             "retrieval_modes": [],
             "reference_count": 0,
             "references": [],
+            "retrieval_health": _default_retrieval_health(),
         }
 
     return {
@@ -2032,6 +2201,50 @@ def _serialize_memory_context(context: AnswerContext | None) -> dict[str, Any]:
         "retrieval_modes": list(context.retrieval_modes),
         "reference_count": len(context.references),
         "references": [_serialize_memory_reference(reference) for reference in context.references],
+        "retrieval_health": _serialize_retrieval_health(context),
+    }
+
+
+def _default_retrieval_health() -> dict[str, Any]:
+    return {
+        "index_status": "disabled",
+        "index_reasons": [],
+        "markdown_fallback_used": False,
+        "retrieval_depth": "none",
+        "query_variants": [],
+        "core_enabled": False,
+        "past_chats_enabled": False,
+        "core_reference_count": 0,
+        "structured_memory_hit_count": 0,
+        "past_chat_hit_count": 0,
+        "project_scope": None,
+    }
+
+
+def _serialize_retrieval_health(context: AnswerContext) -> dict[str, Any]:
+    health = context.retrieval_health
+    return {
+        "index_status": _safe_log_text(str(health.index_status), max_length=40),
+        "index_reasons": [
+            _safe_log_text(str(reason), max_length=240)
+            for reason in health.index_reasons[:10]
+        ],
+        "markdown_fallback_used": bool(health.markdown_fallback_used),
+        "retrieval_depth": _safe_log_text(str(health.retrieval_depth), max_length=40),
+        "query_variants": [
+            _safe_log_text(str(variant), max_length=160)
+            for variant in health.query_variants[:8]
+        ],
+        "core_enabled": bool(health.core_enabled),
+        "past_chats_enabled": bool(health.past_chats_enabled),
+        "core_reference_count": max(0, int(health.core_reference_count)),
+        "structured_memory_hit_count": max(0, int(health.structured_memory_hit_count)),
+        "past_chat_hit_count": max(0, int(health.past_chat_hit_count)),
+        "project_scope": (
+            _safe_log_text(str(health.project_scope), max_length=120)
+            if health.project_scope is not None
+            else None
+        ),
     }
 
 
@@ -2371,12 +2584,13 @@ def _serialize_resume_session(session: Any, root: Path) -> dict[str, Any]:
         "updated_at": session.updated_at.isoformat(timespec="seconds"),
         "last_user_at": session.last_user_at.isoformat(timespec="seconds"),
         "organization": _serialize_organization(root=root, session_file=session.jsonl_file),
+        "personalization": serialize_personalization(load_session_personalization(root, session.jsonl_file)),
     }
 
 
 def _serialize_organization(root: Path, session_file: Path) -> dict[str, Any]:
     if not session_file.exists():
-        return {
+        organization = {
             "status": "empty",
             "label": "未開始",
             "can_organize": False,
@@ -2396,8 +2610,21 @@ def _serialize_organization(root: Path, session_file: Path) -> dict[str, Any]:
                 "index": {"name": "index", "label": "検索index更新", "status": "pending"},
             },
         }
+    else:
+        organization = get_session_organization(root=root, session_file=session_file)
 
-    return get_session_organization(root=root, session_file=session_file)
+    if load_session_personalization(root, session_file).exclude_from_memory:
+        organization = {
+            **organization,
+            "status": "temporary",
+            "label": "一時チャット",
+            "can_organize": False,
+            "is_organized": False,
+            "next_stage": None,
+            "failed_stage": None,
+            "last_error": None,
+        }
+    return organization
 
 
 def _display_path(path: Path, root: Path) -> str:

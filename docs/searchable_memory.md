@@ -82,6 +82,7 @@ SQLite schema:
   * 構造化メモリではcategory、category_label、status、source、source_date、confidenceも保持
 * `tags`: タグ検索用
 * `documents_fts`: FTS5 が使える環境では補助テーブルとして作成
+* `indexed_sources`: 元Markdownのpath、mtime、sizeを保持する鮮度確認用マニフェスト
 
 現時点の検索方式は `SQLite-backed index + Python ranking` です。SQLiteには全文とメタデータを保存し、検索時はSQLiteから対象文書を読み出して、Python側で日本語の部分一致ランキングを行います。
 
@@ -96,6 +97,7 @@ SQLite indexを使う検索では、候補をPythonへ読み込む前に次の�
 * structured-memory category / status
 * exact date、開始日、終了日
 * relative-path substring
+* project scopeのpath / title / tags / category / source / content一致
 
 ```powershell
 python scripts\search_memory.py "検索語" --type summary --from-date 2026-01-01 --to-date 2026-12-31 --path conversations --profile
@@ -108,6 +110,11 @@ python scripts\search_memory.py "" --type memory_item --category study_status --
 * `filter`: SQLite側の絞り込みクエリ時間。`--no-index`では同じ条件のPython絞り込み時間。
 * `ranking`: 日本語部分一致のPython ranking時間。
 * candidates / results: ranking前の候補数と返却件数。
+* `index_status`: `fresh` / `legacy` / `missing` / `stale` / `unreadable` / `disabled`。
+* `query_variants`: 依頼表現を除外した検索語と、一般的なtopic variantの一覧。
+* `retrieval_mode`: 標準の `hybrid-lexical`、または将来のローカル意味rankerを併用する `hybrid-local`。
+
+index構築後にMarkdownが追加・更新・削除された場合、検索はindexを書き換えません。`index_status=stale`とし、その回答中だけ現在のMarkdownを直接検索します。現行indexはsource manifestに加えてschema versionとraw metadata parser versionを保存します。version metadataがない／一致しないDBや`indexed_sources`を持たない旧DBは`index_status=legacy`として、旧parser由来のtitle / tagsをproject scope判定へ使わず、常に現在のMarkdownへfallbackします。indexの再構築は従来どおりfinalizeまたは明示コマンドの責務です。
 
 `--json --profile`では従来の結果配列を`results`に保持し、同じJSONオブジェクトの`profile`で上記の計測値を返します。通常の`--json`出力形式は変わりません。
 
@@ -142,14 +149,16 @@ python scripts\build_answer_context.py "俺の好みに合う店は？"
 
 動作:
 
-* 毎回答で `memory/long_term.md` と `memory/preferences.md` から最大1,000文字のコア記憶だけを読み取り専用で渡す。日記全文・会話全文・無関係な項目は常時渡さない
+* 毎回答で `memory/long_term.md`、`memory/preferences.md`、`memory/projects.md` から最大1,000文字のコア記憶だけを読み取り専用で渡す。日記全文・会話全文・無関係な項目は常時渡さない
 * すべての質問で記憶検索を行う。通常の質問では、構造化メモリ・journal・summaryから関連度の高い短い抜粋を最大2件だけ読む「narrow」検索を使い、会話全文やrawチャンクは常時渡さない
-* 自己参照、過去会話、好み・生活、AI-LifeOS/プロジェクト語などの重み付きスコアは、narrow検索を省略するためではなく、より広い追加検索へ拡張する判断に使う
+* 自己参照、過去会話、好み・生活、AI-LifeOS/プロジェクト語などの重み付きスコアは、検索する/しないの閾値に使わない。すべての非空質問を検索対象とし、スコアは narrow / deep の検索深度にだけ使う
 * `俺` / `おれ` / `オレ` / `私` / `わたし` / `僕` / `ぼく` / `自分` を同じ自己参照として扱い、短いフォローアップでは直近2件までのuser発話を補助にする
 * 自己情報の短い質問や、保存済みの検索取りこぼしと確認済みのパターンでは、少数件だけのフォールバック検索を行う。フォールバックは検索開始の判断にだけ使い、回答の根拠にはしない
 * 質問から構造化メモリのカテゴリを推定できる場合は、`memory/items/*.md` の該当カテゴリを優先取得する
 * 追加情報が必要な場合は `journal` と `summary.md` / `raw.md` を検索する
-* 過去会話の事実照合では具体語を優先して再検索し、未整理の `inbox/live/*.jsonl` も読み取り専用で確認する。日時はAsia/Tokyoの日付で表示する
+* 過去会話の事実照合では具体語を優先して再検索し、未整理の `inbox/live/*.jsonl` も読み取り専用で確認する。ただし現在回答中のlive JSONLは「過去の記憶」として自己検索せず、日時はAsia/Tokyoの日付で表示する
+* `教えて` / `なんだっけ` などの依頼表現は検索語から除外し、一般的なトピック抽出・query variantと日本語文字trigramをOR候補とし、reciprocal-rank fusionで統合する。個人の作品・人物などを結び付ける固定辞書は持たず、語彙が一致しない場合はMemory MCPが検索語を変えて反復検索する
+* ユーザー自身の感想・好みを尋ねる場合はuser発言を一次根拠とし、後の「記録を確認できない」という取得失敗回答を正解として再利用しない
 * 結果は短い抜粋と出典情報に絞る
 * 会話中に `memory` / `journal` / `conversations` を編集しない
 
@@ -159,11 +168,23 @@ python scripts\build_answer_context.py "俺の好みに合う店は？"
 python scripts\codex_conversation.py --no-memory-context
 ```
 
+このオプションは静的contextとMemory MCPの両方を無効化します。MCPだけを無効にする場合は`--no-memory-mcp`を使います。
+
 現在性や外部情報が必要な質問では、ローカル記憶だけで断定せず、Web検索が必要なことを会話プロンプトに明示します。現時点のローカル実装自体はWeb検索クライアントを持ちません。
 
-CLI と GUI は回答生成後に `記憶参照: あり / なし` を表示します。参照ありの場合は、回答時に使った参照元ファイルパス、件数、短い抜粋を保持し、必要に応じて確認できます。通常の assistant 返答本文には出典パスを混ぜず、参照情報はメタデータとして表示します。
+CLI と GUI は回答生成後に、回答生成へ渡した静的context、MCPが列挙した検索候補、MCPで実際に`open_conversation`した一次資料を別々に保持・表示します。候補ありの場合は、取得元ファイルパス、件数、短い抜粋を必要に応じて確認できます。検索で列挙しただけの候補を「open済み」または「最終回答に使用済み」とは扱いません。通常の assistant 返答本文には出典パスを混ぜず、取得情報はメタデータとして表示します。
 
 表示には、コア記憶のみを使ったか、narrow検索、通常検索またはフォールバック検索を追加したかも含めます。検索取りこぼしへの訂正が保存済み記録で確認できた場合だけ、会話のfinalize後に `memory/retrieval_feedback.jsonl` へ正規化済み特徴量と結果を派生データとして保存します。会話本文・回答本文・個人情報の値は保存せず、live会話中やGUI送信中には更新しません。
+
+`AnswerContext.retrieval_health` は、コア記憶件数、構造化メモリ件数、過去会話件数、index鮮度、Markdown fallback、query variantsを別々に保持します。`include_core_memory` と `include_past_chats` は独立して無効化でき、`project_scope` 指定時はpath、title、tags、category、source、本文のスコープ一致をranking前に必須にします。固定コア記憶もファイル全体ではなく、scope名を持つMarkdownセクションまたは一致行だけを取得します。一致が0件でも無関係なプロジェクトへ自動で広げません。
+
+### Phase3.7 / 3.9: Retrieval correctness and hybrid lexical search
+
+固定閾値による検索ON/OFFは廃止しました。Phase3.9のMVPは外部APIやvector DBを追加せず、完全一致、複数query variant、保守的な文字trigram、RRFを使います。`LocalSemanticBackend` は、将来、metadata filter後の文書に対して完全ローカルなembedding rankerを差し込むためのinterfaceだけを定義しています。標準実行ではbackendを読み込まず、新しい依存も外部送信もありません。
+
+### Phase3.8 / 3.10: Agentic retrieval and personalization
+
+Codexは読み取り専用Memory MCPを使い、初回0件時に検索語を変えて再検索し、`open_conversation`で一次発言を確認できます。長期memoryと過去チャット検索は独立して無効化でき、project scope、一時チャット、取得元・retrieval healthをChat GUIから管理・確認できます。詳細は [memory_mcp.md](memory_mcp.md) と [personalization.md](personalization.md) を参照してください。
 
 ### 会話発言の役割付き参照
 
@@ -210,6 +231,7 @@ python scripts\search_benchmark.py --compare-japanese
 ## 安全ルール
 
 * 検索は読み取り専用。
+* live fallbackは `.session.json` の `personalization.temporary` / `exclude_from_memory` を最優先し、該当セッションを過去会話証拠として絶対に返さない。存在するmetadataを読めない場合もfail-closedで除外する。
 * SQLite index は再生成可能な派生データ。
 * `memory/search_index.sqlite3` はGit管理しない。
 * 会話中に `memory` / `journal` を勝手に編集しない。

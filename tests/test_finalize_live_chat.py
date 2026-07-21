@@ -18,6 +18,37 @@ EXPECTED_GIT_ADD = ["git", "add", "--", *process_chat.DEFAULT_COMMIT_PATHS]
 
 
 class FinalizeLiveChatTests(unittest.TestCase):
+    def test_direct_finalize_refuses_temporary_or_excluded_session_before_writing_raw(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_dir = root / "inbox" / "live"
+            live_dir.mkdir(parents=True)
+            live_file = live_dir / "2026-07-21_120000.jsonl"
+            live_file.write_text(
+                '{"role":"user","content":"private","timestamp":"2026-07-21T12:00:00+09:00"}\n',
+                encoding="utf-8",
+            )
+            live_file.with_suffix(".session.json").write_text(
+                json.dumps(
+                    {
+                        "personalization": {
+                            "temporary": True,
+                            "exclude_from_memory": True,
+                            "memory_enabled": False,
+                            "past_chat_search_enabled": False,
+                            "project_scope": None,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "記憶除外セッション"):
+                finalize_live_chat.finalize_live_chat(root=root, session_file=live_file)
+
+            self.assertTrue(live_file.exists())
+            self.assertEqual([], list((root / "conversations").rglob("raw.md")))
+
     def make_root(self, temp_dir: str) -> Path:
         root = Path(temp_dir)
         (root / "inbox" / "live").mkdir(parents=True)
@@ -81,6 +112,31 @@ class FinalizeLiveChatTests(unittest.TestCase):
             self.assertTrue(metadata["organize"]["raw_created"])
             self.assertFalse(metadata["organize"]["memory_processed"])
             self.assertIsNone(metadata["organize"]["failed_stage"])
+
+    def test_finalize_freezes_session_project_scope_in_raw_header(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            live_file = self.make_live_file(root)
+            live_file.with_suffix(".session.json").write_text(
+                json.dumps(
+                    {
+                        "personalization": {
+                            "temporary": False,
+                            "exclude_from_memory": False,
+                            "memory_enabled": True,
+                            "past_chat_search_enabled": True,
+                            "project_scope": "Project Alpha",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = finalize_live_chat.finalize_live_chat(root=root, session_file=live_file)
+
+            raw_text = result.raw_file.read_text(encoding="utf-8")
+            self.assertIn("Project Scope: Project Alpha", raw_text)
+            self.assertLess(raw_text.index("Project Scope: Project Alpha"), raw_text.index("## User"))
 
     def test_finalize_live_chat_refuses_to_overwrite_raw_without_force(self):
         with tempfile.TemporaryDirectory() as temp_dir:

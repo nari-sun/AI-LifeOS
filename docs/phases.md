@@ -18,16 +18,20 @@ Phase3.3 : SQLite-backed Memory Index MVP
 Phase3.4 : Memory Retrieval for Answers
 Phase3.5 : Vector Search Evaluation
 Phase3.6 : Phase4 Planning Checkpoint
-Phase4   : MCP Integration
+Phase3.7 : Retrieval Correctness
+Phase3.8 : Read-only Memory MCP
+Phase3.9 : Hybrid Local Retrieval
+Phase3.10: Personalization Controls
+Phase4   : External Tool Integration
 Phase5   : Life Improvement Agent
 Phase6   : Daily Automation
 ```
 
 ## Current Checkpoint
 
-現在は Phase3.6 まで実装済みです。
+現在は Phase3.10 まで実装済みです。
 
-Phase4.0 では、Phase3 の検索・記憶取得基盤を前提に、MCP連携や外部ツール連携の範囲を決めます。
+Phase4.0 では、Phase3 のローカル記憶MCPとは分けて、外部MCP・外部ツール連携の範囲を決めます。
 
 ## Phase1: Local Archive
 
@@ -181,7 +185,7 @@ FTS5は環境によって日本語トークン化が弱いため、MVPでは検�
 
 ### Phase3.4: Memory Retrieval for Answers
 
-`scripts/build_answer_context.py` が、私的な質問、好み、生活、学習進捗、過去行動、AI-LifeOSの過去方針に関係する質問だけ、読み取り専用の回答用コンテキストを生成します。
+`scripts/build_answer_context.py` が読み取り専用の回答用コンテキストを生成します。Phase3.7以降、非空質問には最低限のbounded narrow検索を行い、私的な質問、好み、生活、学習進捗、過去行動などのsignal scoreはraw会話まで広げるdeep検索の判断にだけ使います。
 
 `scripts/codex_conversation.py` は通常の会話返答生成時にこのコンテキストをプロンプトへ渡します。無効化する場合:
 
@@ -205,7 +209,32 @@ Phase4への引き継ぎは [phase4_planning_checkpoint.md](phase4_planning_chec
 
 Phase4では、まず Filesystem MCP / GitHub MCP / Playwright MCP など、検索・記憶取得と相性がよく、個人情報リスクを管理しやすい連携から検討します。
 
-## Phase4: MCP Integration
+### Phase3.7: Retrieval Correctness
+
+固定スコアを検索ON/OFFのゲートとして使う方式を廃止しました。すべての非空質問でboundedなnarrow検索を行い、スコアはraw会話まで読むdeep検索の深度にだけ使います。
+
+SQLite indexには元Markdownのpath・mtime・size manifestと、schema/raw metadata parser versionを追加しました。indexの欠損、旧schema/parser、追加・更新・削除を読み取り専用で検知し、legacy/stale時はindexを書き換えず、その回答だけ現在のMarkdownへfallbackします。現在回答中のlive sessionは過去記憶から除外し、「作品名なし・summaryなし・stale index」でもuser一次発言へ到達する回帰テストを含みます。
+
+### Phase3.8: Read-only Memory MCP
+
+`scripts/memory_mcp_server.py` を実装しました。Codex会話プロセスへ一時的に接続し、次の読み取り専用ツールで検索語の改写、一次発言の確認、index診断を反復できます。
+
+* `search_past_chats`
+* `open_conversation`
+* `get_personal_memory`
+* `get_index_health`
+
+外部MCP package、API key、`.env`、OpenAI API直叩きは不要です。path traversalを拒否し、一時チャットと`exclude_from_memory`は壊れたmetadataを含めfail-closedで検索対象外にします。詳細は [memory_mcp.md](memory_mcp.md) を参照してください。
+
+### Phase3.9: Hybrid Local Retrieval
+
+依頼表現除去、一般的なtopic/query variant、保守的な文字trigramをOR候補として作り、reciprocal-rank fusionで統合します。個人の話題を対応付ける固定語彙bridgeは持たず、静的検索で語彙が一致しない場合はMemory MCPが検索語を変えて反復検索します。外部embeddingやvector DBは導入していません。将来、完全ローカルrankerを比較できる`LocalSemanticBackend` interfaceだけを追加しています。
+
+### Phase3.10: Personalization Controls
+
+長期memoryと過去チャット検索の独立ON/OFF、project scope、一時チャット、読み取り専用memory preview、回答ごとの静的context・MCP検索候補・MCP open済み一次資料・取得理由・index health表示をChat GUIへ追加しました。全体既定値と現在セッション設定は別々に保存し、暗黙作成セッションにも既定値をsnapshotします。一時チャットは最初の発言前にだけ指定でき、live JSONLを保持しつつ、回答時の記憶利用、将来の検索、raw化、summary/journal/memory整理から除外します。詳細は [personalization.md](personalization.md) を参照してください。
+
+## Phase4: External Tool Integration
 
 未実装です。
 

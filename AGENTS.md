@@ -8,7 +8,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 
 ## Current Status
 
-現在は Phase3.6 まで実装済みです。次は Phase4.0 として、Phase3 の検索・記憶取得基盤を前提に、MCP連携や外部ツール連携の範囲を決めます。
+現在は Phase3.10 まで実装済みです。次は Phase4.0 として、ローカル記憶用の読み取り専用MCPとは分けて、外部ツール連携の範囲を決めます。
 
 実装済みの主要範囲:
 
@@ -17,7 +17,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 * Phase2.6: PowerShell 上の live conversation CLI、JSONL逐次保存、終了時finalize
 * Phase2.65: `.session.json` によるセッション保存、10日以内の resume、dry-run prune
 * Phase2.7: Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の Chat GUI MVP
-* Phase3: Markdown検索、タグ/メタデータ抽出、SQLite-backed index、回答用memory context、ベクトル検索評価、Phase4引き継ぎ
+* Phase3: Markdown/SQLite検索、stale index fallback、回答用memory context、読み取り専用Memory MCP、軽量ハイブリッド検索、パーソナライズ管理
 
 詳細なフェーズ履歴は [docs/phases.md](docs/phases.md) を参照してください。
 
@@ -104,6 +104,8 @@ privacy check が失敗した場合は commit / push を中止し、検出箇所
 
 ```powershell
 python scripts\codex_conversation.py
+python scripts\codex_conversation.py --temporary
+python scripts\codex_conversation.py --project-scope AI-LifeOS
 ```
 
 ルール:
@@ -149,7 +151,9 @@ python scripts\rebuild_index.py
 python scripts\build_answer_context.py "俺の好みに合う店は？"
 ```
 
-検索は読み取り専用です。Phase3.3 の検索方式は `SQLite-backed index + Python ranking` MVPです。SQLiteには全文とメタデータを保存しますが、日本語の部分一致を安定させるため、検索結果ランキングの主経路はPython側で行います。FTS5が使える環境では `documents_fts` も補助テーブルとして作成します。
+検索は読み取り専用です。Phase3.7以降は固定スコアで検索をON/OFFせず、スコアをnarrow/deepの取得深度だけに使います。SQLite indexが古い場合はその回答中だけMarkdownへfallbackし、依頼表現除去、query variant、文字trigram、RRFをPython側で統合します。FTS5は補助テーブルであり、主経路ではありません。
+
+`scripts/memory_mcp_server.py` はCodex会話から反復検索する読み取り専用MCPです。Phase3.10の設定に従い、長期memory、過去チャット、project scope、一時チャット除外を独立して適用します。
 
 構造化メモリの`memory/items/*.md`、個人用`memory/categories.json`、カテゴリ提案はGit管理せず、「整理して保存」時だけ更新します。公開用の初期カテゴリは`config/memory_categories.example.json`、項目雛形は`templates/memory_item.md`です。
 
@@ -184,6 +188,8 @@ AI-LifeOS/
 * [docs/structured_memory.md](docs/structured_memory.md): 動的カテゴリ付き構造化メモリ
 * [docs/vector_search_evaluation.md](docs/vector_search_evaluation.md): Phase3.5 Vector Search Evaluation
 * [docs/phase4_planning_checkpoint.md](docs/phase4_planning_checkpoint.md): Phase3.6 Phase4引き継ぎ
+* [docs/memory_mcp.md](docs/memory_mcp.md): Phase3.8 Read-only Memory MCP
+* [docs/personalization.md](docs/personalization.md): Phase3.10 パーソナライズ管理
 
 ## Development Style
 

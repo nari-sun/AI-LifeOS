@@ -16,6 +16,7 @@ from process_chat import (
     run_codex_task,
 )
 from memory_index import rebuild_index
+from personalization_settings import load_session_personalization
 from retrieval_feedback import record_confirmed_retrieval_feedback
 from session_store import get_session_organization, save_session
 
@@ -53,6 +54,9 @@ def finalize_live_chat(
     root = Path(root)
     _emit_progress(progress, 15, "Reading live JSONL...")
     jsonl_file = _resolve_session_file(root=root, session_file=session_file)
+    personalization = load_session_personalization(root, jsonl_file)
+    if personalization.temporary or personalization.exclude_from_memory:
+        raise ValueError("一時チャットまたは記憶除外セッションは整理できません。live JSONLは保持されます。")
     records = _read_live_records(jsonl_file)
     if not records:
         raise ValueError("live JSONL has no messages.")
@@ -100,6 +104,7 @@ def finalize_live_chat(
                     imported_at=imported_at,
                     message_offset=message_offset,
                     total_messages=len(records),
+                    project_scope=personalization.project_scope,
                 ),
                 encoding="utf-8",
             )
@@ -426,6 +431,7 @@ def _format_raw_markdown(
     imported_at: datetime,
     message_offset: int = 0,
     total_messages: int | None = None,
+    project_scope: str | None = None,
 ) -> str:
     date = imported_at.strftime("%Y-%m-%d")
     time_text = imported_at.strftime("%H:%M:%S")
@@ -439,10 +445,10 @@ def _format_raw_markdown(
         f"Session: {session_id}",
         f"Live JSONL: {_relative_path(jsonl_file, root)}",
         f"Message Range: {message_offset + 1}-{message_offset + len(records)} of {total}",
-        "",
-        "---",
-        "",
     ]
+    if project_scope:
+        lines.append(f"Project Scope: {project_scope}")
+    lines.extend(("", "---", ""))
 
     for record in records:
         heading = "User" if record["role"] == "user" else "Assistant"

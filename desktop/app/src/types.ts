@@ -5,6 +5,8 @@ export interface ChatMessage {
   content: string
   timestamp: string
   memory_context?: MemoryContextSummary | null
+  memory_candidates?: MemoryContextReference[]
+  memory_opened?: MemoryContextReference[]
 }
 
 export interface ReadAloudResult {
@@ -63,6 +65,66 @@ export interface MemoryContextSummary {
   retrieval_modes: string[]
   reference_count: number
   references: MemoryContextReference[]
+  retrieval_health: RetrievalHealth
+}
+
+export interface RetrievalHealth {
+  index_status: string
+  index_reasons: string[]
+  markdown_fallback_used: boolean
+  retrieval_depth: string
+  query_variants: string[]
+  core_enabled: boolean
+  past_chats_enabled: boolean
+  core_reference_count: number
+  structured_memory_hit_count: number
+  past_chat_hit_count: number
+  project_scope: string | null
+}
+
+export interface PersonalizationSettings {
+  memory_enabled: boolean
+  past_chat_search_enabled: boolean
+  project_scope: string | null
+}
+
+export interface SessionPersonalization extends PersonalizationSettings {
+  temporary: boolean
+  temporary_locked: boolean
+  exclude_from_memory: boolean
+  explicitly_configured: boolean
+}
+
+export interface PersonalizationResult {
+  ok: boolean
+  settings: PersonalizationSettings
+  session: SessionPersonalization | null
+  session_state: SessionFile | null
+  settings_file: string
+}
+
+export interface MemoryPreviewFile {
+  key: string
+  label: string
+  path: string
+  exists: boolean
+  content: string
+  character_count: number
+  truncated: boolean
+  modified_at: string | null
+}
+
+export interface MemorySummary {
+  read_only: true
+  sections: MemoryPreviewFile[]
+  structured_items: MemoryPreviewFile[]
+  structured_item_count: number
+  structured_items_truncated: boolean
+}
+
+export interface MemorySummaryResult {
+  ok: boolean
+  summary: MemorySummary
 }
 
 export interface AttachmentPayload {
@@ -114,6 +176,7 @@ export interface SessionFile {
   session_id: string
   jsonl_file: string
   organization: SessionOrganization
+  personalization: SessionPersonalization
 }
 
 export interface ResumeSession {
@@ -125,6 +188,7 @@ export interface ResumeSession {
   updated_at: string
   last_user_at: string
   organization: SessionOrganization
+  personalization: SessionPersonalization
 }
 
 export interface StartSessionResult {
@@ -138,7 +202,9 @@ export interface SendMessageResult {
   session: SessionFile
   messages: ChatMessage[]
   assistant: ChatMessage | null
-  memory_context: MemoryContextSummary
+  memory_context: MemoryContextSummary | null
+  memory_candidates: MemoryContextReference[]
+  memory_opened: MemoryContextReference[]
   attachments: AttachmentResult[]
   error: string | null
   cancelled: boolean

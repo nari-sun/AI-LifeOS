@@ -7,7 +7,11 @@ import type {
   FinalizeSessionResult,
   ListResumableResult,
   LocalDataReportResult,
+  MemorySummaryResult,
   OrganizeSessionsJobResult,
+  PersonalizationResult,
+  PersonalizationSettings,
+  SessionPersonalization,
   StartOrganizeSessionsJobResult,
   AttachmentPayload,
   AssistantStreamEvent,
@@ -160,6 +164,32 @@ export async function resumeSession(sessionRef: string) {
       session_ref: sessionRef,
     },
   })
+}
+
+export async function getPersonalization(sessionFile: string | null) {
+  return invoke<PersonalizationResult>("get_personalization", {
+    payload: {
+      session_file: sessionFile,
+    },
+  })
+}
+
+export async function updatePersonalization(
+  sessionFile: string | null,
+  settings: PersonalizationSettings | null,
+  session: Pick<SessionPersonalization, "temporary" | "memory_enabled" | "past_chat_search_enabled" | "project_scope"> | null,
+) {
+  return invoke<PersonalizationResult>("update_personalization", {
+    payload: {
+      session_file: sessionFile,
+      settings,
+      ...(session ? { session } : {}),
+    },
+  })
+}
+
+export async function getMemorySummary() {
+  return invoke<MemorySummaryResult>("get_memory_summary", { payload: defaultPayload })
 }
 
 export async function finalizeSession(sessionFile: string) {

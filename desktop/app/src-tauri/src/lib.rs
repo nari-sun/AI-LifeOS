@@ -1,11 +1,16 @@
 use serde_json::Value;
+use std::collections::HashSet;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
+
+static ACTIVE_STREAM_CHILDREN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 
 #[tauri::command]
 async fn start_session(payload: Value) -> Result<Value, String> {
@@ -60,6 +65,21 @@ async fn list_resumable_sessions(payload: Value) -> Result<Value, String> {
 #[tauri::command]
 async fn resume_session(payload: Value) -> Result<Value, String> {
     run_bridge("resume-session", payload)
+}
+
+#[tauri::command]
+async fn get_personalization(payload: Value) -> Result<Value, String> {
+    run_bridge("get-personalization", payload)
+}
+
+#[tauri::command]
+async fn update_personalization(payload: Value) -> Result<Value, String> {
+    run_bridge("update-personalization", payload)
+}
+
+#[tauri::command]
+async fn get_memory_summary(payload: Value) -> Result<Value, String> {
+    run_bridge("get-memory-summary", payload)
 }
 
 #[tauri::command]
@@ -118,7 +138,7 @@ async fn apply_chatgpt_import(payload: Value) -> Result<Value, String> {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             start_session,
@@ -132,6 +152,9 @@ pub fn run() {
             save_session,
             list_resumable_sessions,
             resume_session,
+            get_personalization,
+            update_personalization,
+            get_memory_summary,
             finalize_session,
             start_finalize_job,
             get_finalize_job,
@@ -144,8 +167,17 @@ pub fn run() {
             preview_chatgpt_import,
             apply_chatgpt_import
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running AI-LifeOS desktop app");
+        .build(tauri::generate_context!())
+        .expect("error while building AI-LifeOS desktop app");
+
+    app.run(|_app_handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            terminate_active_stream_children();
+        }
+    });
 }
 
 fn run_bridge(command_name: &str, payload: Value) -> Result<Value, String> {
@@ -286,41 +318,69 @@ fn run_bridge_stream(
         .spawn()
         .map_err(|error| format!("Failed to start Python bridge: {error}"))?;
 
-    if let Some(stdin) = child.stdin.as_mut() {
+    let child_pid = child.id();
+    register_stream_child(child_pid);
+    let stderr_stream = match child.stderr.take() {
+        Some(stream) => stream,
+        None => {
+            terminate_child(&mut child);
+            return Err("Failed to open Python bridge stderr.".to_string());
+        }
+    };
+    let stderr_thread = thread::spawn(move || {
+        let mut stderr = String::new();
+        let mut stream = stderr_stream;
+        let _ = stream.read_to_string(&mut stderr);
+        stderr
+    });
+
+    let operation = (|| -> Result<(ExitStatus, Option<Value>), String> {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "Failed to open Python bridge stdin.".to_string())?;
         stdin
             .write_all(payload.to_string().as_bytes())
             .map_err(|error| format!("Failed to write Python bridge payload: {error}"))?;
-    }
-    drop(child.stdin.take());
+        drop(child.stdin.take());
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to open Python bridge stdout.".to_string())?;
-    let mut result: Option<Value> = None;
-    for line in BufReader::new(stdout).lines() {
-        let line = line.map_err(|error| format!("Failed to read Python bridge output: {error}"))?;
-        if line.trim().is_empty() {
-            continue;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to open Python bridge stdout.".to_string())?;
+        let mut result: Option<Value> = None;
+        for line in BufReader::new(stdout).lines() {
+            let line =
+                line.map_err(|error| format!("Failed to read Python bridge output: {error}"))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: Value = serde_json::from_str(&line)
+                .map_err(|error| format!("Python bridge returned invalid stream JSON: {error}"))?;
+            match event.get("type").and_then(Value::as_str) {
+                Some("delta") | Some("audio") => on_event
+                    .send(event)
+                    .map_err(|error| format!("Failed to send stream event to GUI: {error}"))?,
+                Some("result") => result = event.get("data").cloned(),
+                _ => {}
+            }
         }
-        let event: Value = serde_json::from_str(&line)
-            .map_err(|error| format!("Python bridge returned invalid stream JSON: {error}"))?;
-        match event.get("type").and_then(Value::as_str) {
-            Some("delta") | Some("audio") => on_event
-                .send(event)
-                .map_err(|error| format!("Failed to send stream event to GUI: {error}"))?,
-            Some("result") => result = event.get("data").cloned(),
-            _ => {}
-        }
-    }
 
-    let mut stderr = String::new();
-    if let Some(mut stream) = child.stderr.take() {
-        let _ = stream.read_to_string(&mut stderr);
+        let status = child
+            .wait()
+            .map_err(|error| format!("Failed to wait for Python bridge: {error}"))?;
+        Ok((status, result))
+    })();
+
+    if operation.is_err() {
+        terminate_child(&mut child);
+    } else {
+        unregister_stream_child(child_pid);
     }
-    let status = child
-        .wait()
-        .map_err(|error| format!("Failed to wait for Python bridge: {error}"))?;
+    let stderr = stderr_thread
+        .join()
+        .unwrap_or_else(|_| "Failed to collect Python bridge stderr.".to_string());
+    let (status, result) = operation?;
     let value = result.ok_or_else(|| {
         if stderr.trim().is_empty() {
             "Python bridge returned no stream result.".to_string()
@@ -333,6 +393,66 @@ fn run_bridge_stream(
     }
     tauri_log(&root, &format!("bridge.success command={command_name}"));
     Ok(value)
+}
+
+fn active_stream_children() -> &'static Mutex<HashSet<u32>> {
+    ACTIVE_STREAM_CHILDREN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn register_stream_child(pid: u32) {
+    if let Ok(mut children) = active_stream_children().lock() {
+        children.insert(pid);
+    }
+}
+
+fn unregister_stream_child(pid: u32) {
+    if let Ok(mut children) = active_stream_children().lock() {
+        children.remove(&pid);
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    let pid = child.id();
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        _ => {
+            terminate_process_tree(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    unregister_stream_child(pid);
+}
+
+fn terminate_active_stream_children() {
+    let pids = active_stream_children()
+        .lock()
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for pid in pids {
+        terminate_process_tree(pid);
+        unregister_stream_child(pid);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(windows))]
+fn terminate_process_tree(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn parse_bridge_json(stdout: &str, stderr: &str) -> Result<Value, String> {

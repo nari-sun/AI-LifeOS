@@ -20,7 +20,7 @@ python scripts\privacy_check.py --publish
 
 AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、後から検索・要約・日記・長期メモリとして活用するための個人用AI記憶システムです。
 
-現在は Phase3 Searchable Memory までの実装が入っています。Phase2.6 の live conversation、Phase2.65 の Session Save / Resume、Phase2.7 の Tauri 2 + React GUI、Phase3 の検索・SQLite index・回答用記憶コンテキストを、OpenAI API 直叩きや `.env` 前提なしで動かす方針です。
+現在は Phase3.10 までの実装が入っています。Phase2.6 の live conversation、Phase2.65 の Session Save / Resume、Phase2.7 の Tauri 2 + React GUI、Phase3 の検索・読み取り専用Memory MCP・パーソナライズ管理を、OpenAI API 直叩きや `.env` 前提なしで動かす方針です。
 
 運用の中心は、ローカルの Markdown / JSONL / SQLite、Codex CLI、Git です。ChatGPT公式Webや公式デスクトップアプリのスクレイピング、外部ベクトルDB、クラウド同期はまだ扱いません。
 
@@ -38,7 +38,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - Phase2.6: PowerShell上の live conversation CLI、JSONL逐次保存、終了時finalizeを実装済み
 - Phase2.65: `.session.json` によるセッション保存、10日以内の resume、dry-run prune を実装済み
 - Phase2.7: Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の Chat GUI MVP を実装済み
-- Phase3: Markdown検索、タグ/メタデータ抽出、SQLite index、回答用memory context、ベクトル検索評価、Phase4引き継ぎを実装済み
+- Phase3.0〜3.10: Markdown/SQLite検索、stale fallback、回答用memory context、読み取り専用Memory MCP、軽量ハイブリッド検索、パーソナライズ管理を実装済み
 - 構造化メモリ: 動的カテゴリ、出典、状態、タグを持つ`memory/items/*.md`の整理時保存・検索を実装済み
 
 ## できること
@@ -54,7 +54,9 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - Tauri GUIのassistant返答を、任意導入のKokoro TTSで文ごとに先行再生・停止し、5種類の日本語voiceから選択する
 - 保存済みの raw.md / summary.md / journal / memory を検索する
 - `memory/search_index.sqlite3` を再構築可能な検索indexとして生成する
-- 私的な質問や好みに関係する会話では、`memory/long_term.md` と `memory/preferences.md` を読み取り専用コンテキストとして回答に渡す
+- 私的な質問や好みに関係する会話では、`memory/long_term.md`、`memory/preferences.md`、`memory/projects.md` を読み取り専用コンテキストとして回答に渡す
+- 過去会話をCodexが読み取り専用Memory MCPで検索語を変えながら反復検索し、一次発言を開いて確認する
+- 長期memoryと過去チャット検索を独立してON/OFFし、全体既定値と現在セッションのproject scope・一時チャットを分けてGUIで管理する
 - ChatGPT exportのフォルダ、zip、`conversations.json`、または分割された `conversations-*.json` をCLIまたはGUIでdry-run確認してから、選択した会話だけをraw.mdへ取り込む
 - `python -m unittest` で Python 側の保存・再開・GUIブリッジ処理をテストする
 
@@ -74,7 +76,11 @@ Phase3.3 : SQLite Memory Index
 Phase3.4 : Memory Retrieval for Answers
 Phase3.5 : Vector Search Evaluation
 Phase3.6 : Phase4 Planning Checkpoint
-Phase4   : MCP Integration
+Phase3.7 : Retrieval Correctness
+Phase3.8 : Read-only Memory MCP
+Phase3.9 : Hybrid Local Retrieval
+Phase3.10: Personalization Controls
+Phase4   : External Tool Integration
 Phase5   : Life Improvement Agent
 Phase6   : Daily Automation
 ```
@@ -369,6 +375,9 @@ python scripts\codex_conversation.py --no-process-on-exit
 python scripts\codex_conversation.py --commit-on-exit
 python scripts\codex_conversation.py --resume
 python scripts\codex_conversation.py --no-memory-context
+python scripts\codex_conversation.py --no-memory-mcp
+python scripts\codex_conversation.py --temporary
+python scripts\codex_conversation.py --project-scope AI-LifeOS
 ```
 
 会話中コマンド:
@@ -441,7 +450,7 @@ python scripts\search_memory.py "検索語" --rebuild-index
 
 DBは `memory/search_index.sqlite3` に作成されます。このDBはMarkdownから再生成できる派生データで、Git管理しません。
 
-現時点の検索方式は `SQLite-backed index + Python ranking` のMVPです。SQLiteには全文とメタデータを保存し、検索時はPython側で日本語の部分一致ランキングを行います。FTS5は使える環境で補助テーブルを作成しますが、現在の検索結果ランキングの主経路ではありません。
+現時点の検索方式は `SQLite-backed index + Python hybrid ranking` です。固定閾値で検索を止めず、依頼表現を除いた複数query variant、保守的な文字trigram、RRFを統合します。source manifestまたはschema/raw metadata parser versionが古ければ検索中に書き換えず、その回答だけMarkdownを直接検索します。FTS5は補助テーブルであり、主経路ではありません。
 
 ### 回答用memory contextを作る
 
@@ -449,7 +458,13 @@ DBは `memory/search_index.sqlite3` に作成されます。このDBはMarkdown�
 python scripts\build_answer_context.py "俺の好みに合う店は？"
 ```
 
-毎回、`memory/long_term.md` と `memory/preferences.md` を少量読み、記憶検索を行います。通常は構造化メモリ・`journal`・`summary.md`から関連する短い抜粋を最大2件だけ読み、私的な質問、好み、生活、学習進捗、過去行動、AI-LifeOSの過去方針に明確に関係する場合だけ、`raw.md`を含む広い検索へ拡張します。
+毎回、`memory/long_term.md`、`memory/preferences.md`、`memory/projects.md` を少量読み、記憶検索を行います。通常は構造化メモリ・`journal`・`summary.md`から関連する短い抜粋を最大2件だけ読み、私的な質問、好み、生活、学習進捗、過去行動、AI-LifeOSの過去方針に明確に関係する場合だけ、`raw.md`を含む広い検索へ拡張します。現在回答中のlive JSONLは過去記憶として自己検索しません。
+
+### 読み取り専用Memory MCP
+
+`scripts/codex_conversation.py` と Chat GUI は、過去チャット検索がONのときだけ `scripts/memory_mcp_server.py` をそのCodexプロセスへ接続します。永続登録や外部Python依存は不要です。`search_past_chats`、`open_conversation`、`get_personal_memory`、`get_index_health` を使い、最初の検索が0件でも具体語へ改写して再検索できます。
+
+手動起動とCodexへの永続登録方法は [docs/memory_mcp.md](docs/memory_mcp.md)、GUIのmemory/past-chat独立トグル、全体既定値とセッション設定の分離、project scope、一時チャット、memory previewは [docs/personalization.md](docs/personalization.md) を参照してください。一時チャットは最初の発言前にだけ指定でき、直接finalizeしても下位層で拒否されます。
 
 ### Chat GUIを起動する
 
@@ -507,13 +522,14 @@ GUIでできること:
 - セッション再開
 - 「整理して保存」による raw.md 化と summary / journal / memory 更新のバックグラウンド実行
 - ローカル個人データ状況の読み取り専用表示
+- パーソナライズの全体既定値／セッション設定、memory preview、project scope、一時チャット、回答ごとの静的context・MCP検索候補・MCP open済み一次資料・index health表示
 - エラー表示
 
 GUIでまだやらないこと:
 
 - 専用の過去ログ検索画面
 - ベクトル検索
-- MCP連携
+- 外部サービス向けMCP連携
 - モデル・応答設定UI
 - 会話中の memory / journal 自動編集
 - 自動Git commit
@@ -530,16 +546,32 @@ python scripts\chat_gui_bridge.py --help
 
 ```text
 start-session
+read-aloud
+read-aloud-stream
+cancel-read-aloud
+discard-read-aloud-audio
 send-message
+send-message-stream
+cancel-message
 save-session
 list-resumable
 resume-session
+get-personalization
+update-personalization
+get-memory-summary
 finalize-session
 start-finalize-job
 get-finalize-job
 cancel-finalize-job
+run-finalize-job
+start-organize-sessions-job
+get-organize-sessions-job
+cancel-organize-sessions-job
+run-organize-sessions-job
 local-data-report
 open-local-data-folder
+preview-chatgpt-import
+apply-chatgpt-import
 ```
 
 ## Logs
@@ -580,6 +612,7 @@ python -m unittest
 - GUIブリッジが start / send / resume を処理できる
 - GUIブリッジログに会話本文を残さない
 - Phase3のMarkdown検索、タグ抽出、SQLite index、回答用memory contextが動く
+- stale index fallback、Memory MCP、一時チャット境界、独立トグル、project scopeが動く
 
 GUI側のビルド確認:
 
@@ -624,4 +657,4 @@ Codex用プロンプトの元ファイルは `prompts/codex_phase2_prompt.md` �
 - Git commit はユーザー明示操作、または既存スクリプトの明示オプション経由にする
 - PublicEdition の自動commit対象は公開用プロジェクトファイルに限定し、`conversations`、`journal`、`memory`、`inbox`、`tasks` はGit管理しない
 - SQLite index は再生成可能な派生データとして扱い、Git管理しない
-- ベクトル検索とMCP連携は、Phase3の検索基盤の上で必要性を確認してから扱う
+- ベクトルDBと外部サービス向けMCP連携は、Phase3のローカル検索基盤で不足が確認されてから扱う

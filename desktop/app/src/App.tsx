@@ -43,7 +43,9 @@ import {
   applyChatGptImport,
   getFinalizeJob,
   getLocalDataReport,
+  getMemorySummary,
   getOrganizeSessionsJob,
+  getPersonalization,
   isTauriRuntime,
   listResumableSessions,
   openLocalDataFolder,
@@ -54,6 +56,7 @@ import {
   startFinalizeJob,
   startOrganizeSessionsJob,
   startSession,
+  updatePersonalization,
 } from "@/tauri"
 import type {
   AttachmentPayload,
@@ -61,17 +64,21 @@ import type {
   ChatMessage,
   FinalizeJob,
   LocalDataReport,
+  MemoryContextReference,
+  MemorySummary,
   MemoryContextSummary,
+  PersonalizationSettings,
   ReadAloudAudioChunk,
   ResumeSession,
   OrganizeSessionsJob,
   SessionFile,
+  SessionPersonalization,
   SessionOrganization,
 } from "@/types"
 
 type BusyState = "idle" | "starting" | "generating" | "stopping" | "resuming" | "finalizing" | "refreshing" | "importing"
 type ReplyState = "idle" | "generating" | "stopping" | "stopped" | "failed" | "completed"
-type ViewMode = "chat" | "data" | "organize" | "import"
+type ViewMode = "chat" | "data" | "organize" | "import" | "personalization"
 type PendingMessageStatus = "sending" | "failed"
 type ReadAloudStatus = "synthesizing" | "playing" | "stopping"
 
@@ -98,6 +105,13 @@ interface ActiveReadAloud {
   status: ReadAloudStatus
   audioPath: string | null
   queuedCount: number
+}
+
+interface SessionPersonalizationDraft {
+  temporary: boolean
+  memory_enabled: boolean
+  past_chat_search_enabled: boolean
+  project_scope: string | null
 }
 
 const busyLabel: Record<BusyState, string> = {
@@ -146,6 +160,8 @@ function App() {
   const [notice, setNotice] = useState("AI-LifeOS Chat")
   const [error, setError] = useState<string | null>(null)
   const [lastMemoryContext, setLastMemoryContext] = useState<MemoryContextSummary | null>(null)
+  const [lastMemoryCandidates, setLastMemoryCandidates] = useState<MemoryContextReference[]>([])
+  const [lastMemoryOpened, setLastMemoryOpened] = useState<MemoryContextReference[]>([])
   const [lastSubmittedText, setLastSubmittedText] = useState("")
   const [pendingUserMessage, setPendingUserMessage] = useState<PendingUserMessage | null>(null)
   const [streamingAssistant, setStreamingAssistant] = useState<ChatMessage | null>(null)
@@ -155,6 +171,14 @@ function App() {
   const [organizeSessionsJob, setOrganizeSessionsJob] = useState<OrganizeSessionsJob | null>(null)
   const [localDataReport, setLocalDataReport] = useState<LocalDataReport | null>(null)
   const [localDataLoading, setLocalDataLoading] = useState(false)
+  const [personalizationSettings, setPersonalizationSettings] = useState<PersonalizationSettings | null>(null)
+  const [sessionPersonalization, setSessionPersonalization] = useState<SessionPersonalization | null>(null)
+  const [personalizationDraft, setPersonalizationDraft] = useState<PersonalizationSettings | null>(null)
+  const [sessionPersonalizationDraft, setSessionPersonalizationDraft] = useState<SessionPersonalizationDraft | null>(null)
+  const [personalizationLoading, setPersonalizationLoading] = useState(false)
+  const [personalizationSaving, setPersonalizationSaving] = useState(false)
+  const [memorySummary, setMemorySummary] = useState<MemorySummary | null>(null)
+  const [personalizationSettingsFile, setPersonalizationSettingsFile] = useState("memory/personalization_settings.json")
   const [chatGptImportSourcePath, setChatGptImportSourcePath] = useState<string | null>(null)
   const [chatGptImportPreview, setChatGptImportPreview] = useState<ChatGptImportPreview | null>(null)
   const [chatGptImportSelectedIds, setChatGptImportSelectedIds] = useState<string[]>([])
@@ -165,12 +189,42 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const initializedRef = useRef(false)
   const activeRequestIdRef = useRef<string | null>(null)
+  const sessionRef = useRef<SessionFile | null>(null)
+  const personalizationRequestRef = useRef(0)
   const activeReadAloudRef = useRef<ActiveReadAloud | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const readAloudQueueRef = useRef<ReadAloudAudioChunk[]>([])
   const readAloudSynthesisFinishedRef = useRef(false)
   const streamingTextRef = useRef("")
   const streamingFrameRef = useRef<number | null>(null)
+
+  function activateSession(next: SessionFile | null) {
+    personalizationRequestRef.current += 1
+    sessionRef.current = next
+    setSession(next)
+    setPersonalizationLoading(false)
+    setPersonalizationSaving(false)
+  }
+
+  function updateCurrentSession(next: SessionFile) {
+    if (sessionRef.current?.jsonl_file !== next.jsonl_file) {
+      return false
+    }
+    sessionRef.current = next
+    setSession(next)
+    return true
+  }
+
+  function isCurrentPersonalizationRequest(requestToken: number, sessionFile: string | null) {
+    return personalizationRequestRef.current === requestToken
+      && (sessionRef.current?.jsonl_file ?? null) === sessionFile
+  }
+
+  function clearLastMemoryRetrieval() {
+    setLastMemoryContext(null)
+    setLastMemoryCandidates([])
+    setLastMemoryOpened([])
+  }
 
   function clearStreamingAssistant() {
     streamingTextRef.current = ""
@@ -249,6 +303,21 @@ function App() {
   }, [])
 
   useEffect(() => {
+    const cancelActiveRequest = () => {
+      const requestId = activeRequestIdRef.current
+      if (requestId) {
+        void cancelMessage(requestId).catch(() => undefined)
+      }
+    }
+
+    window.addEventListener("beforeunload", cancelActiveRequest)
+    return () => {
+      window.removeEventListener("beforeunload", cancelActiveRequest)
+      cancelActiveRequest()
+    }
+  }, [])
+
+  useEffect(() => {
     const node = viewportRef.current
     if (node) {
       node.scrollTop = node.scrollHeight
@@ -276,6 +345,12 @@ function App() {
       void refreshLocalDataReport()
     }
   }, [viewMode, localDataReport, localDataLoading])
+
+  useEffect(() => {
+    if (viewMode === "personalization" && isTauriRuntime()) {
+      void refreshPersonalization()
+    }
+  }, [viewMode, session?.jsonl_file])
 
   useEffect(() => {
     if (!finalizeJob || (finalizeJob.status !== "queued" && finalizeJob.status !== "running")) {
@@ -312,13 +387,13 @@ function App() {
         try {
           const jobResult = await getFinalizeJob(trackedJobId)
           const resumed = await resumeSession(finalizeSessionId(jobResult.job.session_file))
-          setSession(resumed.session)
+          activateSession(resumed.session)
           setMessages(resumed.messages)
           setFinalizeJob(jobResult.job)
           setPendingUserMessage(null)
           setStreamingAssistant(null)
           setAttachments([])
-          setLastMemoryContext(null)
+          clearLastMemoryRetrieval()
           restored = true
 
           if (jobResult.job.status === "failed") {
@@ -342,12 +417,12 @@ function App() {
 
       if (!restored) {
         const sessionResult = await startSession()
-        setSession(sessionResult.session)
+        activateSession(sessionResult.session)
         setMessages(sessionResult.messages)
         setPendingUserMessage(null)
         setStreamingAssistant(null)
         setAttachments([])
-        setLastMemoryContext(null)
+        clearLastMemoryRetrieval()
         setNotice("新規セッションを開始しました。")
       }
 
@@ -407,7 +482,7 @@ function App() {
   }
 
   async function createSession() {
-    if (isBusy || isOrganizationActive) {
+    if (isBusy || isOrganizationActive || personalizationLoading || personalizationSaving) {
       return
     }
 
@@ -416,9 +491,9 @@ function App() {
     setError(null)
     try {
       const result = await startSession()
-      setSession(result.session)
+      activateSession(result.session)
       setMessages(result.messages)
-      setLastMemoryContext(null)
+      clearLastMemoryRetrieval()
       setInput("")
       setPendingUserMessage(null)
       setStreamingAssistant(null)
@@ -448,7 +523,7 @@ function App() {
     setBusy("generating")
     setReplyState("generating")
     setError(null)
-    setLastMemoryContext(null)
+    clearLastMemoryRetrieval()
     setInput("")
     setLastSubmittedText(content)
     clearStreamingAssistant()
@@ -478,13 +553,17 @@ function App() {
         return
       }
 
-      setSession(result.session)
+      activateSession(result.session)
       const memoryContext = result.assistant ? result.memory_context : null
-      setMessages(attachMemoryContextToLatestAssistant(result.messages, memoryContext))
+      const memoryCandidates = result.assistant ? result.memory_candidates ?? [] : []
+      const memoryOpened = result.assistant ? result.memory_opened ?? [] : []
+      setMessages(attachMemoryContextToLatestAssistant(result.messages, memoryContext, memoryCandidates, memoryOpened))
       setPendingUserMessage(null)
       clearStreamingAssistant()
       setAttachments([])
       setLastMemoryContext(memoryContext)
+      setLastMemoryCandidates(memoryCandidates)
+      setLastMemoryOpened(memoryOpened)
       const attachmentNotice = formatAttachmentResultNotice(result.attachments)
       if (result.cancelled) {
         setReplyState("stopped")
@@ -544,7 +623,7 @@ function App() {
   }
 
   async function loadSession(sessionId: string) {
-    if (isBusy || isOrganizationActive) {
+    if (isBusy || isOrganizationActive || personalizationLoading || personalizationSaving) {
       return
     }
 
@@ -553,9 +632,9 @@ function App() {
     setError(null)
     try {
       const result = await resumeSession(sessionId)
-      setSession(result.session)
+      activateSession(result.session)
       setMessages(result.messages)
-      setLastMemoryContext(null)
+      clearLastMemoryRetrieval()
       setPendingUserMessage(null)
       setStreamingAssistant(null)
       setAttachments([])
@@ -601,7 +680,7 @@ function App() {
       setFinalizeJob(result.job)
       if (result.job.status === "succeeded" && result.job.result) {
         clearTrackedFinalizeJob(jobId)
-        setSession(result.job.result.session)
+        activateSession(result.job.result.session)
         setNotice(`整理済み: ${result.job.result.raw_file}`)
         await refreshSessionsAfterAction()
       } else if (result.job.status === "failed") {
@@ -787,6 +866,134 @@ function App() {
       await openLocalDataFolder(folder)
     } catch (err) {
       setError(`フォルダを開けませんでした: ${formatError(err)}`)
+    }
+  }
+
+  async function refreshPersonalization() {
+    if (personalizationLoading || personalizationSaving) {
+      return
+    }
+    const requestedSessionFile = sessionRef.current?.jsonl_file ?? null
+    const requestToken = personalizationRequestRef.current + 1
+    personalizationRequestRef.current = requestToken
+    setPersonalizationLoading(true)
+    setError(null)
+    try {
+      const [result, summaryResult] = await Promise.all([
+        getPersonalization(requestedSessionFile),
+        getMemorySummary(),
+      ])
+      if (!isCurrentPersonalizationRequest(requestToken, requestedSessionFile)) {
+        return
+      }
+      setPersonalizationSettings(result.settings)
+      setSessionPersonalization(result.session)
+      setPersonalizationSettingsFile(result.settings_file)
+      setMemorySummary(summaryResult.summary)
+      setPersonalizationDraft({ ...result.settings })
+      setSessionPersonalizationDraft(result.session ? {
+        temporary: result.session.temporary,
+        memory_enabled: result.session.memory_enabled,
+        past_chat_search_enabled: result.session.past_chat_search_enabled,
+        project_scope: result.session.project_scope,
+      } : null)
+      if (result.session_state) {
+        updateCurrentSession(result.session_state)
+      }
+      setNotice("パーソナライズ設定と記憶プレビューを読み込みました。")
+    } catch (err) {
+      if (isCurrentPersonalizationRequest(requestToken, requestedSessionFile)) {
+        setError(`パーソナライズ情報を読み込めませんでした: ${formatError(err)}`)
+      }
+    } finally {
+      if (isCurrentPersonalizationRequest(requestToken, requestedSessionFile)) {
+        setPersonalizationLoading(false)
+      }
+    }
+  }
+
+  async function savePersonalization() {
+    if (!personalizationDraft || personalizationSaving || personalizationLoading) {
+      return
+    }
+    const requestedSessionFile = sessionRef.current?.jsonl_file ?? null
+    const requestToken = personalizationRequestRef.current + 1
+    personalizationRequestRef.current = requestToken
+    setPersonalizationSaving(true)
+    setError(null)
+    try {
+      const settings: PersonalizationSettings = {
+        memory_enabled: personalizationDraft.memory_enabled,
+        past_chat_search_enabled: personalizationDraft.past_chat_search_enabled,
+        project_scope: personalizationDraft.project_scope?.trim() || null,
+      }
+      const result = await updatePersonalization(requestedSessionFile, settings, null)
+      if (!isCurrentPersonalizationRequest(requestToken, requestedSessionFile)) {
+        return
+      }
+      setPersonalizationSettings(result.settings)
+      setPersonalizationSettingsFile(result.settings_file)
+      setPersonalizationDraft({ ...result.settings })
+      clearLastMemoryRetrieval()
+      setNotice("新しいセッションに使うパーソナライズ既定値を保存しました。")
+      await refreshSessionsAfterAction()
+    } catch (err) {
+      if (isCurrentPersonalizationRequest(requestToken, requestedSessionFile)) {
+        setError(`パーソナライズ設定を保存できませんでした: ${formatError(err)}`)
+      }
+    } finally {
+      if (isCurrentPersonalizationRequest(requestToken, requestedSessionFile)) {
+        setPersonalizationSaving(false)
+      }
+    }
+  }
+
+  async function saveSessionPersonalization() {
+    const requestedSession = sessionRef.current
+    if (!requestedSession || !sessionPersonalizationDraft || personalizationSaving || personalizationLoading) {
+      return
+    }
+    const requestedSessionFile = requestedSession.jsonl_file
+    const requestToken = personalizationRequestRef.current + 1
+    personalizationRequestRef.current = requestToken
+    setPersonalizationSaving(true)
+    setError(null)
+    try {
+      const sessionSettings: SessionPersonalizationDraft = {
+        temporary: sessionPersonalizationDraft.temporary,
+        memory_enabled: sessionPersonalizationDraft.memory_enabled,
+        past_chat_search_enabled: sessionPersonalizationDraft.past_chat_search_enabled,
+        project_scope: sessionPersonalizationDraft.project_scope?.trim() || null,
+      }
+      const result = await updatePersonalization(requestedSessionFile, null, sessionSettings)
+      if (!isCurrentPersonalizationRequest(requestToken, requestedSessionFile)) {
+        return
+      }
+      setPersonalizationSettings(result.settings)
+      setSessionPersonalization(result.session)
+      setPersonalizationSettingsFile(result.settings_file)
+      if (result.session_state) {
+        updateCurrentSession(result.session_state)
+      }
+      setSessionPersonalizationDraft(result.session ? {
+        temporary: result.session.temporary,
+        memory_enabled: result.session.memory_enabled,
+        past_chat_search_enabled: result.session.past_chat_search_enabled,
+        project_scope: result.session.project_scope,
+      } : null)
+      clearLastMemoryRetrieval()
+      setNotice(result.session?.temporary
+        ? "このセッションを一時チャットとして固定しました。会話ログは保持し、記憶整理から除外します。"
+        : "現在のセッションのパーソナライズ設定を保存しました。")
+      await refreshSessionsAfterAction()
+    } catch (err) {
+      if (isCurrentPersonalizationRequest(requestToken, requestedSessionFile)) {
+        setError(`セッション設定を保存できませんでした: ${formatError(err)}`)
+      }
+    } finally {
+      if (isCurrentPersonalizationRequest(requestToken, requestedSessionFile)) {
+        setPersonalizationSaving(false)
+      }
     }
   }
 
@@ -995,13 +1202,13 @@ function App() {
         </div>
 
         <div className="space-y-2 border-b border-border p-3">
-          <Button className="w-full justify-start" variant="secondary" onClick={createSession} disabled={isBusy || isOrganizationActive}>
+          <Button className="w-full justify-start" variant="secondary" onClick={createSession} disabled={isBusy || isOrganizationActive || personalizationLoading || personalizationSaving}>
             <MessageSquarePlus className="h-4 w-4" />
             新規チャット
           </Button>
           <Button
             className="w-full justify-start"
-            variant={viewMode === "data" || viewMode === "organize" || viewMode === "import" ? "secondary" : "ghost"}
+            variant={viewMode === "data" || viewMode === "organize" || viewMode === "import" || viewMode === "personalization" ? "secondary" : "ghost"}
             onClick={() => setManagementExpanded((current) => !current)}
           >
             <Settings className="h-4 w-4" />
@@ -1010,6 +1217,17 @@ function App() {
           </Button>
           {managementExpanded && (
             <div className="space-y-1 border-l border-border pl-3">
+              <Button
+                className="w-full justify-start"
+                variant={viewMode === "personalization" ? "secondary" : "ghost"}
+                onClick={() => {
+                  setManagementExpanded(true)
+                  setViewMode("personalization")
+                }}
+              >
+                <Brain className="h-4 w-4" />
+                パーソナライズ
+              </Button>
               <Button
                 className="w-full justify-start"
                 variant={viewMode === "data" ? "secondary" : "ghost"}
@@ -1068,7 +1286,7 @@ function App() {
                     session?.session_id === item.session_id && "border-primary bg-primary/10",
                   )}
                   onClick={() => void loadSession(item.session_id)}
-                  disabled={isBusy || isOrganizationActive}
+                  disabled={isBusy || isOrganizationActive || personalizationLoading || personalizationSaving}
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0 flex-1">
@@ -1092,14 +1310,22 @@ function App() {
         <header className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold">
-              {viewMode === "data" ? "ローカルデータ管理" : viewMode === "organize" ? "データ整理" : viewMode === "import" ? "ChatGPTエクスポートを取り込む" : sessionTitle}
+              {viewMode === "personalization" ? "パーソナライズと記憶" : viewMode === "data" ? "ローカルデータ管理" : viewMode === "organize" ? "データ整理" : viewMode === "import" ? "ChatGPTエクスポートを取り込む" : sessionTitle}
             </div>
             <div className="truncate text-xs text-muted-foreground">
-              {viewMode === "data" || viewMode === "organize" || viewMode === "import" ? (localDataReport?.root ?? "AI-LifeOS root") : (session?.jsonl_file ?? "inbox/live")}
+              {viewMode === "personalization" ? personalizationSettingsFile : viewMode === "data" || viewMode === "organize" || viewMode === "import" ? (localDataReport?.root ?? "AI-LifeOS root") : (session?.jsonl_file ?? "inbox/live")}
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {viewMode === "data" ? (
+            {viewMode === "personalization" ? (
+              <>
+                <Badge variant="secondary">明示操作時のみ保存</Badge>
+                <Button variant="outline" onClick={() => void refreshPersonalization()} disabled={personalizationLoading || personalizationSaving}>
+                  <RefreshCw className={cn("h-4 w-4", personalizationLoading && "animate-spin")} />
+                  更新
+                </Button>
+              </>
+            ) : viewMode === "data" ? (
               <>
                 <Badge variant="secondary">読み取り専用</Badge>
                 <Button variant="outline" onClick={() => void refreshLocalDataReport()} disabled={localDataLoading}>
@@ -1126,6 +1352,11 @@ function App() {
                   </Badge>
                 )}
                 <Badge variant={replyState === "failed" ? "outline" : "secondary"}>{replyStateLabel[replyState]}</Badge>
+                {session?.personalization.temporary && <Badge variant="outline">一時チャット</Badge>}
+                {session?.personalization.project_scope && <Badge variant="outline">project: {session.personalization.project_scope}</Badge>}
+                {session && !session.personalization.memory_enabled && !session.personalization.past_chat_search_enabled && <Badge variant="outline">記憶参照OFF</Badge>}
+                {session?.personalization.memory_enabled === false && session.personalization.past_chat_search_enabled && <Badge variant="outline">長期memory OFF</Badge>}
+                {session?.personalization.memory_enabled && session.personalization.past_chat_search_enabled === false && <Badge variant="outline">過去検索OFF</Badge>}
                 <Badge variant={organization?.is_organized ? "secondary" : "outline"}>{statusLabel}</Badge>
                 <Button variant="outline" onClick={finalizeCurrentSession} disabled={!canFinalize}>
                   <Archive className="h-4 w-4" />
@@ -1136,7 +1367,25 @@ function App() {
           </div>
         </header>
 
-        {viewMode === "data" ? (
+        {viewMode === "personalization" ? (
+          <PersonalizationScreen
+            settings={personalizationSettings}
+            sessionSettings={sessionPersonalization}
+            draft={personalizationDraft}
+            sessionDraft={sessionPersonalizationDraft}
+            summary={memorySummary}
+            settingsFile={personalizationSettingsFile}
+            hasSession={Boolean(session)}
+            loading={personalizationLoading}
+            saving={personalizationSaving}
+            error={error}
+            onDraftChange={setPersonalizationDraft}
+            onSessionDraftChange={setSessionPersonalizationDraft}
+            onSave={() => void savePersonalization()}
+            onSaveSession={() => void saveSessionPersonalization()}
+            onRefresh={() => void refreshPersonalization()}
+          />
+        ) : viewMode === "data" ? (
           <DataManagementScreen report={localDataReport} loading={localDataLoading} onRefresh={refreshLocalDataReport} onOpenFolder={openDataFolder} />
         ) : viewMode === "organize" ? (
           <OrganizeSessionsScreen
@@ -1194,7 +1443,14 @@ function App() {
             </div>
           )}
           {finalizeJob && <FinalizeJobPanel job={finalizeJob} onCancel={cancelCurrentFinalizeJob} />}
-          {lastMemoryContext && <MemoryContextDetails context={lastMemoryContext} className="mt-2" />}
+          {lastMemoryContext && (
+            <MemoryContextDetails
+              context={lastMemoryContext}
+              candidates={lastMemoryCandidates}
+              opened={lastMemoryOpened}
+              className="mt-2"
+            />
+          )}
         </div>
 
         <div ref={viewportRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
@@ -1345,7 +1601,15 @@ function MessageBubble({
             </div>
           )}
           {isUser ? <div className="whitespace-pre-wrap break-words">{message.content}</div> : <MarkdownContent content={message.content} />}
-          {!isUser && message.memory_context && <MemoryContextDetails context={message.memory_context} compact className="mt-3" />}
+          {!isUser && message.memory_context && (
+            <MemoryContextDetails
+              context={message.memory_context}
+              candidates={message.memory_candidates ?? []}
+              opened={message.memory_opened ?? []}
+              compact
+              className="mt-3"
+            />
+          )}
         </div>
         <div className={cn("mt-1 text-xs text-muted-foreground", isUser ? "text-right" : "text-left")}>
           {pendingStatus ? `${formatDateTime(message.timestamp)}・${pendingStatus === "sending" ? "送信中" : "未同期"}` : formatDateTime(message.timestamp)}
@@ -1674,6 +1938,322 @@ function ChatGptImportScreen({
   )
 }
 
+function PersonalizationScreen({
+  settings,
+  sessionSettings,
+  draft,
+  sessionDraft,
+  summary,
+  settingsFile,
+  hasSession,
+  loading,
+  saving,
+  error,
+  onDraftChange,
+  onSessionDraftChange,
+  onSave,
+  onSaveSession,
+  onRefresh,
+}: {
+  settings: PersonalizationSettings | null
+  sessionSettings: SessionPersonalization | null
+  draft: PersonalizationSettings | null
+  sessionDraft: SessionPersonalizationDraft | null
+  summary: MemorySummary | null
+  settingsFile: string
+  hasSession: boolean
+  loading: boolean
+  saving: boolean
+  error: string | null
+  onDraftChange: (draft: PersonalizationSettings) => void
+  onSessionDraftChange: (draft: SessionPersonalizationDraft | null) => void
+  onSave: () => void
+  onSaveSession: () => void
+  onRefresh: () => void
+}) {
+  if (loading && !draft) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
+        <Loader2 className="h-4 w-4 animate-spin" />
+        パーソナライズ情報を読み込み中
+      </div>
+    )
+  }
+
+  if (!draft) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center">
+        <div className="rounded-md border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+          <div>パーソナライズ情報を取得できませんでした。</div>
+          <Button type="button" variant="outline" className="mt-3" onClick={onRefresh} disabled={loading}>
+            <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+            再読み込み
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
+  const globalRetrievalEnabled = draft.memory_enabled || draft.past_chat_search_enabled
+  const sessionRetrievalEnabled = Boolean(
+    sessionDraft
+    && (sessionDraft.memory_enabled || sessionDraft.past_chat_search_enabled)
+    && !sessionDraft.temporary,
+  )
+  const savedRetrievalEnabled = Boolean(
+    ((sessionSettings?.memory_enabled ?? settings?.memory_enabled)
+      || (sessionSettings?.past_chat_search_enabled ?? settings?.past_chat_search_enabled))
+    && !sessionSettings?.temporary,
+  )
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
+      <div className="mx-auto flex max-w-5xl flex-col gap-5">
+        {error && (
+          <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span className="break-words">{error}</span>
+          </div>
+        )}
+
+        <section className="rounded-md border border-border p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2 text-sm font-semibold">
+                <Brain className="h-4 w-4" />
+                新しいセッションの既定値
+              </div>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
+                新規セッションの初期値です。「既定値を保存」を押したときだけ {settingsFile} に書き込みます。現在のセッション設定は変更しません。
+              </p>
+            </div>
+            <Badge variant={globalRetrievalEnabled ? "secondary" : "outline"}>
+              既定の記憶参照: {globalRetrievalEnabled ? "ON" : "OFF"}
+            </Badge>
+          </div>
+
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <PersonalizationToggle
+              checked={draft.memory_enabled}
+              label="長期メモリを使う"
+              description="long_term、preferences、projects、構造化メモリを回答の根拠として利用します。"
+              disabled={saving}
+              onChange={(checked) => onDraftChange({ ...draft, memory_enabled: checked })}
+            />
+            <PersonalizationToggle
+              checked={draft.past_chat_search_enabled}
+              label="過去チャットを検索する"
+              description="明示的な過去照会で raw.md / live JSONL を読み取り専用検索します。"
+              disabled={saving}
+              onChange={(checked) => onDraftChange({ ...draft, past_chat_search_enabled: checked })}
+            />
+          </div>
+
+          <label className="mt-4 block text-sm font-medium">
+            既定のProject scope
+            <input
+              type="text"
+              value={draft.project_scope ?? ""}
+              maxLength={120}
+              placeholder="例: AI-LifeOS / 学習 / 個人"
+              disabled={saving}
+              onChange={(event) => onDraftChange({ ...draft, project_scope: event.target.value || null })}
+              className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            />
+            <span className="mt-1 block text-xs font-normal text-muted-foreground">
+              空欄は全体スコープです。改行・制御文字は保存時に拒否されます。
+            </span>
+          </label>
+
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+            <div className="text-xs text-muted-foreground">長期メモリと過去チャット検索は独立して設定できます。</div>
+            <Button type="button" onClick={onSave} disabled={saving || loading}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+              既定値を保存
+            </Button>
+          </div>
+        </section>
+
+        <section className="rounded-md border border-border p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold">現在のセッション</div>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
+                このセッションだけに適用します。既定値とは別に保存されるため、再開時にも上書きされません。
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Badge variant={savedRetrievalEnabled ? "secondary" : "outline"}>
+                保存済み: 記憶参照{savedRetrievalEnabled ? "ON" : "OFF"}
+              </Badge>
+              {sessionSettings?.project_scope && <Badge variant="outline">project: {sessionSettings.project_scope}</Badge>}
+            </div>
+          </div>
+
+          {!hasSession || !sessionDraft ? (
+            <div className="mt-4 rounded-md border border-dashed border-border px-3 py-5 text-sm text-muted-foreground">
+              セッション開始後に、この会話専用の設定を変更できます。
+            </div>
+          ) : (
+            <>
+              <div className="mt-4 grid gap-3 md:grid-cols-2">
+                <PersonalizationToggle
+                  checked={sessionDraft.memory_enabled}
+                  label="この会話で長期メモリを使う"
+                  description="long_term、preferences、projects、構造化メモリを参照候補に含めます。"
+                  disabled={saving || sessionDraft.temporary}
+                  onChange={(checked) => onSessionDraftChange({ ...sessionDraft, memory_enabled: checked })}
+                />
+                <PersonalizationToggle
+                  checked={sessionDraft.past_chat_search_enabled}
+                  label="この会話で過去チャットを検索する"
+                  description="raw.md / live JSONLを読み取り専用で検索します。"
+                  disabled={saving || sessionDraft.temporary}
+                  onChange={(checked) => onSessionDraftChange({ ...sessionDraft, past_chat_search_enabled: checked })}
+                />
+              </div>
+
+              <label className="mt-4 block text-sm font-medium">
+                この会話のProject scope
+                <input
+                  type="text"
+                  value={sessionDraft.project_scope ?? ""}
+                  maxLength={120}
+                  placeholder="例: AI-LifeOS / 学習 / 個人"
+                  disabled={saving || sessionDraft.temporary}
+                  onChange={(event) => onSessionDraftChange({ ...sessionDraft, project_scope: event.target.value || null })}
+                  className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                />
+                <span className="mt-1 block text-xs font-normal text-muted-foreground">
+                  空欄は全体スコープです。scopeは検索サーバー側でも強制されます。
+                </span>
+              </label>
+
+              <div className="mt-4 rounded-md border border-border p-3">
+                <label className="flex cursor-pointer items-start gap-3">
+                  <input
+                    type="checkbox"
+                    checked={sessionDraft.temporary}
+                    disabled={saving || Boolean(sessionSettings?.temporary_locked)}
+                    onChange={(event) => onSessionDraftChange({ ...sessionDraft, temporary: event.target.checked })}
+                    className="mt-1 h-4 w-4"
+                  />
+                  <span>
+                    <span className="block text-sm font-medium">このセッションを一時チャットにする</span>
+                    <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                      既存memoryと過去チャットを使わず、この会話をsummary・journal・memory・検索indexの整理対象から除外します。live会話ログ自体は保持します。
+                    </span>
+                  </span>
+                </label>
+                {sessionSettings?.temporary_locked && (
+                  <div className="mt-2 text-xs text-muted-foreground">
+                    最初の発言保存後は、通常／一時の区分を変更できません。
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+                <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                  <Badge variant={sessionRetrievalEnabled ? "secondary" : "outline"}>保存後の記憶参照: {sessionRetrievalEnabled ? "ON" : "OFF"}</Badge>
+                  {sessionDraft.temporary && <Badge variant="outline">整理対象外</Badge>}
+                </div>
+                <Button type="button" onClick={onSaveSession} disabled={saving || loading}>
+                  {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                  セッション設定を保存
+                </Button>
+              </div>
+            </>
+          )}
+        </section>
+
+        <section className="rounded-md border border-border p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="flex items-center gap-2 text-sm font-semibold">
+                <FileText className="h-4 w-4" />
+                Memory summary
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">固定されたmemory配下のファイルだけを読み取り専用で表示します。</div>
+            </div>
+            <Badge variant="secondary">読み取り専用</Badge>
+          </div>
+
+          {!summary ? (
+            <div className="mt-4 rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
+              プレビューを取得できませんでした。
+            </div>
+          ) : (
+            <>
+              <div className="mt-4 grid gap-3 lg:grid-cols-3">
+                {summary.sections.map((item) => <MemoryPreviewCard key={item.key} item={item} />)}
+              </div>
+              <div className="mt-5 flex items-center justify-between gap-2">
+                <div className="text-sm font-medium">構造化メモリ</div>
+                <Badge variant="outline">{summary.structured_item_count}件</Badge>
+              </div>
+              {summary.structured_items.length === 0 ? (
+                <div className="mt-3 rounded-md border border-dashed border-border px-3 py-5 text-sm text-muted-foreground">memory/items/*.md はありません。</div>
+              ) : (
+                <div className="mt-3 grid gap-3 lg:grid-cols-2">
+                  {summary.structured_items.map((item) => <MemoryPreviewCard key={item.path} item={item} />)}
+                </div>
+              )}
+              {summary.structured_items_truncated && <div className="mt-2 text-xs text-muted-foreground">先頭100件だけ表示しています。</div>}
+            </>
+          )}
+        </section>
+      </div>
+    </div>
+  )
+}
+
+function PersonalizationToggle({
+  checked,
+  label,
+  description,
+  disabled,
+  onChange,
+}: {
+  checked: boolean
+  label: string
+  description: string
+  disabled: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return (
+    <label className={cn("flex cursor-pointer items-start gap-3 rounded-md border border-border p-3", disabled && "cursor-not-allowed opacity-70")}>
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} className="mt-1 h-4 w-4" />
+      <span>
+        <span className="block text-sm font-medium">{label}</span>
+        <span className="mt-1 block text-xs leading-5 text-muted-foreground">{description}</span>
+      </span>
+    </label>
+  )
+}
+
+function MemoryPreviewCard({ item }: { item: MemorySummary["sections"][number] }) {
+  return (
+    <details className="min-w-0 rounded-md border border-border bg-muted/30 p-3">
+      <summary className="cursor-pointer list-none">
+        <div className="flex items-center justify-between gap-2">
+          <span className="truncate text-sm font-medium">{item.label}</span>
+          <Badge variant={item.exists ? "secondary" : "outline"}>{item.exists ? `${item.character_count}字` : "未作成"}</Badge>
+        </div>
+        <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{item.path}</div>
+      </summary>
+      {item.exists && (
+        <div className="mt-3">
+          <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background p-3 text-xs leading-5 text-foreground">{item.content}</pre>
+          <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-muted-foreground">
+            {item.modified_at && <span>更新: {formatDateTime(item.modified_at)}</span>}
+            {item.truncated && <span>表示上限で省略</span>}
+          </div>
+        </div>
+      )}
+    </details>
+  )
+}
+
 function DataManagementScreen({
   report,
   loading,
@@ -1783,17 +2363,23 @@ function DataMetric({ icon, label, value }: { icon: ReactNode; label: string; va
 
 function MemoryContextDetails({
   context,
+  candidates = [],
+  opened = [],
   compact = false,
   className,
 }: {
   context: MemoryContextSummary
+  candidates?: MemoryContextReference[]
+  opened?: MemoryContextReference[]
   compact?: boolean
   className?: string
 }) {
-  const label = context.used ? `記憶参照: あり (${context.reference_count}件)` : "記憶参照: なし"
-  const scoreLabel = context.threshold > 0 ? `score ${context.score}/${context.threshold}` : "score -"
+  const label = context.used ? `記憶取得: あり (${context.reference_count}件)` : "記憶取得: なし"
+  const scoreLabel = context.threshold > 0
+    ? `depth score ${context.score}（deep基準 ${context.threshold}）`
+    : "depth score -"
   const modeLabel = context.retrieval_modes.length > 0 ? context.retrieval_modes.join(" / ") : "なし"
-  const references = context.references.slice(0, 5)
+  const health = context.retrieval_health
 
   return (
     <details
@@ -1810,26 +2396,76 @@ function MemoryContextDetails({
         <span>取得: {modeLabel}</span>
       </summary>
       <div className="mt-2 space-y-2">
-        {context.used ? (
-          references.map((reference) => (
-            <div key={`${reference.path}:${reference.document_type}:${reference.speaker_role ?? ""}:${reference.message_number ?? ""}`} className="min-w-0">
-              <div className="break-all font-mono text-[11px] text-foreground">{reference.path}</div>
-              <div className="mt-1 flex flex-wrap gap-2">
-                <span>{reference.document_type}</span>
-                {reference.speaker_role && <span>role: {reference.speaker_role}</span>}
-                {reference.message_number !== null && <span>message {reference.message_number}</span>}
-                {reference.date && <span>{reference.date}</span>}
-                {reference.score > 0 && <span>match {reference.score}</span>}
-              </div>
-              {reference.snippet && <div className="mt-1 line-clamp-2 break-words">{reference.snippet}</div>}
-            </div>
-          ))
-        ) : (
-          <div>今回の回答では memory context を使っていません。</div>
+        <div className="grid gap-2 rounded-md border border-border/70 bg-background/60 p-2 sm:grid-cols-2 lg:grid-cols-4">
+          <div>
+            <div className="font-medium text-foreground">Index</div>
+            <div>{health.index_status}{health.markdown_fallback_used ? " / Markdown fallback" : ""}</div>
+          </div>
+          <div>
+            <div className="font-medium text-foreground">検索深度</div>
+            <div>{health.retrieval_depth}</div>
+          </div>
+          <div>
+            <div className="font-medium text-foreground">Hit count</div>
+            <div>core {health.core_reference_count} / structured {health.structured_memory_hit_count} / past {health.past_chat_hit_count}</div>
+          </div>
+          <div>
+            <div className="font-medium text-foreground">Scope</div>
+            <div className="break-words">{health.project_scope ?? "全体"}</div>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <span>core: {health.core_enabled ? "ON" : "OFF"}</span>
+          <span>past chats: {health.past_chats_enabled ? "ON" : "OFF"}</span>
+          {health.index_reasons.length > 0 && <span>index理由: {health.index_reasons.join(" / ")}</span>}
+        </div>
+        {health.query_variants.length > 0 && (
+          <div className="break-words">検索語: {health.query_variants.join(" / ")}</div>
         )}
-        {context.references.length > references.length && <div>他{context.references.length - references.length}件</div>}
+        <div className="flex flex-wrap gap-2">
+          <span className="font-medium text-foreground">取得理由:</span>
+          <span>{context.reasons.length > 0 ? context.reasons.join(" / ") : "理由なし"}</span>
+        </div>
+        <div className="font-medium text-foreground">回答へ渡した記憶参照</div>
+        {context.used
+          ? <MemoryReferenceRows references={context.references} />
+          : <div>今回の回答へ渡した記憶参照はありません。</div>}
+        {candidates.length > 0 && (
+          <div className="space-y-2 border-t border-border/70 pt-2">
+            <div className="font-medium text-foreground">MCP検索候補（未open・回答未使用を含む）</div>
+            <MemoryReferenceRows references={candidates} />
+          </div>
+        )}
+        {opened.length > 0 && (
+          <div className="space-y-2 border-t border-border/70 pt-2">
+            <div className="font-medium text-foreground">MCPでopenした一次資料</div>
+            <MemoryReferenceRows references={opened} />
+          </div>
+        )}
       </div>
     </details>
+  )
+}
+
+function MemoryReferenceRows({ references }: { references: MemoryContextReference[] }) {
+  const visible = references.slice(0, 5)
+  return (
+    <>
+      {visible.map((reference) => (
+        <div key={`${reference.path}:${reference.document_type}:${reference.speaker_role ?? ""}:${reference.message_number ?? ""}`} className="min-w-0">
+          <div className="break-all font-mono text-[11px] text-foreground">{reference.path}</div>
+          <div className="mt-1 flex flex-wrap gap-2">
+            <span>{reference.document_type}</span>
+            {reference.speaker_role && <span>role: {reference.speaker_role}</span>}
+            {reference.message_number !== null && <span>message {reference.message_number}</span>}
+            {reference.date && <span>{reference.date}</span>}
+            {reference.score > 0 && <span>match {reference.score}</span>}
+          </div>
+          {reference.snippet && <div className="mt-1 line-clamp-2 break-words">{reference.snippet}</div>}
+        </div>
+      ))}
+      {references.length > visible.length && <div>他{references.length - visible.length}件</div>}
+    </>
   )
 }
 
@@ -2080,15 +2716,22 @@ function renderInline(text: string) {
   return nodes
 }
 
-function attachMemoryContextToLatestAssistant(messages: ChatMessage[], context: MemoryContextSummary | null) {
-  if (!context) {
+function attachMemoryContextToLatestAssistant(
+  messages: ChatMessage[],
+  context: MemoryContextSummary | null,
+  candidates: MemoryContextReference[] = [],
+  opened: MemoryContextReference[] = [],
+) {
+  if (!context && candidates.length === 0 && opened.length === 0) {
     return messages
   }
 
   const next = messages.map((message) => ({ ...message }))
   for (let index = next.length - 1; index >= 0; index -= 1) {
     if (next[index].role === "assistant") {
-      next[index].memory_context = context
+      next[index].memory_context = context ?? undefined
+      next[index].memory_candidates = candidates
+      next[index].memory_opened = opened
       break
     }
   }
