@@ -28,6 +28,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 * ChatGPT Plus / Codex CLI 側を使う。
 * ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない。
 * APIキーや秘密情報を保存しない。
+* ユーザーがそのターンで明示的に許可しない限り、このリポジトリ外のファイルやディレクトリを参照・検索・編集しない。
 * 会話ログにないことを summary / journal / memory に書かない。
 * `memory/long_term.md` は長期的に重要な情報だけ扱い、既存情報を勝手に削除しない。
 * journal は事実ベースで、AIがどう答えたか、その結果どうなったかを400文字程度で書く。結果が会話内で未確定なら未確定と書く。
@@ -61,6 +62,8 @@ Git管理しないもの:
 * `tests/`
 * `README.md`
 * `AGENTS.md`
+* `.codex/`
+* `.vscode/`
 * `.gitignore`
 
 commit / push 前の原則:

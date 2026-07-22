@@ -1,0 +1,13 @@
+# Keep local command access inside this repository, apart from the minimal
+# system paths Codex needs to start tools on Windows.
+default_permissions = "workspace-only"
+
+[permissions.workspace-only]
+description = "Read and write only inside the active repository workspace."
+extends = ":workspace"
+
+[permissions.workspace-only.filesystem]
+":root" = "deny"
+":minimal" = "read"
+":tmpdir" = "deny"
+":slash_tmp" = "deny"

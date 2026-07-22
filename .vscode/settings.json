@@ -1,20 +1,23 @@
 {
+  "terminal.integrated.cwd": "${workspaceFolder}",
   "terminal.integrated.profiles.windows": {
-    "Codex": {
+    "Codex (AI-LifeOS repo-only)": {
       "path": "powershell.exe",
       "args": [
+        "-NoLogo",
+        "-NoProfile",
         "-NoExit",
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "${workspaceFolder}\\.vscode\\codex-launch.ps1",
-        "--dangerously-bypass-approvals-and-sandbox"
+        "${workspaceFolder}\\.vscode\\codex-launch.ps1"
       ],
       "overrideName": true,
-      "icon": "line-height"
+      "icon": "shield"
     }
   },
-  "terminal.integrated.defaultProfile.windows": "Codex",
+  "terminal.integrated.defaultProfile.windows": "Codex (AI-LifeOS repo-only)",
+  "terminal.integrated.enablePersistentSessions": false,
   "terminal.integrated.env.windows": {
     "PYTHONUTF8": "1",
     "PYTHONIOENCODING": "utf-8"
