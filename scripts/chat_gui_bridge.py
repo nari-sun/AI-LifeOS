@@ -24,12 +24,17 @@ from finalize_live_chat import finalize_live_chat
 from import_chatgpt_export import (
     CONVERSATION_FILE_PATTERN,
     ExportConversation,
-    find_imported_source_ids,
+    IMPORT_STATE_CONFLICT,
+    IMPORT_STATE_DUPLICATE,
+    IMPORT_STATE_NEW,
+    IMPORT_STATE_UPDATED,
+    classify_import_states,
     import_conversations,
     load_export,
 )
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from local_data_report import build_local_data_report
+from memory_index import inspect_index_health, rebuild_index
 from kokoro_tts import (
     DEFAULT_VOICE,
     KokoroSynthesisCancelled,
@@ -539,21 +544,36 @@ def handle_preview_chatgpt_import(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
     source_path = _resolve_chatgpt_export_source(payload.get("source"))
     source = _load_chatgpt_export_source(source_path)
-    duplicate_ids = find_imported_source_ids(root / "conversations")
+    import_states = classify_import_states(source.conversations, root / "conversations")
     conversations = [
-        _serialize_chatgpt_import_conversation(item, duplicate=item.source_id in duplicate_ids)
+        _serialize_chatgpt_import_conversation(
+            item,
+            import_state=import_states.get(item.source_id, IMPORT_STATE_CONFLICT),
+        )
         for item in source.conversations
     ]
-    duplicate_count = sum(1 for item in conversations if item["duplicate"])
+    state_counts = {
+        state: sum(1 for item in conversations if item["import_state"] == state)
+        for state in (
+            IMPORT_STATE_NEW,
+            IMPORT_STATE_UPDATED,
+            IMPORT_STATE_DUPLICATE,
+            IMPORT_STATE_CONFLICT,
+        )
+    }
     _gui_log(
         root,
-        f"chatgpt_import.preview conversations={len(conversations)} new={len(conversations) - duplicate_count} duplicates={duplicate_count}",
+        f"chatgpt_import.preview conversations={len(conversations)} "
+        f"new={state_counts[IMPORT_STATE_NEW]} updated={state_counts[IMPORT_STATE_UPDATED]} "
+        f"duplicates={state_counts[IMPORT_STATE_DUPLICATE]} conflicts={state_counts[IMPORT_STATE_CONFLICT]}",
     )
     return {
         "source": source.display_name,
         "total_count": len(conversations),
-        "new_count": len(conversations) - duplicate_count,
-        "duplicate_count": duplicate_count,
+        "new_count": state_counts[IMPORT_STATE_NEW],
+        "updated_count": state_counts[IMPORT_STATE_UPDATED],
+        "duplicate_count": state_counts[IMPORT_STATE_DUPLICATE],
+        "conflict_count": state_counts[IMPORT_STATE_CONFLICT],
         "conversations": conversations,
     }
 
@@ -572,29 +592,41 @@ def handle_apply_chatgpt_import(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("選択した会話がエクスポート内に見つかりません。内容を再確認してください。")
 
     selected = [item for item in source.conversations if item.source_id in selected_ids]
+    import_states = classify_import_states(selected, root / "conversations")
+    if any(import_states.get(item.source_id) == IMPORT_STATE_CONFLICT for item in selected):
+        raise ValueError("競合している会話は自動更新できません。既存のimport metadataを確認してください。")
     results = import_conversations(
         selected,
         conversations_dir=root / "conversations",
         source_display_name=source.display_name,
     )
-    imported = [item for item in results if not item.duplicate]
-    duplicate_count = len(results) - len(imported)
+    created = [item for item in results if not item.duplicate and not item.updated]
+    updated = [item for item in results if item.updated]
+    written = [item for item in results if not item.duplicate]
+    duplicate_count = sum(1 for item in results if item.duplicate)
+    index_updated, index_status, index_error = _rebuild_chatgpt_import_index(root)
     _gui_log(
         root,
-        f"chatgpt_import.apply selected={len(selected)} imported={len(imported)} duplicates={duplicate_count}",
+        f"chatgpt_import.apply selected={len(selected)} imported={len(created)} updated={len(updated)} "
+        f"duplicates={duplicate_count} index_updated={index_updated} index_status={index_status}",
     )
     return {
         "source": source.display_name,
         "selected_count": len(selected),
-        "imported_count": len(imported),
+        "imported_count": len(created),
+        "updated_count": len(updated),
         "duplicate_count": duplicate_count,
+        "index_updated": index_updated,
+        "index_status": index_status,
+        "index_error": index_error,
         "imported": [
             {
                 "source_id": item.conversation.source_id,
                 "title": item.conversation.title,
                 "raw_file": _display_path(item.raw_file, root) if item.raw_file else None,
+                "updated": item.updated,
             }
-            for item in imported
+            for item in written
         ],
     }
 
@@ -1942,7 +1974,7 @@ def _selected_chatgpt_import_ids(value: Any) -> set[str]:
 def _serialize_chatgpt_import_conversation(
     conversation: ExportConversation,
     *,
-    duplicate: bool,
+    import_state: str,
 ) -> dict[str, Any]:
     return {
         "source_id": conversation.source_id,
@@ -1950,7 +1982,15 @@ def _serialize_chatgpt_import_conversation(
         "created_at": _chatgpt_import_timestamp(conversation.created_at),
         "updated_at": _chatgpt_import_timestamp(conversation.updated_at),
         "message_count": len(conversation.messages),
-        "duplicate": duplicate,
+        "duplicate": import_state == IMPORT_STATE_DUPLICATE,
+        "import_state": import_state,
+        "source_message_count": conversation.source_message_count,
+        "skipped_message_count": conversation.skipped_message_count,
+        "non_text_message_count": conversation.non_text_message_count,
+        "attachment_count": conversation.attachment_count,
+        "non_text_part_count": conversation.non_text_part_count,
+        "audio_transcription_count": conversation.audio_transcription_count,
+        "empty_conversation": conversation.empty_conversation,
     }
 
 
@@ -2168,6 +2208,39 @@ def _serialize_session_file(path: Path, root: Path) -> dict[str, Any]:
         "organization": _serialize_organization(root=root, session_file=path),
         "personalization": serialize_personalization(load_session_personalization(root, path)),
     }
+
+
+def _rebuild_chatgpt_import_index(root: Path) -> tuple[bool, str, str | None]:
+    """Refresh the derived index without changing the outcome of a completed import."""
+
+    try:
+        rebuild_index(root=root)
+        health = inspect_index_health(root=root)
+    except Exception as exc:
+        # Importing raw.md is the durable operation.  Index failures must not
+        # make that successful write look rolled back, and exception text may
+        # contain an absolute path or private source detail.
+        _gui_log(root, f"chatgpt_import.index_failed error_type={type(exc).__name__}")
+        return (
+            False,
+            "error",
+            "会話の取り込みは完了しましたが、検索indexの更新に失敗しました。後で再構築してください。",
+        )
+
+    if health.status != "fresh":
+        status = _safe_log_text(str(health.status), max_length=40) or "unknown"
+        _gui_log(root, f"chatgpt_import.index_incomplete status={status}")
+        return (
+            False,
+            status,
+            "会話の取り込みは完了しましたが、検索indexの最新状態を確認できませんでした。後で再構築してください。",
+        )
+
+    _gui_log(
+        root,
+        f"chatgpt_import.index_updated status=fresh sources={health.source_count}",
+    )
+    return True, "fresh", None
 
 
 def _serialize_message(message: LiveMessage) -> dict[str, str]:

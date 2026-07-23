@@ -57,7 +57,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - 私的な質問や好みに関係する会話では、`memory/long_term.md`、`memory/preferences.md`、`memory/projects.md` を読み取り専用コンテキストとして回答に渡す
 - 過去会話をCodexが読み取り専用Memory MCPで検索語を変えながら反復検索し、一次発言を開いて確認する
 - 長期memoryと過去チャット検索を独立してON/OFFし、全体既定値と現在セッションのproject scope・一時チャットを分けてGUIで管理する
-- ChatGPT exportのフォルダ、zip、`conversations.json`、または分割された `conversations-*.json` をCLIまたはGUIでdry-run確認してから、選択した会話だけをraw.mdへ取り込む
+- ChatGPT exportのフォルダ、zip、`conversations.json`、または分割された `conversations-*.json` をdry-run確認し、新規・更新revisionを選択してraw.mdへ取り込む。GUIでは取り込み後に検索indexも再構築する
 - `python -m unittest` で Python 側の保存・再開・GUIブリッジ処理をテストする
 
 ## Phase Overview
@@ -265,19 +265,21 @@ python -m venv --system-site-packages .venv
 
 ### ChatGPT export import
 
-既定はdry-runです。件数、UTC期間、タイトル、会話ID、重複状態を確認できます。
+既定はdry-runです。件数、UTC期間、タイトル、会話ID、新規・更新・変更なし・競合状態、テキスト抽出状況を確認できます。音声会話はexport内の文字起こしを取り込み、画像・音声ファイル本体は保存しません。
 
 ```powershell
 python scripts\import_chatgpt_export.py imports\chatgpt_export\export.zip
 ```
 
-確認後、対象指定と `--apply` を明示して取り込みます。インポートだけではsummary / journal / memory / 検索indexを更新しません。
+確認後、対象指定と `--apply` を明示して取り込みます。同じ会話IDの内容が更新されていれば旧revisionを退避して更新し、同一内容はスキップします。CLIインポートだけではsummary / journal / memory / 検索indexを更新しません。
 
 ```powershell
 python scripts\import_chatgpt_export.py imports\chatgpt_export\export.zip --id CONVERSATION_ID --apply
 ```
 
 期間・タイトル・全件指定、重複判定、保存形式の詳細は [docs/chatgpt_export_import.md](docs/chatgpt_export_import.md) を参照してください。
+
+Chat GUIでは初期選択を0件にし、表示中の対象だけを明示選択して取り込みます。取り込み成功後は派生検索indexを自動再構築しますが、summary / journal / memoryへの昇格は行いません。
 
 ## Codex Settings
 
@@ -614,10 +616,11 @@ python -m unittest
 - Phase3のMarkdown検索、タグ抽出、SQLite index、回答用memory contextが動く
 - stale index fallback、Memory MCP、一時チャット境界、独立トグル、project scopeが動く
 
-GUI側のビルド確認:
+GUI側のfilterテストとビルド確認:
 
 ```powershell
 cd desktop\app
+npm test
 npm run build
 ```
 

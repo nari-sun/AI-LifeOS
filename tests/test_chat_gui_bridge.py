@@ -165,7 +165,13 @@ class ChatGuiBridgeTests(unittest.TestCase):
                                     "message": {
                                         "author": {"role": "user"},
                                         "create_time": 1767225601,
-                                        "content": {"parts": ["GUIから取り込みたい"]},
+                                        "content": {
+                                            "parts": [
+                                                "GUIから取り込みたい",
+                                                {"content_type": "audio_transcription", "text": "音声からの発言"},
+                                                {"content_type": "image_asset_pointer"},
+                                            ]
+                                        },
                                     },
                                 },
                                 "assistant-node": {
@@ -189,7 +195,14 @@ class ChatGuiBridgeTests(unittest.TestCase):
 
             self.assertEqual(1, preview["total_count"])
             self.assertEqual(1, preview["new_count"])
+            self.assertEqual(0, preview["updated_count"])
+            self.assertEqual(0, preview["conflict_count"])
             self.assertFalse(preview["conversations"][0]["duplicate"])
+            self.assertEqual("new", preview["conversations"][0]["import_state"])
+            self.assertEqual(2, preview["conversations"][0]["source_message_count"])
+            self.assertEqual(1, preview["conversations"][0]["attachment_count"])
+            self.assertEqual(1, preview["conversations"][0]["audio_transcription_count"])
+            self.assertFalse(preview["conversations"][0]["empty_conversation"])
             self.assertFalse((root / "conversations").exists())
             with self.assertRaisesRegex(ValueError, "最終確認"):
                 chat_gui_bridge.handle_apply_chatgpt_import(
@@ -207,15 +220,198 @@ class ChatGuiBridgeTests(unittest.TestCase):
 
             self.assertEqual(1, result["selected_count"])
             self.assertEqual(1, result["imported_count"])
+            self.assertTrue(result["index_updated"])
+            self.assertEqual("fresh", result["index_status"])
+            self.assertIsNone(result["index_error"])
             raw_file = root / result["imported"][0]["raw_file"]
             self.assertTrue(raw_file.exists())
             self.assertTrue((raw_file.parent / "import_metadata.json").exists())
             self.assertFalse((root / "journal").exists())
-            self.assertFalse((root / "memory").exists())
+            self.assertTrue((root / "memory" / "search_index.sqlite3").exists())
             refreshed_preview = chat_gui_bridge.handle_preview_chatgpt_import({"root": str(root), "source": str(source_path)})
             self.assertTrue(refreshed_preview["conversations"][0]["duplicate"])
+            self.assertEqual("duplicate", refreshed_preview["conversations"][0]["import_state"])
             log_text = (root / "logs" / "chat_gui_bridge.log").read_text(encoding="utf-8")
             self.assertNotIn(str(source_path), log_text)
+
+    def test_chatgpt_import_updates_changed_revision_and_rebuilds_index(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "lifeos"
+            source_path = Path(temp_dir) / "conversations.json"
+
+            def write_revision(update_time: int, assistant_text: str) -> None:
+                source_path.write_text(
+                    json.dumps(
+                        [
+                            {
+                                "id": "gui-import-updated",
+                                "title": "Updated export conversation",
+                                "create_time": 1767225600,
+                                "update_time": update_time,
+                                "current_node": "assistant-node",
+                                "mapping": {
+                                    "user-node": {
+                                        "id": "user-node",
+                                        "parent": None,
+                                        "message": {
+                                            "author": {"role": "user"},
+                                            "create_time": 1767225601,
+                                            "content": {"parts": ["更新確認"]},
+                                        },
+                                    },
+                                    "assistant-node": {
+                                        "id": "assistant-node",
+                                        "parent": "user-node",
+                                        "message": {
+                                            "author": {"role": "assistant"},
+                                            "create_time": 1767225602,
+                                            "content": {"parts": [assistant_text]},
+                                        },
+                                    },
+                                },
+                            }
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+            write_revision(1767225660, "最初の回答")
+            first = chat_gui_bridge.handle_apply_chatgpt_import(
+                {
+                    "root": str(root),
+                    "source": str(source_path),
+                    "selected_ids": ["gui-import-updated"],
+                    "confirmed": True,
+                }
+            )
+            raw_file = root / first["imported"][0]["raw_file"]
+
+            write_revision(1767225720, "更新後の回答")
+            preview = chat_gui_bridge.handle_preview_chatgpt_import(
+                {"root": str(root), "source": str(source_path)}
+            )
+            self.assertEqual(0, preview["new_count"])
+            self.assertEqual(1, preview["updated_count"])
+            self.assertEqual("updated", preview["conversations"][0]["import_state"])
+            self.assertFalse(preview["conversations"][0]["duplicate"])
+
+            updated = chat_gui_bridge.handle_apply_chatgpt_import(
+                {
+                    "root": str(root),
+                    "source": str(source_path),
+                    "selected_ids": ["gui-import-updated"],
+                    "confirmed": True,
+                }
+            )
+
+            self.assertEqual(0, updated["imported_count"])
+            self.assertEqual(1, updated["updated_count"])
+            self.assertEqual(0, updated["duplicate_count"])
+            self.assertTrue(updated["index_updated"])
+            self.assertTrue(updated["imported"][0]["updated"])
+            self.assertEqual(raw_file, root / updated["imported"][0]["raw_file"])
+            self.assertIn("更新後の回答", raw_file.read_text(encoding="utf-8"))
+            refreshed = chat_gui_bridge.handle_preview_chatgpt_import(
+                {"root": str(root), "source": str(source_path)}
+            )
+            self.assertEqual("duplicate", refreshed["conversations"][0]["import_state"])
+
+    def test_chatgpt_import_conflict_is_previewed_but_not_applied(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "lifeos"
+            source_path = Path(temp_dir) / "conversations.json"
+            source_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "gui-import-conflict",
+                            "title": "First revision",
+                            "create_time": 1767225600,
+                            "update_time": 1767225660,
+                            "mapping": {},
+                        },
+                        {
+                            "id": "gui-import-conflict",
+                            "title": "Second revision",
+                            "create_time": 1767225600,
+                            "update_time": 1767225720,
+                            "mapping": {},
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            preview = chat_gui_bridge.handle_preview_chatgpt_import(
+                {"root": str(root), "source": str(source_path)}
+            )
+
+            self.assertEqual(2, preview["conflict_count"])
+            self.assertTrue(
+                all(item["import_state"] == "conflict" for item in preview["conversations"])
+            )
+            with self.assertRaisesRegex(ValueError, "競合"):
+                chat_gui_bridge.handle_apply_chatgpt_import(
+                    {
+                        "root": str(root),
+                        "source": str(source_path),
+                        "selected_ids": ["gui-import-conflict"],
+                        "confirmed": True,
+                    }
+                )
+            self.assertFalse((root / "conversations").exists())
+
+    def test_chatgpt_import_keeps_raw_success_when_index_rebuild_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "lifeos"
+            source_path = Path(temp_dir) / "conversations.json"
+            source_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "gui-import-index-failure",
+                            "title": "Private import title",
+                            "create_time": 1767225600,
+                            "mapping": {
+                                "user-node": {
+                                    "id": "user-node",
+                                    "parent": None,
+                                    "message": {
+                                        "author": {"role": "user"},
+                                        "create_time": 1767225601,
+                                        "content": {"parts": ["PRIVATE_IMPORT_BODY"]},
+                                    },
+                                }
+                            },
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            private_error = f"PRIVATE_INDEX_ERROR {source_path.resolve()} PRIVATE_IMPORT_BODY"
+
+            with mock.patch.object(chat_gui_bridge, "rebuild_index", side_effect=RuntimeError(private_error)):
+                result = chat_gui_bridge.handle_apply_chatgpt_import(
+                    {
+                        "root": str(root),
+                        "source": str(source_path),
+                        "selected_ids": ["gui-import-index-failure"],
+                        "confirmed": True,
+                    }
+                )
+
+            self.assertEqual(1, result["imported_count"])
+            self.assertFalse(result["index_updated"])
+            self.assertEqual("error", result["index_status"])
+            self.assertIn("取り込みは完了", result["index_error"])
+            self.assertNotIn("PRIVATE_INDEX_ERROR", result["index_error"])
+            raw_file = root / result["imported"][0]["raw_file"]
+            self.assertTrue(raw_file.exists())
+            log_text = (root / "logs" / "chat_gui_bridge.log").read_text(encoding="utf-8")
+            self.assertNotIn("PRIVATE_INDEX_ERROR", log_text)
+            self.assertNotIn("PRIVATE_IMPORT_BODY", log_text)
+            self.assertNotIn(str(source_path.resolve()), log_text)
 
     def test_chatgpt_import_preview_accepts_split_conversation_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:

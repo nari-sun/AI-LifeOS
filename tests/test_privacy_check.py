@@ -95,9 +95,9 @@ class PrivacyCheckTests(unittest.TestCase):
         self.assertEqual("personal data path", findings[0].label)
 
     def test_scan_path_allows_gitkeep_placeholders(self):
-        findings = privacy_check.scan_path("memory/.gitkeep")
-
-        self.assertEqual([], findings)
+        for path in ("memory/.gitkeep", "imports/chatgpt_export/.gitkeep"):
+            with self.subTest(path=path):
+                self.assertEqual([], privacy_check.scan_path(path))
 
     def test_scan_text_detects_email(self):
         text = "contact: " + "user" + "@example.com\n"

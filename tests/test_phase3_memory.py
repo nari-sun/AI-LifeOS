@@ -1162,6 +1162,119 @@ class Phase3MemoryTests(unittest.TestCase):
             self.assertTrue(all(item.path == correct_session / "raw.md" for item in raw_chunks))
             self.assertEqual(index_before, db_path.read_bytes())
 
+    def test_narrow_retrieval_reads_imported_user_raw_from_stale_markdown(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = memory_index.rebuild_index(root)
+            index_before = db_path.read_bytes()
+            session = root / "conversations" / "2099" / "05" / "2099-05-19_120000"
+            session.mkdir(parents=True)
+            long_tail = "静かな余韻が残った。" * 120
+            (session / "raw.md").write_text(
+                "\n".join(
+                    (
+                        "# Chat Log",
+                        "",
+                        "Date: 2099-05-19",
+                        "Source: ChatGPT export",
+                        "Title: Imported movie conversation",
+                        "",
+                        "## User",
+                        "",
+                        "星舟クロニクルは青い羅針盤の場面が好きだった。NARROW_IMPORTED_USER_EVIDENCE",
+                        long_tail,
+                        "",
+                        "## Assistant",
+                        "",
+                        "NARROW_IMPORTED_ASSISTANT_MUST_NOT_APPEAR",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="星舟クロニクルってどうだった？",
+            )
+
+            raw_chunks = [item for item in context.results if item.document_type == "raw_chunk"]
+            self.assertEqual("narrow", context.retrieval_health.retrieval_depth)
+            self.assertEqual("stale", context.retrieval_health.index_status)
+            self.assertTrue(context.retrieval_health.markdown_fallback_used)
+            self.assertEqual(["user"], [item.speaker_role for item in raw_chunks])
+            self.assertEqual(1, len(raw_chunks))
+            self.assertLessEqual(
+                len(raw_chunks[0].snippet),
+                build_answer_context.NARROW_RAW_SNIPPET_CHAR_LIMIT + 3,
+            )
+            self.assertIn("NARROW_IMPORTED_USER_EVIDENCE", context.text)
+            self.assertNotIn("NARROW_IMPORTED_ASSISTANT_MUST_NOT_APPEAR", context.text)
+            self.assertEqual(index_before, db_path.read_bytes())
+
+    def test_narrow_raw_retrieval_preserves_scope_and_failed_request_exclusions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            def write_raw(name: str, scope: str, user_text: str, assistant_text: str) -> Path:
+                session = root / "conversations" / "2099" / "05" / name
+                session.mkdir(parents=True)
+                path = session / "raw.md"
+                path.write_text(
+                    "\n".join(
+                        (
+                            "# Chat Log",
+                            "",
+                            "Date: 2099-05-20",
+                            f"Project Scope: {scope}",
+                            "",
+                            "## User",
+                            "",
+                            user_text,
+                            "",
+                            "## Assistant",
+                            "",
+                            assistant_text,
+                            "",
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                return path
+
+            expected_path = write_raw(
+                "2099-05-20_090000",
+                "Alpha",
+                "NARROW_SCOPE_TOPIC GOOD_SCOPE_USER_EVIDENCE",
+                "通常の応答。",
+            )
+            write_raw(
+                "2099-05-20_100000",
+                "Beta",
+                "NARROW_SCOPE_TOPIC WRONG_SCOPE_MUST_NOT_APPEAR",
+                "通常の応答。",
+            )
+            write_raw(
+                "2099-05-20_110000",
+                "Alpha",
+                "NARROW_SCOPE_TOPIC FAILED_REQUEST_MUST_NOT_APPEAR",
+                "具体的な感想は確認できない。",
+            )
+
+            context = build_answer_context.build_answer_context(
+                root=root,
+                question="NARROW_SCOPE_TOPICってどうだった？",
+                project_scope="Alpha",
+            )
+
+            raw_chunks = [item for item in context.results if item.document_type == "raw_chunk"]
+            self.assertEqual(1, len(raw_chunks))
+            self.assertEqual(expected_path, raw_chunks[0].path)
+            self.assertEqual("user", raw_chunks[0].speaker_role)
+            self.assertIn("GOOD_SCOPE_USER_EVIDENCE", context.text)
+            self.assertNotIn("WRONG_SCOPE_MUST_NOT_APPEAR", context.text)
+            self.assertNotIn("FAILED_REQUEST_MUST_NOT_APPEAR", context.text)
+
     def test_core_and_past_chat_controls_are_independent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = self.make_root(temp_dir)

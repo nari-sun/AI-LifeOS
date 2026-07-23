@@ -31,6 +31,11 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
+import {
+  filterChatGptImportConversations,
+  hasInvalidChatGptImportDateRange,
+  isChatGptImportEligible,
+} from "@/chatgptImportFilters"
 import { cn } from "@/lib/utils"
 import {
   cancelMessage,
@@ -60,6 +65,7 @@ import {
 } from "@/tauri"
 import type {
   AttachmentPayload,
+  ChatGptImportConversation,
   ChatGptImportPreview,
   ChatMessage,
   FinalizeJob,
@@ -794,11 +800,14 @@ function App() {
         return
       }
 
+      setChatGptImportSourcePath(null)
+      setChatGptImportPreview(null)
+      setChatGptImportSelectedIds([])
       const preview = await previewChatGptImport(source)
       setChatGptImportSourcePath(source)
       setChatGptImportPreview(preview)
-      setChatGptImportSelectedIds(preview.conversations.filter((item) => !item.duplicate).map((item) => item.source_id))
-      setNotice(`取り込み前確認を完了しました（新規 ${preview.new_count}件、重複 ${preview.duplicate_count}件）。`)
+      setChatGptImportSelectedIds([])
+      setNotice(`取り込み前確認を完了しました（新規 ${preview.new_count}件、更新 ${preview.updated_count}件、変更なし ${preview.duplicate_count}件、競合 ${preview.conflict_count}件）。`)
     } catch (err) {
       setError(`ChatGPTエクスポートを確認できませんでした: ${formatError(err)}`)
     } finally {
@@ -816,13 +825,13 @@ function App() {
     setChatGptImportSelectedIds(sourceIds)
   }
 
-  async function applySelectedChatGptImport() {
-    if (!chatGptImportSourcePath || !chatGptImportPreview || chatGptImportSelectedCount === 0 || isBusy || isOrganizationActive) {
+  async function applySelectedChatGptImport(selectedIds: string[]) {
+    if (!chatGptImportSourcePath || !chatGptImportPreview || selectedIds.length === 0 || isBusy || isOrganizationActive) {
       return
     }
 
     const confirmed = window.confirm(
-      `選択した ${chatGptImportSelectedCount} 件を raw.md と import_metadata.json として取り込みます。summary、journal、memory、検索indexは更新しません。`,
+      `表示中から選択した ${selectedIds.length} 件を raw.md と import_metadata.json として取り込み、検索indexを更新します。summary、journal、memoryは更新しません。`,
     )
     if (!confirmed) {
       return
@@ -831,12 +840,15 @@ function App() {
     setBusy("importing")
     setError(null)
     try {
-      const result = await applyChatGptImport(chatGptImportSourcePath, chatGptImportSelectedIds)
+      const result = await applyChatGptImport(chatGptImportSourcePath, selectedIds)
       const refreshedPreview = await previewChatGptImport(chatGptImportSourcePath)
       setChatGptImportPreview(refreshedPreview)
       setChatGptImportSelectedIds([])
       setLocalDataReport(null)
-      setNotice(`ChatGPT会話を ${result.imported_count}件取り込みました。重複 ${result.duplicate_count}件はスキップしました。記憶整理は必要な会話だけ後から実行してください。`)
+      const indexMessage = result.index_updated
+        ? `検索indexも更新しました（${result.index_status}）。`
+        : (result.index_error ?? `検索indexは更新できませんでした（${result.index_status}）。`)
+      setNotice(`ChatGPT会話を処理しました（新規 ${result.imported_count}件、更新 ${result.updated_count}件、変更なし ${result.duplicate_count}件）。${indexMessage} 記憶整理は必要な会話だけ後から実行してください。`)
     } catch (err) {
       setError(`ChatGPT会話の取り込みに失敗しました: ${formatError(err)}`)
     } finally {
@@ -1406,7 +1418,7 @@ function App() {
             onToggle={toggleChatGptImportConversation}
             onSelectNew={selectChatGptImportConversations}
             onClearSelection={() => setChatGptImportSelectedIds([])}
-            onApply={() => void applySelectedChatGptImport()}
+            onApply={(selectedIds) => void applySelectedChatGptImport(selectedIds)}
           />
         ) : (
           <>
@@ -1783,31 +1795,29 @@ function ChatGptImportScreen({
   onToggle: (sourceId: string) => void
   onSelectNew: (sourceIds: string[]) => void
   onClearSelection: () => void
-  onApply: () => void
+  onApply: (selectedIds: string[]) => void
 }) {
   const [query, setQuery] = useState("")
   const [fromDate, setFromDate] = useState("")
   const [toDate, setToDate] = useState("")
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds])
+  const invalidDateRange = hasInvalidChatGptImportDateRange(fromDate, toDate)
   const filteredConversations = useMemo(() => {
-    if (!preview) {
-      return []
-    }
-    const normalizedQuery = query.trim().toLocaleLowerCase()
-    if (!normalizedQuery) {
-      return preview.conversations
-    }
-    return preview.conversations.filter((item) => {
-      const matchesQuery = !normalizedQuery
-        || item.title.toLocaleLowerCase().includes(normalizedQuery)
-        || item.source_id.toLocaleLowerCase().includes(normalizedQuery)
-      const createdDate = item.created_at?.slice(0, 10) ?? null
-      const matchesFromDate = !fromDate || (createdDate !== null && createdDate >= fromDate)
-      const matchesToDate = !toDate || (createdDate !== null && createdDate <= toDate)
-      return matchesQuery && matchesFromDate && matchesToDate
+    return filterChatGptImportConversations(preview?.conversations ?? [], {
+      query,
+      fromDate,
+      toDate,
     })
-  }, [preview, query, fromDate, toDate])
-  const filteredNewIds = filteredConversations.filter((item) => !item.duplicate).map((item) => item.source_id)
+  }, [preview, query, fromDate, toDate, invalidDateRange])
+  const filteredEligibleIds = filteredConversations.filter(isChatGptImportEligible).map((item) => item.source_id)
+  const visibleSelectedIds = filteredEligibleIds.filter((sourceId) => selectedIdSet.has(sourceId))
+
+  function updateFilter(setter: (value: string) => void, value: string) {
+    // A changed filter may hide previously selected conversations.  Clear the
+    // selection so only an explicit selection in the current view can apply.
+    onClearSelection()
+    setter(value)
+  }
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
@@ -1820,7 +1830,7 @@ function ChatGptImportScreen({
                 ChatGPTエクスポートを確認して取り込む
               </div>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-                最初の確認ではファイルを書き換えません。会話を選択して最終確認した後だけ、raw.mdとimport_metadata.jsonを作成します。summary、journal、memory、検索indexは更新しません。
+                最初の確認ではファイルを書き換えません。会話を選択して最終確認した後だけ、raw.mdとimport_metadata.jsonを作成し、派生検索indexを再構築します。summary、journal、memoryは更新しません。
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -1842,29 +1852,31 @@ function ChatGptImportScreen({
           </section>
         ) : (
           <>
-            <section className="grid gap-3 sm:grid-cols-4">
+            <section className="grid gap-3 sm:grid-cols-3 xl:grid-cols-6">
               <DataMetric icon={<FileText className="h-4 w-4" />} label="エクスポート内" value={`${preview.total_count}件`} />
               <DataMetric icon={<CheckCircle2 className="h-4 w-4" />} label="新規" value={`${preview.new_count}件`} />
-              <DataMetric icon={<RotateCcw className="h-4 w-4" />} label="重複" value={`${preview.duplicate_count}件`} />
-              <DataMetric icon={<FileUp className="h-4 w-4" />} label="選択" value={`${selectedIds.length}件`} />
+              <DataMetric icon={<RefreshCw className="h-4 w-4" />} label="更新あり" value={`${preview.updated_count}件`} />
+              <DataMetric icon={<RotateCcw className="h-4 w-4" />} label="変更なし" value={`${preview.duplicate_count}件`} />
+              <DataMetric icon={<AlertTriangle className="h-4 w-4" />} label="競合・要確認" value={`${preview.conflict_count}件`} />
+              <DataMetric icon={<FileUp className="h-4 w-4" />} label="表示中の選択" value={`${visibleSelectedIds.length}件`} />
             </section>
 
             <section className="rounded-md border border-border p-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="min-w-0">
                   <div className="text-sm font-medium">{preview.source}</div>
-                  <div className="mt-1 text-xs text-muted-foreground">重複済みの会話は選択できず、再取り込みされません。</div>
+                  <div className="mt-1 text-xs text-muted-foreground">新規と更新ありだけを選択できます。変更なしと競合は自動適用せず、既存rawを保護します。</div>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <Button type="button" size="sm" variant="outline" onClick={() => onSelectNew(filteredNewIds)} disabled={disabled || filteredNewIds.length === 0}>
-                    表示中の新規を選択
+                  <Button type="button" size="sm" variant="outline" onClick={() => onSelectNew(filteredEligibleIds)} disabled={disabled || filteredEligibleIds.length === 0}>
+                    表示中の新規・更新を選択
                   </Button>
                   <Button type="button" size="sm" variant="ghost" onClick={onClearSelection} disabled={disabled || selectedIds.length === 0}>
                     選択を解除
                   </Button>
-                  <Button type="button" size="sm" onClick={onApply} disabled={disabled || selectedIds.length === 0}>
+                  <Button type="button" size="sm" onClick={() => onApply(visibleSelectedIds)} disabled={disabled || visibleSelectedIds.length === 0}>
                     {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileUp className="h-4 w-4" />}
-                    {selectedIds.length}件を取り込む
+                    表示中の{visibleSelectedIds.length}件を取り込む
                   </Button>
                 </div>
               </div>
@@ -1873,7 +1885,7 @@ function ChatGptImportScreen({
                 <input
                   type="search"
                   value={query}
-                  onChange={(event) => setQuery(event.target.value)}
+                  onChange={(event) => updateFilter(setQuery, event.target.value)}
                   placeholder="タイトルまたは会話IDで絞り込み"
                   className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 />
@@ -1882,8 +1894,9 @@ function ChatGptImportScreen({
                   <input
                     type="date"
                     value={fromDate}
-                    onChange={(event) => setFromDate(event.target.value)}
+                    onChange={(event) => updateFilter(setFromDate, event.target.value)}
                     aria-label="UTC作成日の開始日"
+                    aria-invalid={invalidDateRange}
                     className="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-sm text-foreground outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   />
                 </label>
@@ -1892,15 +1905,25 @@ function ChatGptImportScreen({
                   <input
                     type="date"
                     value={toDate}
-                    onChange={(event) => setToDate(event.target.value)}
+                    onChange={(event) => updateFilter(setToDate, event.target.value)}
                     aria-label="UTC作成日の終了日"
+                    aria-invalid={invalidDateRange}
                     className="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-sm text-foreground outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   />
                 </label>
               </div>
+              <div className="mt-2 text-xs text-muted-foreground">
+                絞り込み条件を変更すると、非表示の会話を誤って取り込まないよう現在の選択を解除します。
+              </div>
+              {invalidDateRange && (
+                <div className="mt-2 flex items-center gap-2 text-xs text-destructive" role="alert">
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  UTC開始日はUTC終了日以前にしてください。日付を直すまで選択・取り込みはできません。
+                </div>
+              )}
 
               <div className="mt-3 overflow-hidden rounded-md border border-border">
-                <div className="grid grid-cols-[32px_minmax(0,1fr)_110px_80px] gap-3 border-b border-border bg-muted px-3 py-2 text-xs font-medium text-muted-foreground">
+                <div className="grid grid-cols-[32px_minmax(0,1fr)_110px_110px] gap-3 border-b border-border bg-muted px-3 py-2 text-xs font-medium text-muted-foreground">
                   <div></div>
                   <div>会話</div>
                   <div>作成日 (UTC)</div>
@@ -1910,21 +1933,36 @@ function ChatGptImportScreen({
                   <div className="px-3 py-6 text-sm text-muted-foreground">一致する会話はありません。</div>
                 ) : (
                   filteredConversations.map((item) => (
-                    <label key={item.source_id} className={cn("grid grid-cols-[32px_minmax(0,1fr)_110px_80px] gap-3 border-b border-border px-3 py-2 text-sm last:border-b-0", item.duplicate && "bg-muted/40 text-muted-foreground")}>
+                    <label key={item.source_id} className={cn("grid grid-cols-[32px_minmax(0,1fr)_110px_110px] gap-3 border-b border-border px-3 py-2 text-sm last:border-b-0", !isChatGptImportEligible(item) && "bg-muted/40 text-muted-foreground")}>
                       <input
                         type="checkbox"
                         checked={selectedIdSet.has(item.source_id)}
-                        disabled={disabled || item.duplicate}
+                        disabled={disabled || !isChatGptImportEligible(item)}
                         onChange={() => onToggle(item.source_id)}
                         className="mt-1 h-4 w-4"
                       />
                       <div className="min-w-0">
                         <div className="truncate font-medium">{item.title}</div>
                         <div className="mt-1 truncate font-mono text-xs text-muted-foreground">{item.source_id}</div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          テキスト保存 {item.message_count}/{item.source_message_count}発言
+                        </div>
+                        {(item.audio_transcription_count > 0 || item.attachment_count > 0 || item.skipped_message_count > 0 || item.non_text_message_count > 0 || item.non_text_part_count > 0 || item.empty_conversation) && (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {item.audio_transcription_count > 0 && <Badge variant="outline">音声文字起こし {item.audio_transcription_count}</Badge>}
+                            {item.attachment_count > 0 && <Badge variant="outline">添付 {item.attachment_count}</Badge>}
+                            {item.skipped_message_count > 0 && <Badge variant="outline">保存対象外発言 {item.skipped_message_count}</Badge>}
+                            {item.non_text_message_count > 0 && <Badge variant="outline">本文なし発言 {item.non_text_message_count}</Badge>}
+                            {item.non_text_part_count > 0 && <Badge variant="outline">非テキスト要素 {item.non_text_part_count}</Badge>}
+                            {item.empty_conversation && <Badge variant="destructive">保存できるテキストなし</Badge>}
+                          </div>
+                        )}
                       </div>
                       <div className="text-xs text-muted-foreground">{formatImportDate(item.created_at)}</div>
                       <div>
-                        <Badge variant={item.duplicate ? "outline" : "secondary"}>{item.duplicate ? "重複" : `${item.message_count}発言`}</Badge>
+                        <Badge variant={item.import_state === "conflict" ? "destructive" : item.import_state === "new" ? "secondary" : "outline"}>
+                          {chatGptImportStateLabel(item.import_state)}
+                        </Badge>
                       </div>
                     </label>
                   ))
@@ -2901,6 +2939,19 @@ function formatImportDate(value: string | null) {
     month: "2-digit",
     day: "2-digit",
   }).format(date)
+}
+
+function chatGptImportStateLabel(state: ChatGptImportConversation["import_state"]) {
+  switch (state) {
+    case "new":
+      return "新規"
+    case "updated":
+      return "更新あり"
+    case "duplicate":
+      return "変更なし"
+    case "conflict":
+      return "競合・要確認"
+  }
 }
 
 function createRequestId() {

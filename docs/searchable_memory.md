@@ -196,6 +196,8 @@ Codexは読み取り専用Memory MCPを使い、初回0件時に検索語を変�
 
 この仕組みはChatGPT exportから取り込んだ会話と、AI-LifeOSのLive Conversation / Chat GUIから保存された会話の両方に適用されます。ChatGPT exportで個別発言の時刻が欠けていても、`## User` / `## Assistant` の見出しと出現順から役割情報を保持します。役割情報はSQLite indexの派生データなので、`python scripts\rebuild_index.py`で再生成できます。
 
+通常のnarrow retrievalでも、話題が強く一致した過去のuser `raw_chunk`を最大1件、600文字以内で参照します。これにより、summary未作成のChatGPT import直後でも「その作品ってどうだった？」のような自然な話題再訪を拾えます。弱い部分一致、assistant発言、project scope外、取得失敗直前のuser発言はnarrow contextへ入れません。
+
 ### Phase3.5: Vector Search Evaluation
 
 ベクトル検索は本番導入していません。評価結果は `docs/vector_search_evaluation.md` にまとめています。

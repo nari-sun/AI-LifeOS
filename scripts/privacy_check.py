@@ -40,6 +40,7 @@ ALLOWED_PRIVATE_DATA_FILES = {
     "inbox/.gitkeep",
     "tasks/.gitkeep",
     "imports/.gitkeep",
+    "imports/chatgpt_export/.gitkeep",
     "logs/.gitkeep",
     "renovationTickets/.gitkeep",
 }

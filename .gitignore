@@ -42,6 +42,9 @@ inbox/**
 imports/**
 !imports/
 !imports/.gitkeep
+!imports/chatgpt_export/
+imports/chatgpt_export/**
+!imports/chatgpt_export/.gitkeep
 # ChatGPT exportの代表ファイルを作業ルートへ置いた場合も追跡しない
 conversations.json
 
@@ -61,5 +64,4 @@ Thumbs.db
 
 # Others
 public-safe/
-imports/chatgpt_export/
 *.zip

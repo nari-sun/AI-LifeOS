@@ -1,7 +1,7 @@
 import argparse
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -25,6 +25,10 @@ MEMORY_SCORE_THRESHOLD = DEEP_SEARCH_SCORE_THRESHOLD
 CORE_MEMORY_CHAR_LIMIT = 1000
 RAW_EVIDENCE_LIMIT = 2
 NARROW_SEARCH_RESULT_LIMIT = 2
+NARROW_RAW_CANDIDATE_LIMIT = 8
+NARROW_RAW_EVIDENCE_LIMIT = 1
+NARROW_RAW_MIN_SCORE = 200
+NARROW_RAW_SNIPPET_CHAR_LIMIT = 600
 TOKYO_TIMEZONE = ZoneInfo("Asia/Tokyo")
 
 USER_EVIDENCE_SIGNALS = (
@@ -369,6 +373,7 @@ def build_answer_context(
         retrieval_modes.append("fallback" if fallback else "search")
 
     narrow_results: list[MemorySearchResult] = []
+    narrow_raw_chunk_results: list[MemorySearchResult] = []
     structured_results: list[MemorySearchResult] = []
     journal_results: list[MemorySearchResult] = []
     conversation_results: list[MemorySearchResult] = []
@@ -391,6 +396,19 @@ def build_answer_context(
                 document_types=narrow_document_types,
                 use_index=use_index,
                 project_scope=normalized_scope,
+            )
+        if include_past_chats:
+            narrow_raw_candidates = _search_scoped(
+                root=root,
+                query=_narrow_raw_search_query(question, search_query),
+                limit=NARROW_RAW_CANDIDATE_LIMIT,
+                document_types=("raw_chunk",),
+                use_index=use_index,
+                project_scope=normalized_scope,
+                speaker_role="user",
+            )
+            narrow_raw_chunk_results = _select_narrow_user_raw_evidence(
+                narrow_raw_candidates
             )
 
     if should_expand_search:
@@ -495,6 +513,15 @@ def build_answer_context(
             lines.extend(_format_result(result, root))
         lines.append("")
 
+    if narrow_raw_chunk_results:
+        lines.append("## Narrow Raw Conversation Evidence")
+        lines.append(
+            "Use this short user-authored excerpt only when it directly matches the current topic."
+        )
+        for result in narrow_raw_chunk_results:
+            lines.extend(_format_result(result, root))
+        lines.append("")
+
     if structured_results:
         lines.append("## Structured Memory Matches")
         for result in structured_results:
@@ -531,6 +558,7 @@ def build_answer_context(
         [
             *priority_references,
             *(_reference_from_result(result, root) for result in narrow_results),
+            *(_reference_from_result(result, root) for result in narrow_raw_chunk_results),
             *(_reference_from_result(result, root) for result in structured_results),
             *(_reference_from_result(result, root) for result in journal_results),
             *(_reference_from_result(result, root) for result in conversation_results),
@@ -546,6 +574,7 @@ def build_answer_context(
         results=tuple(
             [
                 *narrow_results,
+                *narrow_raw_chunk_results,
                 *structured_results,
                 *journal_results,
                 *conversation_results,
@@ -573,6 +602,7 @@ def build_answer_context(
             + len(conversation_results)
             + len(raw_chunk_results)
             + len(live_results)
+            + len(narrow_raw_chunk_results)
             + sum(result.document_type in {"journal", "summary"} for result in narrow_results),
             project_scope=normalized_scope,
         ),
@@ -692,6 +722,25 @@ def _search_query(question: str, history: tuple[str, ...]) -> str:
     return "\n".join(part for part in parts if part)[:800]
 
 
+def _narrow_raw_search_query(question: str, fallback_query: str) -> str:
+    """Extract a bounded topic from an ordinary conversational revisit."""
+
+    cleaned = re.sub(r"[?？!！。]+$", "", question.strip())
+    cleaned = re.sub(r"^(?:そういえば|ところで|ちなみに)[、,\s]*", "", cleaned)
+    patterns = (
+        r"^(?P<topic>.+?)(?:って|は|のこと)?(?:どうだった|どう思う|どう感じた|どんな感じだった)(?:っけ)?$",
+        r"^(?:what about|how about)\s+(?P<topic>.+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, cleaned, flags=re.IGNORECASE)
+        if not match:
+            continue
+        topic = match.group("topic").strip(" \t\r\n「」『』'\"")
+        if 2 <= len(topic) <= 80:
+            return topic
+    return fallback_query
+
+
 def _needs_past_conversation_evidence(question: str) -> bool:
     return _has_any(question, PAST_SIGNALS + ("いつ話した", "何て聞いた", "何て答えた")) or (
         _has_any(question, SELF_REFERENCES)
@@ -770,6 +819,7 @@ def _search_scoped(
     use_index: bool,
     project_scope: str | None,
     category: str | None = None,
+    speaker_role: str | None = None,
 ) -> list[MemorySearchResult]:
     results = search_memory(
         root=root,
@@ -779,8 +829,42 @@ def _search_scoped(
         category=category,
         scope=project_scope,
         use_index=use_index,
+        speaker_role=speaker_role,
     )
     return _filter_project_scope(results, project_scope, root)[: max(limit, 1)]
+
+
+def _select_narrow_user_raw_evidence(
+    candidates: list[MemorySearchResult],
+) -> list[MemorySearchResult]:
+    """Keep one compact, strongly related first-party excerpt for narrow retrieval.
+
+    The normal ranker may return conservative character-trigram matches with a
+    base score of two.  Requiring that strength rejects one-trigram noise while
+    still handling a natural revisit such as adding ``ってどうだった`` to a
+    previously stored title.  Failed retrieval requests are removed with the
+    same adjacency rule used by deep raw evidence.
+    """
+
+    safe_candidates = _exclude_failed_retrieval_messages(candidates)
+    selected: list[MemorySearchResult] = []
+    seen: set[tuple[Path, int | None]] = set()
+    for result in safe_candidates:
+        if result.document_type != "raw_chunk" or result.speaker_role != "user":
+            continue
+        if result.score < NARROW_RAW_MIN_SCORE:
+            continue
+        key = (result.path.resolve(), result.message_number)
+        if key in seen:
+            continue
+        snippet = _short_snippet(result.snippet, width=NARROW_RAW_SNIPPET_CHAR_LIMIT)
+        if not snippet:
+            continue
+        seen.add(key)
+        selected.append(replace(result, snippet=snippet))
+        if len(selected) >= NARROW_RAW_EVIDENCE_LIMIT:
+            break
+    return selected
 
 
 def _contains_failed_retrieval_signal(content: str) -> bool:

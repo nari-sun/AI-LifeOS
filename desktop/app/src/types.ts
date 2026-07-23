@@ -372,6 +372,14 @@ export interface ChatGptImportConversation {
   updated_at: string | null
   message_count: number
   duplicate: boolean
+  import_state: "new" | "duplicate" | "updated" | "conflict"
+  source_message_count: number
+  skipped_message_count: number
+  non_text_message_count: number
+  attachment_count: number
+  non_text_part_count: number
+  audio_transcription_count: number
+  empty_conversation: boolean
 }
 
 export interface ChatGptImportPreview {
@@ -379,6 +387,8 @@ export interface ChatGptImportPreview {
   total_count: number
   new_count: number
   duplicate_count: number
+  updated_count: number
+  conflict_count: number
   conversations: ChatGptImportConversation[]
 }
 
@@ -388,6 +398,8 @@ export interface ChatGptImportPreviewResult {
   total_count: number
   new_count: number
   duplicate_count: number
+  updated_count: number
+  conflict_count: number
   conversations: ChatGptImportConversation[]
 }
 
@@ -397,9 +409,14 @@ export interface ChatGptImportApplyResult {
   selected_count: number
   imported_count: number
   duplicate_count: number
+  updated_count: number
+  index_updated: boolean
+  index_status: string
+  index_error: string | null
   imported: Array<{
     source_id: string
     title: string
     raw_file: string | null
+    updated: boolean
   }>
 }

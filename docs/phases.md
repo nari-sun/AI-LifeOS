@@ -234,6 +234,8 @@ SQLite indexには元Markdownのpath・mtime・size manifestと、schema/raw met
 
 長期memoryと過去チャット検索の独立ON/OFF、project scope、一時チャット、読み取り専用memory preview、回答ごとの静的context・MCP検索候補・MCP open済み一次資料・取得理由・index health表示をChat GUIへ追加しました。全体既定値と現在セッション設定は別々に保存し、暗黙作成セッションにも既定値をsnapshotします。一時チャットは最初の発言前にだけ指定でき、live JSONLを保持しつつ、回答時の記憶利用、将来の検索、raw化、summary/journal/memory整理から除外します。詳細は [personalization.md](personalization.md) を参照してください。
 
+Phase3.10後のimport/retrieval保守として、ChatGPT exportを内容fingerprint付きrevisionとして扱い、更新前rawを検索対象外のbackupへ保存するようにしました。音声文字起こしをテキストとして復元し、GUIの初期選択・期間filter・競合表示をfail-closedに変更しています。GUI import後は派生indexを再構築し、通常のnarrow retrievalでも強く一致したuser raw発言を1件だけ参照します。summary / journal / memoryへの昇格は引き続き明示操作時だけです。
+
 ## Phase4: External Tool Integration
 
 未実装です。
