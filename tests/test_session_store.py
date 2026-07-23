@@ -167,7 +167,7 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(["2026-07-01_224000", "2026-07-01_223000"], [s.session_id for s in sessions])
             self.assertEqual("newer", sessions[0].title)
 
-    def test_list_resumable_sessions_keeps_last_user_within_retention(self):
+    def test_list_resumable_sessions_includes_old_sessions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.make_live_file(root, "recent.jsonl")
@@ -184,11 +184,9 @@ class SessionStoreTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            now = datetime(2026, 7, 1, 22, 30, 0, tzinfo=timezone(timedelta(hours=9)))
+            sessions = session_store.list_resumable_sessions(root=root)
 
-            sessions = session_store.list_resumable_sessions(root=root, retention_days=10, now=now)
-
-            self.assertEqual(["recent"], [session.session_id for session in sessions])
+            self.assertEqual(["recent", "old"], [session.session_id for session in sessions])
 
     def test_list_resumable_sessions_returns_only_the_latest_fifty(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -211,11 +209,7 @@ class SessionStoreTests(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-            sessions = session_store.list_resumable_sessions(
-                root=root,
-                retention_days=10,
-                now=started_at + timedelta(days=1),
-            )
+            sessions = session_store.list_resumable_sessions(root=root)
 
             self.assertEqual(50, len(sessions))
             self.assertEqual("session-50", sessions[0].session_id)
@@ -225,13 +219,33 @@ class SessionStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.make_live_file(root, "2026-07-01_223000.jsonl")
-            now = datetime(2026, 7, 1, 22, 30, 0, tzinfo=timezone(timedelta(hours=9)))
-
-            summary, records = session_store.load_resume_session(root=root, session_ref="latest", now=now)
+            summary, records = session_store.load_resume_session(root=root, session_ref="latest")
 
             self.assertEqual("2026-07-01_223000", summary.session_id)
             self.assertEqual(2, len(records))
             self.assertEqual("セッション保存を追加したい", records[0]["content"])
+
+    def test_load_resume_session_allows_old_session(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            old = self.make_live_file(root, "old.jsonl")
+            old.write_text(
+                json.dumps(
+                    {
+                        "role": "user",
+                        "timestamp": "2020-01-01T12:00:00+09:00",
+                        "content": "古い会話を再開したい",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary, records = session_store.load_resume_session(root=root, session_ref="old")
+
+            self.assertEqual("old", summary.session_id)
+            self.assertEqual("古い会話を再開したい", records[0]["content"])
 
     def test_prune_expired_sessions_lists_sessions_without_deleting_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:

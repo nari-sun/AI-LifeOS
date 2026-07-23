@@ -798,7 +798,7 @@ class ChatGuiBridgeTests(unittest.TestCase):
     def test_resume_session_returns_messages(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            now = datetime.now(timezone.utc) - timedelta(days=1)
+            now = datetime.now(timezone.utc) - timedelta(days=365)
             session = create_live_session(root=root, started_at=now)
             session.append_message("user", "resume me", now)
             session.append_message("assistant", "ok", now + timedelta(seconds=2))
@@ -807,12 +807,22 @@ class ChatGuiBridgeTests(unittest.TestCase):
                 {
                     "root": str(root),
                     "session_ref": session.path.stem,
-                    "retention_days": 10,
                 }
             )
 
             self.assertEqual(result["session"]["session_id"], session.path.stem)
             self.assertEqual([message["role"] for message in result["messages"]], ["user", "assistant"])
+
+    def test_list_resumable_sessions_includes_old_sessions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            old = datetime.now(timezone.utc) - timedelta(days=365)
+            session = create_live_session(root=root, started_at=old)
+            session.append_message("user", "list me", old)
+
+            result = chat_gui_bridge.handle_list_resumable({"root": str(root), "max_sessions": 50})
+
+            self.assertEqual([session.path.stem], [item["session_id"] for item in result["sessions"]])
 
     def test_cleanup_expired_command_is_not_exposed(self):
         self.assertNotIn("cleanup-expired", chat_gui_bridge.COMMANDS)
@@ -966,7 +976,7 @@ class ChatGuiBridgeTests(unittest.TestCase):
             newer.append_message("user", "newer", newer.started_at)
 
             started = chat_gui_bridge.handle_start_organize_sessions_job(
-                {"root": str(root), "retention_days": 10, "run_codex": False}
+                {"root": str(root), "run_codex": False}
             )
             self.assertEqual(2, started["eligible_count"])
             job_id = started["job"]["job_id"]
@@ -997,8 +1007,8 @@ class ChatGuiBridgeTests(unittest.TestCase):
             fake_process = mock.Mock(pid=os.getpid())
 
             with mock.patch.object(chat_gui_bridge, "_spawn_organize_sessions_worker", return_value=fake_process) as spawn:
-                first = chat_gui_bridge.handle_start_organize_sessions_job({"root": str(root), "retention_days": 10})["job"]
-                second = chat_gui_bridge.handle_start_organize_sessions_job({"root": str(root), "retention_days": 10})["job"]
+                first = chat_gui_bridge.handle_start_organize_sessions_job({"root": str(root)})["job"]
+                second = chat_gui_bridge.handle_start_organize_sessions_job({"root": str(root)})["job"]
 
             self.assertEqual(first["job_id"], second["job_id"])
             spawn.assert_called_once()

@@ -379,19 +379,17 @@ def handle_save_session(payload: dict[str, Any]) -> dict[str, Any]:
 
 def handle_list_resumable(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
-    retention_days = int(payload.get("retention_days") or 10)
     max_sessions = int(payload.get("max_sessions") or 50)
-    sessions = list_resumable_sessions(root=root, retention_days=retention_days, limit=max_sessions)
-    _gui_log(root, f"list_resumable.done days={retention_days} limit={max_sessions} count={len(sessions)}")
+    sessions = list_resumable_sessions(root=root, limit=max_sessions)
+    _gui_log(root, f"list_resumable.done limit={max_sessions} count={len(sessions)}")
     return {"sessions": [_serialize_resume_session(session, root) for session in sessions]}
 
 
 def handle_resume_session(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
     session_ref = str(payload.get("session_ref") or "latest")
-    retention_days = int(payload.get("retention_days") or 10)
-    _gui_log(root, f"resume_session.start ref={_safe_log_text(session_ref)} days={retention_days}")
-    summary, records = load_resume_session(root=root, session_ref=session_ref, retention_days=retention_days)
+    _gui_log(root, f"resume_session.start ref={_safe_log_text(session_ref)}")
+    summary, records = load_resume_session(root=root, session_ref=session_ref)
     messages = [_message_from_record(record) for record in records]
     _gui_log(root, f"resume_session.done session={summary.session_id} messages={len(messages)}")
     return {
@@ -738,7 +736,6 @@ def handle_run_finalize_job(payload: dict[str, Any]) -> dict[str, Any]:
 
 def handle_start_organize_sessions_job(payload: dict[str, Any]) -> dict[str, Any]:
     root = _payload_root(payload)
-    retention_days = int(payload.get("retention_days") or 10)
     existing = _find_active_organize_sessions_job(root)
     if existing is not None:
         _gui_log(root, f"organize_sessions.reused job_id={existing['job_id']}")
@@ -748,9 +745,9 @@ def handle_start_organize_sessions_job(payload: dict[str, Any]) -> dict[str, Any
     if active_finalize is not None:
         raise RuntimeError("個別の整理ジョブが進行中です。完了または停止してからデータ整理を実行してください。")
 
-    targets = _organize_session_targets(root=root, retention_days=retention_days)
+    targets = _organize_session_targets(root=root)
     if not targets:
-        _gui_log(root, f"organize_sessions.none days={retention_days}")
+        _gui_log(root, "organize_sessions.none")
         return {"job": None, "eligible_count": 0}
 
     job_id = _new_job_id()
@@ -990,8 +987,6 @@ def _payload_log_summary(payload: dict[str, Any]) -> str:
         parts.append(f"content_chars={len(str(payload.get('content') or ''))}")
     if "no_ai" in payload:
         parts.append(f"no_ai={bool(payload.get('no_ai'))}")
-    if payload.get("retention_days"):
-        parts.append(f"retention_days={payload['retention_days']}")
     if isinstance(payload.get("selected_ids"), list):
         parts.append(f"selected_ids={len(payload['selected_ids'])}")
     return ",".join(parts) if parts else "-"
@@ -1277,8 +1272,8 @@ def _find_active_organize_sessions_job(root: Path) -> dict[str, Any] | None:
     return min(active, key=lambda item: str(item.get("created_at") or ""))
 
 
-def _organize_session_targets(root: Path, retention_days: int) -> list[Path]:
-    sessions = list_resumable_sessions(root=root, retention_days=retention_days)
+def _organize_session_targets(root: Path) -> list[Path]:
+    sessions = list_resumable_sessions(root=root, limit=None)
     targets = [
         session
         for session in sessions

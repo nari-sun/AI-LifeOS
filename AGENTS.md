@@ -15,7 +15,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 * Phase1: Local Archive
 * Phase2.5: `inbox/chat.txt` から raw.md / summary / journal / memory までの安全な自動化
 * Phase2.6: PowerShell 上の live conversation CLI、JSONL逐次保存、終了時finalize
-* Phase2.65: `.session.json` によるセッション保存、10日以内の resume、dry-run prune
+* Phase2.65: `.session.json` によるセッション保存、期限なしの resume、参照用 prune
 * Phase2.7: Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の Chat GUI MVP
 * Phase3: Markdown/SQLite検索、stale index fallback、回答用memory context、読み取り専用Memory MCP、軽量ハイブリッド検索、パーソナライズ管理
 
@@ -33,7 +33,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 * `memory/long_term.md` は長期的に重要な情報だけ扱い、既存情報を勝手に削除しない。
 * journal は事実ベースで、AIがどう答えたか、その結果どうなったかを400文字程度で書く。結果が会話内で未確定なら未確定と書く。
 * live会話中、GUI操作中、検索処理中に `memory` / `journal` / `conversations` を勝手に編集しない。
-* 10日超セッションは resume 候補から外すが、会話ログ・live JSONL・セッション情報を削除しない。全文ログは10年以上保持する。
+* user入力のあるliveセッションは経過日数に関係なく resume 候補にし、会話ログ・live JSONL・セッション情報を削除しない。全文ログは10年以上保持する。
 * `memory/search_index.sqlite3` はMarkdownから再生成できる派生データとして扱い、Git管理しない。
 * ベクトルDBは本番導入しない。Markdown検索 + SQLite-backed index + Python ranking で足りない理由が明確になった場合に再評価する。
 
@@ -129,9 +129,9 @@ python scripts\session_store.py prune
 
 ルール:
 
-* resume 候補は最後の user 入力から10日以内に限定する。
+* user入力のあるliveセッションは経過日数に関係なくresumeできる。
 * resume セッション一覧は新しい順に最大50件表示する。
-* `prune` は resume 対象外になったセッションを一覧するだけで、削除しない。
+* `prune` は指定日数を超えたセッションを参考表示するだけで、resume可否に影響せず削除もしない。
 
 ### Chat GUI
 

@@ -12,7 +12,7 @@ They run outside the foreground Tauri command so the React UI can keep rendering
 poll status, and show progress while Codex and indexing work continue.
 
 `organize-sessions` is started only from the 管理 > データ整理 screen. It selects
-reopenable sessions within the existing 10-day retention window whose organization
+reopenable sessions regardless of age whose organization
 state has `can_organize: true`, then processes them oldest first. This includes
 unorganized sessions and sessions whose raw, memory, or index stage failed.
 

@@ -139,32 +139,30 @@ def list_saved_sessions(root: Path | str = ROOT) -> list[SavedSession]:
 
 def list_resumable_sessions(
     root: Path | str = ROOT,
-    retention_days: int = 10,
-    now: datetime | None = None,
-    limit: int = DEFAULT_RESUME_LIST_LIMIT,
+    limit: int | None = DEFAULT_RESUME_LIST_LIMIT,
 ) -> list[ResumeSession]:
     root = Path(root)
-    cutoff = _retention_cutoff(retention_days=retention_days, now=now)
     sessions = []
 
     for jsonl_file in _live_session_files(root):
         summary = _summarize_resume_session(jsonl_file)
-        if summary and _is_at_or_after(summary.last_user_at, cutoff):
+        if summary:
             sessions.append(summary)
 
-    return sorted(sessions, key=lambda session: session.last_user_at, reverse=True)[: max(limit, 1)]
+    sessions.sort(key=lambda session: session.last_user_at, reverse=True)
+    if limit is None:
+        return sessions
+    return sessions[: max(limit, 1)]
 
 
 def load_resume_session(
     root: Path | str = ROOT,
     session_ref: str = "latest",
-    retention_days: int = 10,
-    now: datetime | None = None,
 ) -> tuple[ResumeSession, list[dict[str, Any]]]:
     root = Path(root)
 
     if session_ref == "latest":
-        sessions = list_resumable_sessions(root=root, retention_days=retention_days, now=now)
+        sessions = list_resumable_sessions(root=root)
         if not sessions:
             raise FileNotFoundError("再開できるセッションがありません。")
 
@@ -174,10 +172,6 @@ def load_resume_session(
 
     records = _read_jsonl_messages(jsonl_file)
     summary = _build_resume_summary(jsonl_file=jsonl_file, records=records)
-    cutoff = _retention_cutoff(retention_days=retention_days, now=now)
-
-    if not _is_at_or_after(summary.last_user_at, cutoff):
-        raise ValueError(f"このセッションは最後の入力から{retention_days}日を超えているため再開対象外です。")
 
     return summary, records
 
@@ -204,7 +198,7 @@ def prune_expired_sessions(
     retention_days: int = 10,
     now: datetime | None = None,
 ) -> list[Path]:
-    """List sessions that are no longer eligible for resume without deleting them."""
+    """List sessions older than the reference window without deleting them."""
     return [session.jsonl_file for session in list_expired_sessions(root=root, retention_days=retention_days, now=now)]
 
 
@@ -648,11 +642,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("list", help="保存済みセッションを一覧表示する")
 
     resume_parser = subparsers.add_parser("resume-list", help="再開できるliveセッションを一覧表示する")
-    resume_parser.add_argument("--days", type=int, default=10, help="最後のuser入力から何日以内を残すか")
+    resume_parser.add_argument("--days", type=int, help=argparse.SUPPRESS)
     resume_parser.add_argument("--limit", type=int, default=DEFAULT_RESUME_LIST_LIMIT, help="表示する最新セッション数")
 
-    prune_parser = subparsers.add_parser("prune", help="再開期限を過ぎたliveセッションを一覧する")
-    prune_parser.add_argument("--days", type=int, default=10, help="最後のuser入力から何日以内を残すか")
+    prune_parser = subparsers.add_parser("prune", help="指定日数を超えたliveセッションを一覧する（削除しない）")
+    prune_parser.add_argument("--days", type=int, default=10, help="最後のuser入力から何日を超えたものを表示するか")
 
     return parser
 
@@ -682,7 +676,7 @@ def main() -> int:
             return 0
 
         if args.command == "resume-list":
-            sessions = list_resumable_sessions(root=root, retention_days=args.days, limit=args.limit)
+            sessions = list_resumable_sessions(root=root, limit=args.limit)
             if not sessions:
                 print("再開できるセッションはありません。")
                 return 0
@@ -700,11 +694,11 @@ def main() -> int:
                 retention_days=args.days,
             )
             if not targets:
-                print("resume対象外の期限切れセッションはありません。")
+                print(f"最後のuser入力から{args.days}日を超えたセッションはありません。")
                 return 0
 
             for target in targets:
-                print(f"resume対象外: {_relative_path(target, root)}")
+                print(f"{args.days}日超: {_relative_path(target, root)}")
             return 0
     except (FileNotFoundError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}")

@@ -10,8 +10,8 @@ Phase2.65 は、Phase2.6 のCLI会話と Phase2.7 のGUIの間に置く小さな
 * セッションID、タイトル、メッセージ数、開始時刻、更新時刻、保存時刻をメタデータ化する
 * 最新セッションを簡単に保存できるようにする
 * 保存済みセッションを一覧できるようにする
-* `/resume` で最後のuser入力が10日以内のセッションをロードできるようにする
-* 10日を超えたセッションはresume候補から外すが、記録は保持する
+* `/resume` でuser入力のあるセッションを経過日数に関係なくロードできるようにする
+* 会話ログ・live JSONL・セッション情報を削除せず保持する
 * Phase2.7 のGUIから同じ保存処理を呼べるようにする
 
 ## 保存形式
@@ -72,13 +72,13 @@ python scripts\session_store.py resume-list
 
 一覧は新しい順に最大50件を表示する。CLIでは `--limit` で表示件数を変更できる。
 
-10日を超えたセッションを確認する:
+最後のuser入力から指定日数を超えたセッションを参考確認する:
 
 ```powershell
 python scripts\session_store.py prune
 ```
 
-`prune` は一覧表示のみで、削除操作はありません。
+`prune` は一覧表示のみで、削除操作はありません。表示されたセッションも引き続きresumeできます。
 
 CLI会話を最新セッションから再開する:
 
@@ -104,8 +104,8 @@ CLI会話中に特定セッションを再開する:
 
 ## 保持ルール
 
-* 再開候補は、最後の `user` 入力が10日以内の `inbox/live/*.jsonl` に限定する
-* 10日を超えたセッションは `prune` で一覧できるが、削除しない
+* user入力のある `inbox/live/*.jsonl` は経過日数に関係なく再開候補にする
+* `prune` は指定日数を超えたセッションを参考表示するだけで、resume可否に影響せず削除もしない
 * 会話ログ、live JSONL、`.session.json` は10年以上保持する
 
 ## やらないこと
@@ -121,11 +121,11 @@ CLI会話中に特定セッションを再開する:
 
 Phase2.7 のGUIでは、会話終了時または「セッションを保存」ボタン押下時に `scripts/session_store.py` の保存処理を呼びます。
 
-GUIは最初から検索や複雑な履歴管理を持たず、保存済みセッションのメタデータ表示と、10日以内セッションの再開に留めます。
+GUIは最初から検索や複雑な履歴管理を持たず、保存済みセッションのメタデータ表示と再開に留めます。
 
 ## GUI履歴サイドバー
 
-RT-0009 では、Phase2.65 の resume 対象と同じ「最後のuser入力から10日以内」の live session を左サイドバーに表示します。
+左サイドバーには、Phase2.65 の resume 対象であるuser入力付きlive sessionを、経過日数に関係なく新しい順に最大50件表示します。
 
 表示する情報:
 
@@ -135,7 +135,7 @@ RT-0009 では、Phase2.65 の resume 対象と同じ「最後のuser入力か�
 * 最終user入力日時
 * 整理状態
 
-GUIから新規チャット開始と既存セッション再開を選べます。10日超セッション、全履歴検索、ピン留めは Session Save / Resume MVP の範囲外です。
+GUIから新規チャット開始と既存セッション再開を選べます。50件を超える全履歴の検索、ピン留め、長期スレッド管理は Session Save / Resume MVP の範囲外です。
 
 ## RT-0016 分岐機能との関係
 
@@ -148,9 +148,9 @@ ChatGPT風のメッセージ編集、回答再生成、会話分岐は `docs/con
 * `python scripts\session_store.py save` で最新live JSONLの `.session.json` を作れる
 * `--file` と `--title` を指定して保存できる
 * `python scripts\session_store.py list` で保存済みセッションを確認できる
-* `python scripts\session_store.py resume-list` で10日以内の再開候補を確認できる
+* `python scripts\session_store.py resume-list` で経過日数に関係なく再開候補を確認できる
 * `python scripts\codex_conversation.py --resume`、`/resume <id>`、または `/resume` 後の番号入力でセッションをロードできる
-* `python scripts\session_store.py prune` で10日超のresume対象外セッションを確認できる
+* `python scripts\session_store.py prune` で指定日数を超えたセッションを参考確認できる
 * 会話ログ、live JSONL、`.session.json` は削除しない
 * 通常の保存や再開では元のJSONLを削除・移動しない
 * `python -m unittest` が通る

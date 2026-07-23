@@ -484,7 +484,7 @@ class PersonalizationBridgeTests(unittest.TestCase):
             self.assertFalse(sent["session"]["organization"]["can_organize"])
             with self.assertRaisesRegex(ValueError, "一時チャット"):
                 chat_gui_bridge.handle_start_finalize_job({"root": str(root), "session_file": session_file})
-            self.assertEqual([], chat_gui_bridge._organize_session_targets(root, retention_days=10))  # noqa: SLF001
+            self.assertEqual([], chat_gui_bridge._organize_session_targets(root))  # noqa: SLF001
 
     def test_bridge_can_clear_temporary_before_first_message_and_restore_session_overrides(self):
         with tempfile.TemporaryDirectory() as temp_dir:

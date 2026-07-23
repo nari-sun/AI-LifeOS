@@ -28,9 +28,7 @@ import type {
   StartSessionResult,
 } from "@/types"
 
-const defaultPayload = {
-  retention_days: 10,
-}
+const defaultPayload = {}
 
 export function isTauriRuntime() {
   return "__TAURI_INTERNALS__" in window

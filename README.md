@@ -36,7 +36,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - Phase1: Local Archive は完了済み
 - Phase2.5: `inbox/chat.txt` から raw.md / summary / journal / memory までの安全な自動化と、公開用ファイル限定のGit commitを実装済み
 - Phase2.6: PowerShell上の live conversation CLI、JSONL逐次保存、終了時finalizeを実装済み
-- Phase2.65: `.session.json` によるセッション保存、10日以内の resume、dry-run prune を実装済み
+- Phase2.65: `.session.json` によるセッション保存、期限なしの resume、参照用 prune を実装済み
 - Phase2.7: Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の Chat GUI MVP を実装済み
 - Phase3.0〜3.10: Markdown/SQLite検索、stale fallback、回答用memory context、読み取り専用Memory MCP、軽量ハイブリッド検索、パーソナライズ管理を実装済み
 - 構造化メモリ: 動的カテゴリ、出典、状態、タグを持つ`memory/items/*.md`の整理時保存・検索を実装済み
@@ -49,7 +49,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - `scripts/save_chat.ps1` で保存とCodex実行をまとめて実行する
 - PowerShell上で live 会話を行い、`inbox/live/*.jsonl` に user / assistant 発言を逐次保存する
 - live JSONLを raw.md に変換し、既存の Phase2.5 記憶整理へ接続する
-- live 会話セッションを `.session.json` として保存し、最後のuser入力から10日以内のセッションを再開する
+- live 会話セッションを `.session.json` として保存し、経過日数に関係なく再開する
 - Tauri GUIから新規チャット、送信、履歴再開、添付、管理メニューのローカルデータ確認、未整理セッションの逐次バックグラウンド整理を実行する
 - Tauri GUIのassistant返答を、任意導入のKokoro TTSで文ごとに先行再生・停止し、5種類の日本語voiceから選択する
 - 保存済みの raw.md / summary.md / journal / memory を検索する
@@ -244,7 +244,7 @@ Tauri command から scripts/chat_gui_bridge.py を呼ぶ
 ↓
 既存Python処理で user / assistant を inbox/live/*.jsonl に保存
 ↓
-10日以内のセッションを一覧・再開
+セッションを新しい順に一覧・再開
 ↓
 「整理して保存」で finalize_live_chat.py 相当の処理を実行
 ```
@@ -391,7 +391,7 @@ python scripts\codex_conversation.py --project-scope AI-LifeOS
 /exit
 ```
 
-`/resume` は最後のuser入力が10日以内のセッションだけを候補にします。PowerShellの対話端末ではカーソル選択、パイプ入力などでは番号入力に戻ります。
+`/resume` はuser入力のあるliveセッションを経過日数に関係なく候補にします。PowerShellの対話端末ではカーソル選択、パイプ入力などでは番号入力に戻ります。
 
 ### live JSONLをraw.md化する
 
@@ -422,10 +422,10 @@ python scripts\session_store.py prune
 ルール:
 
 - `.session.json` は元の `inbox/live/*.jsonl` の横に作る
-- 再開候補は最後のuser入力から10日以内に限定する
+- user入力のあるliveセッションは経過日数に関係なく再開候補にする
 - 再開セッション一覧は新しい順に最大50件表示する
-- 10日超のセッションも、会話ログ・live JSONL・`.session.json` を削除せずに保持する
-- `prune` はresume対象外のセッションを確認するだけで、削除しない
+- 会話ログ・live JSONL・`.session.json` は削除せずに保持する
+- `prune` は指定日数を超えたセッションを参考表示するだけで、resume可否に影響せず削除もしない
 
 ### 保存済み記憶を検索する
 
@@ -520,7 +520,7 @@ GUIでできること:
 - user / assistant 発言の表示
 - 送信直後のuser発言の一時表示
 - `.txt` / `.md` / `.pdf` / `.xlsx` 添付MVP
-- 10日以内の再開可能セッション一覧表示
+- 経過日数に関係しない再開可能セッション一覧表示
 - セッション再開
 - 「整理して保存」による raw.md 化と summary / journal / memory 更新のバックグラウンド実行
 - ローカル個人データ状況の読み取り専用表示
@@ -609,7 +609,7 @@ python -m unittest
 - live JSONLを raw.md に変換できる
 - finalize後にCodex実行と公開用commitへ接続できる
 - session save / list / resume-list / prune が動く
-- 10日以内のセッションだけを resume 候補にする
+- user入力のあるliveセッションを経過日数に関係なく resume 候補にする
 - CLIの `/resume` が番号選択に対応する
 - GUIブリッジが start / send / resume を処理できる
 - GUIブリッジログに会話本文を残さない
@@ -656,7 +656,7 @@ Codex用プロンプトの元ファイルは `prompts/codex_phase2_prompt.md` �
 - ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない
 - `memory/long_term.md` は長期的に重要な情報だけ追記する
 - live会話中に `journal` や `memory/long_term.md` を勝手に編集しない
-- 10日超セッションは自動削除しない
+- セッションは経過日数によって自動削除しない
 - Git commit はユーザー明示操作、または既存スクリプトの明示オプション経由にする
 - PublicEdition の自動commit対象は公開用プロジェクトファイルに限定し、`conversations`、`journal`、`memory`、`inbox`、`tasks` はGit管理しない
 - SQLite index は再生成可能な派生データとして扱い、Git管理しない

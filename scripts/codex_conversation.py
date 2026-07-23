@@ -112,8 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume-days",
         type=int,
-        default=10,
-        help="Only sessions whose last user input is within this many days can be resumed.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--codex-command", default="codex.cmd", help="Codex CLI command.")
     parser.add_argument("--chat-codex-model", default=DEFAULT_CHAT_CODEX_MODEL, help="Codex model for chat replies.")
@@ -1361,8 +1360,8 @@ def _render_screen(
         print(line[:width])
 
 
-def _load_resume_messages(root: Path, session_ref: str, retention_days: int) -> tuple[LiveSession, list[LiveMessage]]:
-    summary, records = load_resume_session(root=root, session_ref=session_ref, retention_days=retention_days)
+def _load_resume_messages(root: Path, session_ref: str) -> tuple[LiveSession, list[LiveMessage]]:
+    summary, records = load_resume_session(root=root, session_ref=session_ref)
     messages = [
         LiveMessage(
             role=record["role"],
@@ -1389,8 +1388,8 @@ def _format_resume_list(sessions: list[ResumeSession]) -> str:
     return "\n".join(lines)
 
 
-def _resume_candidates(root: Path, retention_days: int) -> list[ResumeSession]:
-    return list_resumable_sessions(root=root, retention_days=retention_days, limit=10)
+def _resume_candidates(root: Path) -> list[ResumeSession]:
+    return list_resumable_sessions(root=root, limit=10)
 
 
 def _cursor_selection_available() -> bool:
@@ -1680,7 +1679,7 @@ def main() -> int:
 
     try:
         if args.resume:
-            session, messages = _load_resume_messages(root=root, session_ref=args.resume, retention_days=args.resume_days)
+            session, messages = _load_resume_messages(root=root, session_ref=args.resume)
             status = f"Resumed session: {session.path.name}"
             _debug_log(root, f"main.session_resumed path={session.path} messages={len(messages)}")
         else:
@@ -1753,7 +1752,7 @@ def main() -> int:
 
             if normalized == "/resume":
                 _debug_log(root, "main.command_resume_menu")
-                resume_candidates = _resume_candidates(root=root, retention_days=args.resume_days)
+                resume_candidates = _resume_candidates(root=root)
                 if not resume_candidates:
                     status = "No resumable sessions."
                     _render_screen(messages, session_display_path, status)
@@ -1772,7 +1771,6 @@ def main() -> int:
                         session, messages = _load_resume_messages(
                             root=root,
                             session_ref=selected.session_id,
-                            retention_days=args.resume_days,
                         )
                         session_display_path = _display_path(session.path, root)
                         status = f"Resumed session: {session.path.name}"
@@ -1807,7 +1805,6 @@ def main() -> int:
                     session, messages = _load_resume_messages(
                         root=root,
                         session_ref=selected.session_id,
-                        retention_days=args.resume_days,
                     )
                     session_display_path = _display_path(session.path, root)
                     status = f"Resumed session: {session.path.name}"
@@ -1826,7 +1823,6 @@ def main() -> int:
                     session, messages = _load_resume_messages(
                         root=root,
                         session_ref=session_ref,
-                        retention_days=args.resume_days,
                     )
                     session_display_path = _display_path(session.path, root)
                     status = f"Resumed session: {session.path.name}"
