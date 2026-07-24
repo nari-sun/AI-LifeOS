@@ -20,6 +20,11 @@ desktop/app/src-tauri/target/
 desktop/app/src-tauri/gen/
 
 # AI-LifeOS generated data
+config/notion_settings.json
+config/notion_settings.json.tmp
+config/notion_settings.json.*.tmp
+config/notion_settings.lock
+
 conversations/**
 !conversations/
 !conversations/.gitkeep

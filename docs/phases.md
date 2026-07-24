@@ -22,16 +22,17 @@ Phase3.7 : Retrieval Correctness
 Phase3.8 : Read-only Memory MCP
 Phase3.9 : Hybrid Local Retrieval
 Phase3.10: Personalization Controls
-Phase4   : External Tool Integration
+Phase4.0 : Notion Read-only Chat Integration
+Phase4   : External Tool Integration (continued)
 Phase5   : Life Improvement Agent
 Phase6   : Daily Automation
 ```
 
 ## Current Checkpoint
 
-現在は Phase3.10 まで実装済みです。
+現在は Phase4.0 のNotion読み取り専用チャット連携まで実装済みです。
 
-Phase4.0 では、Phase3 のローカル記憶MCPとは分けて、外部MCP・外部ツール連携の範囲を決めます。
+Phase4.0では、Phase3のローカル記憶MCPとは分けて、回答単位で明示したときだけNotionの許可済みpage / data sourceを一時参照する外部adapterを追加しました。その他の外部MCP・外部ツール連携は引き続き個別に範囲を決めます。
 
 ## Phase1: Local Archive
 
@@ -237,7 +238,13 @@ Phase3.10後のimport/retrieval保守として、ChatGPT exportを内容fingerpr
 
 ## Phase4: External Tool Integration
 
-未実装です。
+Phase4.0のNotion読み取り専用連携を実装済みです。その他の候補は未実装です。
+
+### Phase4.0: Notion Read-only Chat Integration
+
+Chat GUIの投稿欄上に既定OFFの「Notionを参照する」を追加し、ONの送信だけNotion公式APIを呼びます。管理 > Notion連携では、接続状態、共有page / data source、使用許可、表示名、用途、最終取得状態を確認・保存できます。
+
+tokenはWindows Credential Managerに置き、Git管理外allowlistにはIDと表示metadataだけを保存します。取得本文はCodexの回答生成へ渡す一時contextであり、memory、journal、SQLite index、構造化メモリ、cacheへ保存しません。create / update / delete endpointは実装せず、未許可、権限喪失、削除済みtarget、接続失敗では古い本文へfallbackしません。通常のassistant回答は従来どおりlive会話ログへ残ります。詳細は [notion_read_only_integration.md](notion_read_only_integration.md) を参照してください。
 
 目的:
 
@@ -245,7 +252,7 @@ Phase3.10後のimport/retrieval保守として、ChatGPT exportを内容fingerpr
 * ローカル記憶を読み取り、必要に応じて安全に外部操作する
 * ファイル操作、GitHub、Web確認などの範囲と安全ルールを定義する
 
-Phase4の具体範囲は Phase4.0 で決めます。
+Notion連携の具体範囲はPhase4.0で確定しました。その他の外部ツールは、同じ安全境界を前提に別チケットで個別に決めます。
 
 ## Phase5: Life Improvement Agent
 

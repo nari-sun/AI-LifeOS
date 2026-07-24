@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   Archive,
   Bot,
+  BookOpen,
   Brain,
   ChevronDown,
   CheckCircle2,
@@ -37,6 +38,7 @@ import {
   isChatGptImportEligible,
 } from "@/chatgptImportFilters"
 import { cn } from "@/lib/utils"
+import { notionContextForSavedAssistant } from "@/notionContext"
 import {
   cancelMessage,
   cancelReadAloud,
@@ -49,6 +51,7 @@ import {
   getFinalizeJob,
   getLocalDataReport,
   getMemorySummary,
+  getNotionSettings,
   getOrganizeSessionsJob,
   getPersonalization,
   isTauriRuntime,
@@ -62,6 +65,7 @@ import {
   startOrganizeSessionsJob,
   startSession,
   updatePersonalization,
+  updateNotionSettings,
 } from "@/tauri"
 import type {
   AttachmentPayload,
@@ -73,6 +77,9 @@ import type {
   MemoryContextReference,
   MemorySummary,
   MemoryContextSummary,
+  NotionContextSummary,
+  NotionSettingsResult,
+  NotionTargetSettings,
   PersonalizationSettings,
   ReadAloudAudioChunk,
   ResumeSession,
@@ -84,7 +91,7 @@ import type {
 
 type BusyState = "idle" | "starting" | "generating" | "stopping" | "resuming" | "finalizing" | "refreshing" | "importing"
 type ReplyState = "idle" | "generating" | "stopping" | "stopped" | "failed" | "completed"
-type ViewMode = "chat" | "data" | "organize" | "import" | "personalization"
+type ViewMode = "chat" | "data" | "organize" | "import" | "personalization" | "notion"
 type PendingMessageStatus = "sending" | "failed"
 type ReadAloudStatus = "synthesizing" | "playing" | "stopping"
 
@@ -173,6 +180,8 @@ function App() {
   const [streamingAssistant, setStreamingAssistant] = useState<ChatMessage | null>(null)
   const [attachments, setAttachments] = useState<AttachmentDraft[]>([])
   const [fullArchiveReview, setFullArchiveReview] = useState(false)
+  const [notionReference, setNotionReference] = useState(false)
+  const [lastNotionContext, setLastNotionContext] = useState<NotionContextSummary | null>(null)
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null)
   const [finalizeJob, setFinalizeJob] = useState<FinalizeJob | null>(null)
   const [organizeSessionsJob, setOrganizeSessionsJob] = useState<OrganizeSessionsJob | null>(null)
@@ -186,6 +195,12 @@ function App() {
   const [personalizationSaving, setPersonalizationSaving] = useState(false)
   const [memorySummary, setMemorySummary] = useState<MemorySummary | null>(null)
   const [personalizationSettingsFile, setPersonalizationSettingsFile] = useState("memory/personalization_settings.json")
+  const [notionSettings, setNotionSettings] = useState<NotionSettingsResult | null>(null)
+  const [notionTargets, setNotionTargets] = useState<NotionTargetSettings[]>([])
+  const [notionLoading, setNotionLoading] = useState(false)
+  const [notionSaving, setNotionSaving] = useState(false)
+  const [notionSettingsError, setNotionSettingsError] = useState<string | null>(null)
+  const [notionSettingsNotice, setNotionSettingsNotice] = useState<string | null>(null)
   const [chatGptImportSourcePath, setChatGptImportSourcePath] = useState<string | null>(null)
   const [chatGptImportPreview, setChatGptImportPreview] = useState<ChatGptImportPreview | null>(null)
   const [chatGptImportSelectedIds, setChatGptImportSelectedIds] = useState<string[]>([])
@@ -206,10 +221,14 @@ function App() {
   const streamingFrameRef = useRef<number | null>(null)
 
   function activateSession(next: SessionFile | null) {
+    const sessionChanged = (sessionRef.current?.jsonl_file ?? null) !== (next?.jsonl_file ?? null)
     personalizationRequestRef.current += 1
     sessionRef.current = next
     setSession(next)
     setFullArchiveReview(false)
+    if (sessionChanged) {
+      setNotionReference(false)
+    }
     setPersonalizationLoading(false)
     setPersonalizationSaving(false)
   }
@@ -232,6 +251,7 @@ function App() {
     setLastMemoryContext(null)
     setLastMemoryCandidates([])
     setLastMemoryOpened([])
+    setLastNotionContext(null)
   }
 
   function clearStreamingAssistant() {
@@ -263,17 +283,18 @@ function App() {
   }
 
   const isBusy = busy !== "idle"
+  const isNotionSettingsBusy = notionLoading || notionSaving
   const isFinalizeActive = finalizeJob?.status === "queued" || finalizeJob?.status === "running"
   const isOrganizeSessionsActive = organizeSessionsJob?.status === "queued" || organizeSessionsJob?.status === "running"
   const isOrganizationActive = isFinalizeActive || isOrganizeSessionsActive
   const isGenerating = busy === "generating" || busy === "stopping"
   const hasAttachmentError = attachments.some((attachment) => attachment.status === "error")
   const canReviewFullArchive = Boolean(session?.personalization.past_chat_search_enabled)
-  const canSend = input.trim().length > 0 && !isBusy && !isOrganizationActive && !hasAttachmentError
+  const canSend = input.trim().length > 0 && !isBusy && !isNotionSettingsBusy && !isOrganizationActive && !hasAttachmentError
   const canStop = busy === "generating" && activeRequestId !== null
-  const canRestoreInput = lastSubmittedText.trim().length > 0 && !isBusy
+  const canRestoreInput = lastSubmittedText.trim().length > 0 && !isBusy && !isNotionSettingsBusy
   const organization = session?.organization ?? null
-  const canFinalize = Boolean(session && organization?.can_organize && !isBusy && !isOrganizationActive)
+  const canFinalize = Boolean(session && organization?.can_organize && !isBusy && !isNotionSettingsBusy && !isOrganizationActive)
   const finalizeButtonLabel = getFinalizeButtonLabel(organization)
   const statusLabel = organization?.label ?? "未開始"
   const eligibleSessionCount = sessions.filter((item) => item.organization.can_organize).length
@@ -491,7 +512,7 @@ function App() {
   }
 
   async function createSession() {
-    if (isBusy || isOrganizationActive || personalizationLoading || personalizationSaving) {
+    if (isBusy || isNotionSettingsBusy || isOrganizationActive || personalizationLoading || personalizationSaving) {
       return
     }
 
@@ -521,12 +542,13 @@ function App() {
 
   async function submitMessage(overrideContent?: string) {
     const content = (overrideContent ?? input).trim()
-    if (!content || isBusy || isOrganizationActive || hasAttachmentError) {
+    if (!content || isBusy || isNotionSettingsBusy || isOrganizationActive || hasAttachmentError) {
       return
     }
 
     const requestId = createRequestId()
     const requestFullArchiveReview = fullArchiveReview && canReviewFullArchive
+    const requestNotionReference = notionReference
     const attachmentPayloads = attachments.filter((attachment) => attachment.status === "ready").map(attachmentToPayload)
     activeRequestIdRef.current = requestId
     setActiveRequestId(requestId)
@@ -553,6 +575,7 @@ function App() {
         requestId,
         attachmentPayloads,
         requestFullArchiveReview,
+        requestNotionReference,
         (delta) => {
           if (activeRequestIdRef.current !== requestId) {
             return
@@ -568,24 +591,31 @@ function App() {
       const memoryContext = result.assistant ? result.memory_context : null
       const memoryCandidates = result.assistant ? result.memory_candidates ?? [] : []
       const memoryOpened = result.assistant ? result.memory_opened ?? [] : []
-      setMessages(attachMemoryContextToLatestAssistant(result.messages, memoryContext, memoryCandidates, memoryOpened))
+      const notionContext = result.notion_context
+      const savedAssistantNotionContext = notionContextForSavedAssistant(Boolean(result.assistant), notionContext)
+      setMessages(attachContextToLatestAssistant(result.messages, memoryContext, memoryCandidates, memoryOpened, savedAssistantNotionContext))
       setPendingUserMessage(null)
       clearStreamingAssistant()
       setAttachments([])
       setLastMemoryContext(memoryContext)
       setLastMemoryCandidates(memoryCandidates)
       setLastMemoryOpened(memoryOpened)
+      setLastNotionContext(notionContext)
+      if (notionContext?.requested) {
+        setNotionSettings(null)
+      }
       const attachmentNotice = formatAttachmentResultNotice(result.attachments)
+      const notionNotice = formatNotionResultNotice(notionContext)
       if (result.cancelled) {
         setReplyState("stopped")
-        setNotice(compactNotice("返答生成を停止しました。ユーザー発言は live JSONL に保存されています。", attachmentNotice))
+        setNotice(compactNotice(compactNotice("返答生成を停止しました。ユーザー発言は live JSONL に保存されています。", attachmentNotice), notionNotice))
       } else if (result.error) {
         setReplyState("failed")
         setError(withNextAction(result.error))
-        setNotice(compactNotice("返答生成に失敗しました。", attachmentNotice))
+        setNotice(compactNotice(compactNotice("返答生成に失敗しました。", attachmentNotice), notionNotice))
       } else {
         setReplyState("completed")
-        setNotice(compactNotice(result.assistant ? "返答を保存しました。" : "入力を保存しました。", attachmentNotice))
+        setNotice(compactNotice(compactNotice(result.assistant ? "返答を保存しました。" : "入力を保存しました。", attachmentNotice), notionNotice))
       }
       await refreshSessionsAfterAction()
     } catch (err) {
@@ -634,7 +664,7 @@ function App() {
   }
 
   async function loadSession(sessionId: string) {
-    if (isBusy || isOrganizationActive || personalizationLoading || personalizationSaving) {
+    if (isBusy || isNotionSettingsBusy || isOrganizationActive || personalizationLoading || personalizationSaving) {
       return
     }
 
@@ -929,6 +959,57 @@ function App() {
     }
   }
 
+  async function openNotionSettings() {
+    if (isBusy) {
+      return
+    }
+    setManagementExpanded(true)
+    setViewMode("notion")
+    if (!notionSettings && !notionLoading) {
+      await refreshNotionConfiguration(false)
+    }
+  }
+
+  async function refreshNotionConfiguration(checkConnection = true) {
+    if (isBusy || notionLoading || notionSaving) {
+      return
+    }
+    setNotionLoading(true)
+    setNotionSettingsError(null)
+    setNotionSettingsNotice(null)
+    try {
+      const result = await getNotionSettings(checkConnection)
+      setNotionSettings(result)
+      setNotionTargets(result.targets.map((target) => ({ ...target })))
+      if (checkConnection) {
+        setNotionSettingsNotice(result.connection.connected ? "Notion接続と共有対象一覧を更新しました。" : null)
+      }
+    } catch (err) {
+      setNotionSettingsError(formatError(err))
+    } finally {
+      setNotionLoading(false)
+    }
+  }
+
+  async function saveNotionConfiguration() {
+    if (isBusy || notionLoading || notionSaving) {
+      return
+    }
+    setNotionSaving(true)
+    setNotionSettingsError(null)
+    setNotionSettingsNotice(null)
+    try {
+      const result = await updateNotionSettings(notionTargets)
+      setNotionSettings(result)
+      setNotionTargets(result.targets.map((target) => ({ ...target })))
+      setNotionSettingsNotice("Notion allowlistを保存しました。")
+    } catch (err) {
+      setNotionSettingsError(formatError(err))
+    } finally {
+      setNotionSaving(false)
+    }
+  }
+
   async function savePersonalization() {
     if (!personalizationDraft || personalizationSaving || personalizationLoading) {
       return
@@ -1219,13 +1300,13 @@ function App() {
         </div>
 
         <div className="space-y-2 border-b border-border p-3">
-          <Button className="w-full justify-start" variant="secondary" onClick={createSession} disabled={isBusy || isOrganizationActive || personalizationLoading || personalizationSaving}>
+          <Button className="w-full justify-start" variant="secondary" onClick={createSession} disabled={isBusy || isNotionSettingsBusy || isOrganizationActive || personalizationLoading || personalizationSaving}>
             <MessageSquarePlus className="h-4 w-4" />
             新規チャット
           </Button>
           <Button
             className="w-full justify-start"
-            variant={viewMode === "data" || viewMode === "organize" || viewMode === "import" || viewMode === "personalization" ? "secondary" : "ghost"}
+            variant={viewMode === "data" || viewMode === "organize" || viewMode === "import" || viewMode === "personalization" || viewMode === "notion" ? "secondary" : "ghost"}
             onClick={() => setManagementExpanded((current) => !current)}
           >
             <Settings className="h-4 w-4" />
@@ -1244,6 +1325,15 @@ function App() {
               >
                 <Brain className="h-4 w-4" />
                 パーソナライズ
+              </Button>
+              <Button
+                className="w-full justify-start"
+                variant={viewMode === "notion" ? "secondary" : "ghost"}
+                onClick={() => void openNotionSettings()}
+                disabled={isBusy || notionLoading || notionSaving}
+              >
+                <BookOpen className="h-4 w-4" />
+                Notion連携
               </Button>
               <Button
                 className="w-full justify-start"
@@ -1303,7 +1393,7 @@ function App() {
                     session?.session_id === item.session_id && "border-primary bg-primary/10",
                   )}
                   onClick={() => void loadSession(item.session_id)}
-                  disabled={isBusy || isOrganizationActive || personalizationLoading || personalizationSaving}
+                  disabled={isBusy || isNotionSettingsBusy || isOrganizationActive || personalizationLoading || personalizationSaving}
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0 flex-1">
@@ -1327,10 +1417,10 @@ function App() {
         <header className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold">
-              {viewMode === "personalization" ? "パーソナライズと記憶" : viewMode === "data" ? "ローカルデータ管理" : viewMode === "organize" ? "データ整理" : viewMode === "import" ? "ChatGPTエクスポートを取り込む" : sessionTitle}
+              {viewMode === "personalization" ? "パーソナライズと記憶" : viewMode === "notion" ? "Notion読み取り設定" : viewMode === "data" ? "ローカルデータ管理" : viewMode === "organize" ? "データ整理" : viewMode === "import" ? "ChatGPTエクスポートを取り込む" : sessionTitle}
             </div>
             <div className="truncate text-xs text-muted-foreground">
-              {viewMode === "personalization" ? personalizationSettingsFile : viewMode === "data" || viewMode === "organize" || viewMode === "import" ? (localDataReport?.root ?? "AI-LifeOS root") : (session?.jsonl_file ?? "inbox/live")}
+              {viewMode === "personalization" ? personalizationSettingsFile : viewMode === "notion" ? (notionSettings?.settings_file ?? "config/notion_settings.json") : viewMode === "data" || viewMode === "organize" || viewMode === "import" ? (localDataReport?.root ?? "AI-LifeOS root") : (session?.jsonl_file ?? "inbox/live")}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -1340,6 +1430,14 @@ function App() {
                 <Button variant="outline" onClick={() => void refreshPersonalization()} disabled={personalizationLoading || personalizationSaving}>
                   <RefreshCw className={cn("h-4 w-4", personalizationLoading && "animate-spin")} />
                   更新
+                </Button>
+              </>
+            ) : viewMode === "notion" ? (
+              <>
+                <Badge variant="secondary">読み取り専用</Badge>
+                <Button variant="outline" onClick={() => void refreshNotionConfiguration(true)} disabled={isBusy || notionLoading || notionSaving}>
+                  <RefreshCw className={cn("h-4 w-4", notionLoading && "animate-spin")} />
+                  接続確認
                 </Button>
               </>
             ) : viewMode === "data" ? (
@@ -1401,6 +1499,22 @@ function App() {
             onSave={() => void savePersonalization()}
             onSaveSession={() => void saveSessionPersonalization()}
             onRefresh={() => void refreshPersonalization()}
+          />
+        ) : viewMode === "notion" ? (
+          <NotionSettingsScreen
+            settings={notionSettings}
+            targets={notionTargets}
+            loading={notionLoading}
+            saving={notionSaving}
+            disabled={isBusy}
+            error={notionSettingsError}
+            notice={notionSettingsNotice}
+            onTargetsChange={(targets) => {
+              setNotionTargets(targets)
+              setNotionSettingsNotice(null)
+            }}
+            onRefresh={() => void refreshNotionConfiguration(true)}
+            onSave={() => void saveNotionConfiguration()}
           />
         ) : viewMode === "data" ? (
           <DataManagementScreen report={localDataReport} loading={localDataLoading} onRefresh={refreshLocalDataReport} onOpenFolder={openDataFolder} />
@@ -1468,6 +1582,7 @@ function App() {
               className="mt-2"
             />
           )}
+          {lastNotionContext && <NotionContextDetails context={lastNotionContext} className="mt-2" />}
         </div>
 
         <div ref={viewportRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
@@ -1519,13 +1634,29 @@ function App() {
               ))}
             </div>
           )}
+          <div className="mx-auto mb-2 flex max-w-4xl justify-end">
+            <label
+              className="flex h-9 cursor-pointer items-center gap-2 rounded-md border border-input bg-background px-3 text-xs"
+              title="ONの送信だけ許可したNotion targetを読み取り、取得本文をCodexの回答生成へ一時的に渡します"
+            >
+              <input
+                type="checkbox"
+                checked={notionReference}
+                disabled={isBusy || isNotionSettingsBusy || isOrganizationActive}
+                onChange={(event) => setNotionReference(event.target.checked)}
+                className="h-4 w-4 shrink-0 accent-primary"
+              />
+              <BookOpen className="h-3.5 w-3.5" />
+              <span>Notionを参照する</span>
+            </label>
+          </div>
           <div className="mx-auto flex max-w-4xl items-end gap-3">
             <Button
               type="button"
               size="icon"
               variant="outline"
               onClick={() => fileInputRef.current?.click()}
-              disabled={isBusy || isFinalizeActive || attachments.length >= MAX_ATTACHMENTS}
+              disabled={isBusy || isNotionSettingsBusy || isFinalizeActive || attachments.length >= MAX_ATTACHMENTS}
               title="ファイル添付"
             >
               <Paperclip className="h-4 w-4" />
@@ -1644,6 +1775,9 @@ function MessageBubble({
               compact
               className="mt-3"
             />
+          )}
+          {!isUser && message.notion_context && (
+            <NotionContextDetails context={message.notion_context} compact className="mt-3" />
           )}
         </div>
         <div className={cn("mt-1 text-xs text-muted-foreground", isUser ? "text-right" : "text-left")}>
@@ -1994,6 +2128,201 @@ function ChatGptImportScreen({
             </section>
           </>
         )}
+      </div>
+    </div>
+  )
+}
+
+function NotionSettingsScreen({
+  settings,
+  targets,
+  loading,
+  saving,
+  disabled,
+  error,
+  notice,
+  onTargetsChange,
+  onRefresh,
+  onSave,
+}: {
+  settings: NotionSettingsResult | null
+  targets: NotionTargetSettings[]
+  loading: boolean
+  saving: boolean
+  disabled: boolean
+  error: string | null
+  notice: string | null
+  onTargetsChange: (targets: NotionTargetSettings[]) => void
+  onRefresh: () => void
+  onSave: () => void
+}) {
+  const connection = settings?.connection
+  const enabledCount = targets.filter((target) => target.enabled).length
+
+  function updateTarget(id: string, update: Partial<NotionTargetSettings>) {
+    onTargetsChange(targets.map((target) => target.id === id ? { ...target, ...update } : target))
+  }
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5" aria-busy={loading || saving}>
+      <div className="mx-auto max-w-5xl space-y-4">
+        <section className="rounded-md border border-border p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2 text-sm font-semibold">
+                <BookOpen className="h-4 w-4" />
+                接続と権限
+              </div>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
+                Notion公式APIを読み取り専用integrationで利用します。tokenはWindows Credential Managerだけに保存し、この画面や設定JSONへは保存しません。
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Badge variant={connection?.connected ? "secondary" : "outline"}>
+                {notionConnectionStatusLabel(connection)}
+              </Badge>
+              {connection && <Badge variant="outline">API {connection.api_version}</Badge>}
+            </div>
+          </div>
+          <pre className="mt-4 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 text-xs leading-5">{`python scripts\\notion_integration.py credential set
+python scripts\\notion_integration.py connection`}</pre>
+          <div className="mt-2 text-xs leading-5 text-muted-foreground">
+            Notion側ではRead contentだけを有効にし、対象ページ／data sourceの「Add connections」から共有してください。token更新後は「接続・対象一覧を更新」を実行します。
+          </div>
+          {connection?.error && (
+            <div role="alert" className="mt-3 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{connection.error}</span>
+            </div>
+          )}
+          {error && (
+            <div role="alert" className="mt-3 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+          {notice && (
+            <div role="status" aria-live="polite" className="mt-3 flex items-start gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-sm text-foreground">
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+              <span>{notice}</span>
+            </div>
+          )}
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+            <div className="text-xs text-muted-foreground">検索は名前一覧の更新時だけ行い、回答時は有効allowlistのtargetだけを取得します。</div>
+            <Button type="button" variant="outline" onClick={onRefresh} disabled={disabled || loading || saving}>
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              接続・対象一覧を更新
+            </Button>
+          </div>
+        </section>
+
+        <section className="rounded-md border border-border p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold">参照allowlist</div>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
+                ONにしたtargetだけが回答時の取得対象です。権限喪失・削除済み・一覧にないtargetは有効化できません。
+              </p>
+            </div>
+            <Badge variant="secondary">有効 {enabledCount} / {targets.length}</Badge>
+          </div>
+
+          {loading && targets.length === 0 ? (
+            <div className="mt-4 flex items-center justify-center gap-2 rounded-md border border-dashed border-border px-3 py-8 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Notion対象を確認しています。
+            </div>
+          ) : targets.length === 0 ? (
+            <div className="mt-4 rounded-md border border-dashed border-border px-3 py-8 text-center text-sm text-muted-foreground">
+              接続確認後、integrationへ共有されたページ／data sourceがここに表示されます。
+            </div>
+          ) : (
+            <div className="mt-4 space-y-3">
+              {targets.map((target) => (
+                <div key={target.id} className={cn("rounded-md border border-border p-3", target.available === false && "bg-muted/40")}>
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <label className="flex min-w-0 flex-1 cursor-pointer items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={target.enabled}
+                        disabled={disabled || loading || saving || (target.available === false && !target.enabled)}
+                        onChange={(event) => updateTarget(target.id, { enabled: event.target.checked })}
+                        className="mt-1 h-4 w-4 shrink-0 accent-primary"
+                      />
+                      <span className="min-w-0">
+                        <span className="block break-words text-sm font-medium">{target.notion_title || target.display_name || "Untitled"}</span>
+                        <span className="mt-1 block break-all font-mono text-[11px] text-muted-foreground">{target.object_type} / {target.id}</span>
+                      </span>
+                    </label>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge variant={target.available === false ? "outline" : "secondary"}>
+                        {target.available === false ? "現在取得不可" : target.available === true ? "取得可能" : "未確認"}
+                      </Badge>
+                      <Badge variant="outline">{notionTargetStatusLabel(target.last_status)}</Badge>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid gap-3 md:grid-cols-2">
+                    <label className="text-xs font-medium">
+                      表示名
+                      <input
+                        type="text"
+                        value={target.display_name}
+                        maxLength={200}
+                        disabled={disabled || loading || saving}
+                        onChange={(event) => updateTarget(target.id, { display_name: event.target.value })}
+                        className="mt-1 h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      />
+                    </label>
+                    <label className="text-xs font-medium">
+                      用途メモ
+                      <input
+                        type="text"
+                        value={target.purpose}
+                        maxLength={500}
+                        disabled={disabled || loading || saving}
+                        placeholder="例: 仕事の仕様、読書メモ"
+                        onChange={(event) => updateTarget(target.id, { purpose: event.target.value })}
+                        className="mt-1 h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      />
+                    </label>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                    <a href={target.url} target="_blank" rel="noreferrer" className="break-all underline underline-offset-2">Notionで確認</a>
+                    <span>最終取得: {target.last_fetched_at ? formatDateTime(target.last_fetched_at) : "未取得"}</span>
+                    {target.last_error && <span className="text-destructive">{target.last_error}</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+            <div className="text-xs text-muted-foreground">保存先: {settings?.settings_file ?? "config/notion_settings.json"}（Git管理外）</div>
+            <Button
+              type="button"
+              onClick={onSave}
+              disabled={disabled || loading || saving || (enabledCount > 0 && !connection?.credential_present)}
+              title={enabledCount > 0 && !connection?.credential_present ? "tokenがない場合は全targetをOFFにするとローカル設定を保存できます" : undefined}
+            >
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+              allowlistを保存
+            </Button>
+          </div>
+        </section>
+
+        <section className="rounded-md border border-border p-4 text-sm">
+          <div className="font-semibold">保存境界</div>
+          <div className="mt-3 grid gap-3 md:grid-cols-3">
+            <div className="rounded-md bg-muted/40 p-3"><div className="font-medium">取得本文</div><div className="mt-1 text-xs leading-5 text-muted-foreground">回答生成のためCodexへ渡し、ローカルでは処理中だけ保持します。memory / journal / index / cacheへは保存しません。</div></div>
+            <div className="rounded-md bg-muted/40 p-3"><div className="font-medium">取得元metadata</div><div className="mt-1 text-xs leading-5 text-muted-foreground">許可targetと最終取得状態だけをGit管理外設定へ保存します。</div></div>
+            <div className="rounded-md bg-muted/40 p-3"><div className="font-medium">assistant回答</div><div className="mt-1 text-xs leading-5 text-muted-foreground">通常どおりlive会話ログへ残ります。短い要約や出典リンクを含む場合があります。</div></div>
+          </div>
+          {settings && (
+            <div className="mt-3 text-xs text-muted-foreground">
+              1回答: target最大{settings.limits.max_targets_per_request}件 / 本文最大{settings.limits.max_total_chars.toLocaleString()}字 / 全体timeout {settings.limits.total_timeout_seconds}秒 / キャッシュなし
+            </div>
+          )}
+        </section>
       </div>
     </div>
   )
@@ -2422,6 +2751,51 @@ function DataMetric({ icon, label, value }: { icon: ReactNode; label: string; va
   )
 }
 
+function NotionContextDetails({
+  context,
+  compact = false,
+  className,
+}: {
+  context: NotionContextSummary
+  compact?: boolean
+  className?: string
+}) {
+  const label = context.used
+    ? `Notion参照: ${context.status === "partial" ? "一部成功" : "成功"} (${context.sources.length}件)`
+    : "Notion参照: 失敗"
+  return (
+    <details className={cn("rounded-md border border-border bg-muted/50 px-3 py-2 text-xs text-muted-foreground", compact && "bg-background/60", className)}>
+      <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2">
+        <BookOpen className={cn("h-3.5 w-3.5", context.used ? "text-primary" : "text-destructive")} />
+        <span className={cn("font-medium", context.used ? "text-foreground" : "text-destructive")}>{label}</span>
+        {context.fetched_at && <span>{formatDateTime(context.fetched_at)}</span>}
+      </summary>
+      <div className="mt-2 space-y-2">
+        {context.error && <div className="rounded-md border border-destructive/30 bg-destructive/5 p-2 text-destructive">{context.error}</div>}
+        {context.sources.length === 0 ? (
+          <div>Notion本文は今回の回答生成へ渡していません。</div>
+        ) : (
+          <div className="space-y-2">
+            <div className="font-medium text-foreground">今回の回答生成へ渡した許可済みNotion出典</div>
+            {context.sources.slice(0, 10).map((source) => (
+              <div key={`${source.allowed_target_id}:${source.id}`} className="rounded-md border border-border/70 bg-background/60 p-2">
+                <a href={source.url} target="_blank" rel="noreferrer" className="break-words font-medium text-foreground underline underline-offset-2">{source.title}</a>
+                <div className="mt-1 flex flex-wrap gap-2">
+                  <span>{source.object_type}</span>
+                  <span>allowlist: {source.allowed_target_title}</span>
+                  <span>{formatDateTime(source.fetched_at)}</span>
+                </div>
+              </div>
+            ))}
+            {context.sources.length > 10 && <div>他{context.sources.length - 10}件</div>}
+          </div>
+        )}
+        <div className="border-t border-border/70 pt-2">取得本文はローカル保存しません。生成に成功したassistant回答だけが通常の会話ログへ残ります。</div>
+      </div>
+    </details>
+  )
+}
+
 function MemoryContextDetails({
   context,
   candidates = [],
@@ -2777,13 +3151,14 @@ function renderInline(text: string) {
   return nodes
 }
 
-function attachMemoryContextToLatestAssistant(
+function attachContextToLatestAssistant(
   messages: ChatMessage[],
   context: MemoryContextSummary | null,
   candidates: MemoryContextReference[] = [],
   opened: MemoryContextReference[] = [],
+  notionContext: NotionContextSummary | null = null,
 ) {
-  if (!context && candidates.length === 0 && opened.length === 0) {
+  if (!context && candidates.length === 0 && opened.length === 0 && !notionContext) {
     return messages
   }
 
@@ -2793,6 +3168,7 @@ function attachMemoryContextToLatestAssistant(
       next[index].memory_context = context ?? undefined
       next[index].memory_candidates = candidates
       next[index].memory_opened = opened
+      next[index].notion_context = notionContext ?? undefined
       break
     }
   }
@@ -2962,6 +3338,37 @@ function formatImportDate(value: string | null) {
     month: "2-digit",
     day: "2-digit",
   }).format(date)
+}
+
+function formatNotionResultNotice(context: NotionContextSummary | null) {
+  if (!context?.requested) {
+    return ""
+  }
+  if (!context.used) {
+    return `Notionを参照できませんでした: ${context.error ?? "取得失敗"} Notion本文は回答生成へ渡していません。`
+  }
+  if (context.status === "partial") {
+    return `Notionは一部だけ参照できました（${context.sources.length}件）。${context.error ?? ""}`.trim()
+  }
+  return `Notion ${context.sources.length}件を一時参照しました。`
+}
+
+function notionConnectionStatusLabel(connection: NotionSettingsResult["connection"] | undefined) {
+  if (!connection) return "未確認"
+  if (connection.status === "connected") return "API接続・共有一覧取得済み"
+  if (connection.status === "connection_error") return "接続失敗"
+  if (connection.status === "credential_error") return "資格情報の確認失敗"
+  if (connection.status === "credential_missing") return "token未登録"
+  if (connection.status === "credential_ready") return "token登録済み・API未確認"
+  return "未確認"
+}
+
+function notionTargetStatusLabel(status: NotionTargetSettings["last_status"]) {
+  if (status === "ok") return "最終取得成功"
+  if (status === "partial") return "最終取得一部成功"
+  if (status === "error") return "最終取得失敗"
+  if (status === "unavailable") return "未取得"
+  return "取得履歴なし"
 }
 
 function chatGptImportStateLabel(state: ChatGptImportConversation["import_state"]) {

@@ -330,6 +330,35 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn("User:\nLatest", prompt)
         self.assertIn("Do not edit files", prompt)
 
+    def test_build_codex_chat_prompt_separates_ephemeral_notion_context_from_memory(self):
+        messages = [create_live_message("user", "Notionの仕様を確認して")]
+
+        prompt = codex_conversation.build_codex_chat_prompt(
+            messages,
+            notion_context=(
+                "[Allowed Notion source]\n"
+                "Title: Product spec\n"
+                "URL: https://www.notion.so/product\n"
+                "Content:\nPRIVATE_NOTION_PROMPT_BODY"
+            ),
+        )
+
+        self.assertIn("Notion-grounding rules:", prompt)
+        self.assertIn("untrusted evidence", prompt)
+        self.assertIn("enabled allowlist", prompt)
+        self.assertIn("fetched body is ephemeral", prompt)
+        self.assertIn("PRIVATE_NOTION_PROMPT_BODY", prompt)
+        self.assertNotIn("Memory Context:", prompt)
+
+    def test_build_codex_chat_prompt_omits_notion_section_when_disabled(self):
+        prompt = codex_conversation.build_codex_chat_prompt(
+            [create_live_message("user", "local only")],
+            notion_context="",
+        )
+
+        self.assertNotIn("Notion-grounding rules:", prompt)
+        self.assertNotIn("Notion Context:", prompt)
+
     def test_parser_defaults_to_no_fast_mode_or_service_tier(self):
         args = codex_conversation.build_parser().parse_args([])
 

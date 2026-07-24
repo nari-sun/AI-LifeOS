@@ -35,6 +35,12 @@ from import_chatgpt_export import (
 from live_session import ROOT, LiveMessage, LiveSession, create_live_message, create_live_session
 from local_data_report import build_local_data_report
 from memory_index import inspect_index_health, rebuild_index
+from notion_integration import (
+    NotionContextResult,
+    get_notion_settings_view,
+    retrieve_notion_context,
+    update_notion_allowlist,
+)
 from kokoro_tts import (
     DEFAULT_VOICE,
     KokoroSynthesisCancelled,
@@ -111,6 +117,9 @@ def handle_send_message(
     full_archive_review = payload.get("full_archive_review", False)
     if not isinstance(full_archive_review, bool):
         raise ValueError("full_archive_review は true または false で指定してください。")
+    notion_reference = payload.get("notion_reference", False)
+    if not isinstance(notion_reference, bool):
+        raise ValueError("notion_reference は true または false で指定してください。")
 
     session_file = _resolve_or_create_session(root=root, value=payload.get("session_file"))
     request_id = _optional_request_id(payload.get("request_id"))
@@ -145,11 +154,40 @@ def handle_send_message(
     memory_context = None
     memory_candidates: tuple[MemoryContextReference, ...] = ()
     memory_opened: tuple[MemoryContextReference, ...] = ()
+    notion_context_result: NotionContextResult | None = None
     error = None
     cancelled = False
     if not bool(payload.get("no_ai", False)):
         try:
             run_command = _cancelable_run_command(root=root, cancel_file=cancel_file) if cancel_file else subprocess.run
+            if notion_reference:
+                try:
+                    notion_context_result = retrieve_notion_context(
+                        root,
+                        content,
+                        is_cancelled=(lambda: bool(cancel_file and cancel_file.exists())),
+                    )
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    notion_context_result = NotionContextResult(
+                        requested=True,
+                        used=False,
+                        status="error",
+                        fetched_at=None,
+                        error="Notion参照処理で予期しないエラーが発生しました。ローカル情報だけで回答します。",
+                    )
+                    _gui_log(
+                        root,
+                        "send_message.notion_context_unexpected "
+                        f"session={session_file.stem} type={type(exc).__name__}",
+                    )
+                _gui_log(
+                    root,
+                    "send_message.notion_context "
+                    f"session={session_file.stem} status={notion_context_result.status} "
+                    f"used={notion_context_result.used} sources={len(notion_context_result.sources)}",
+                )
             generation_messages = _messages_for_generation(messages, user_message, prompt_user_content)
             generation_options = {
                 "root": root,
@@ -165,6 +203,7 @@ def handle_send_message(
                 "force_full_archive_review": full_archive_review,
                 "project_scope": personalization.project_scope,
                 "exclude_live_session": session_file,
+                "notion_context": notion_context_result.context_text if notion_context_result else "",
             }
             if on_delta is None:
                 reply_result = generate_assistant_reply_with_context(
@@ -237,6 +276,7 @@ def handle_send_message(
         "memory_context": _serialize_memory_context(memory_context),
         "memory_candidates": [_serialize_memory_reference(reference) for reference in memory_candidates],
         "memory_opened": [_serialize_memory_reference(reference) for reference in memory_opened],
+        "notion_context": _serialize_notion_context(notion_context_result),
         "attachments": [_serialize_attachment_report(attachment) for attachment in attachments],
         "error": error,
         "cancelled": cancelled,
@@ -482,6 +522,32 @@ def handle_get_memory_summary(payload: dict[str, Any]) -> dict[str, Any]:
         f"sections={len(summary['sections'])} structured_items={len(summary['structured_items'])}",
     )
     return {"summary": summary}
+
+
+def handle_get_notion_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    refresh = payload.get("refresh", False)
+    if not isinstance(refresh, bool):
+        raise ValueError("refresh は true または false で指定してください。")
+    result = get_notion_settings_view(root, refresh=refresh)
+    _gui_log(
+        root,
+        "notion_settings.get "
+        f"refresh={refresh} status={result['connection']['status']} targets={len(result['targets'])}",
+    )
+    return result
+
+
+def handle_update_notion_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    root = _payload_root(payload)
+    result = update_notion_allowlist(root, payload.get("targets"))
+    _gui_log(
+        root,
+        "notion_settings.update "
+        f"status={result['connection']['status']} targets={len(result['targets'])} "
+        f"enabled={sum(1 for item in result['targets'] if item['enabled'])}",
+    )
+    return result
 
 
 def handle_finalize_session(payload: dict[str, Any]) -> dict[str, Any]:
@@ -866,6 +932,8 @@ COMMANDS = {
     "get-personalization": handle_get_personalization,
     "update-personalization": handle_update_personalization,
     "get-memory-summary": handle_get_memory_summary,
+    "get-notion-settings": handle_get_notion_settings,
+    "update-notion-settings": handle_update_notion_settings,
     "finalize-session": handle_finalize_session,
     "local-data-report": handle_local_data_report,
     "open-local-data-folder": handle_open_local_data_folder,
@@ -2657,6 +2725,30 @@ def _serialize_resume_session(session: Any, root: Path) -> dict[str, Any]:
         "last_user_at": session.last_user_at.isoformat(timespec="seconds"),
         "organization": _serialize_organization(root=root, session_file=session.jsonl_file),
         "personalization": serialize_personalization(load_session_personalization(root, session.jsonl_file)),
+    }
+
+
+def _serialize_notion_context(context: NotionContextResult | None) -> dict[str, Any] | None:
+    if context is None:
+        return None
+    return {
+        "requested": context.requested,
+        "used": context.used,
+        "status": context.status,
+        "fetched_at": context.fetched_at,
+        "error": context.error,
+        "sources": [
+            {
+                "id": source.id,
+                "object_type": source.object_type,
+                "title": source.title,
+                "url": source.url,
+                "allowed_target_id": source.allowed_target_id,
+                "allowed_target_title": source.allowed_target_title,
+                "fetched_at": source.fetched_at,
+            }
+            for source in context.sources
+        ],
     }
 
 

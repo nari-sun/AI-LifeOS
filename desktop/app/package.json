@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build --configLoader runner",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "preview": "vite preview",
     "bundle": "npm run build && tauri build",

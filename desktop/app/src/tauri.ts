@@ -8,6 +8,8 @@ import type {
   ListResumableResult,
   LocalDataReportResult,
   MemorySummaryResult,
+  NotionSettingsResult,
+  NotionTargetSettings,
   OrganizeSessionsJobResult,
   PersonalizationResult,
   PersonalizationSettings,
@@ -94,6 +96,7 @@ export async function sendMessage(
   requestId: string,
   attachments: AttachmentPayload[] = [],
   fullArchiveReview = false,
+  notionReference = false,
 ) {
   return invoke<SendMessageResult>("send_message", {
     payload: {
@@ -103,6 +106,7 @@ export async function sendMessage(
       request_id: requestId,
       attachments,
       full_archive_review: fullArchiveReview,
+      notion_reference: notionReference,
     },
   })
 }
@@ -113,6 +117,7 @@ export async function sendMessageStream(
   requestId: string,
   attachments: AttachmentPayload[] = [],
   fullArchiveReview: boolean,
+  notionReference: boolean,
   onDelta: (delta: string) => void,
 ) {
   const onEvent = new Channel<AssistantStreamEvent>()
@@ -129,6 +134,7 @@ export async function sendMessageStream(
       request_id: requestId,
       attachments,
       full_archive_review: fullArchiveReview,
+      notion_reference: notionReference,
     },
     onEvent,
   })
@@ -192,6 +198,26 @@ export async function updatePersonalization(
 
 export async function getMemorySummary() {
   return invoke<MemorySummaryResult>("get_memory_summary", { payload: defaultPayload })
+}
+
+export async function getNotionSettings(refresh = false) {
+  return invoke<NotionSettingsResult>("get_notion_settings", {
+    payload: { refresh },
+  })
+}
+
+export async function updateNotionSettings(targets: NotionTargetSettings[]) {
+  return invoke<NotionSettingsResult>("update_notion_settings", {
+    payload: {
+      targets: targets.map((target) => ({
+        id: target.id,
+        object_type: target.object_type,
+        enabled: target.enabled,
+        display_name: target.display_name,
+        purpose: target.purpose,
+      })),
+    },
+  })
 }
 
 export async function finalizeSession(sessionFile: string) {

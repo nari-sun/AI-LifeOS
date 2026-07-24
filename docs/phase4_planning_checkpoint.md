@@ -20,6 +20,20 @@ Phase3.6 は、検索・記憶取得が一通り動いた後に、Phase4のMCP�
 
 これらは個人情報が多いため、最初から自動保存しません。読み取り範囲、保存範囲、確認ステップを設計してから扱います。
 
+## Phase4.0で実装したNotion境界
+
+RT-0024でNotionの読み取り専用チャット連携を追加しました。ローカルMemory MCPとは統合せず、公式Notion REST APIを使う外部参照adapterとして分離しています。
+
+* 回答ごとのチェックは既定OFF。OFFではNotion接続処理を呼ばない。
+* tokenはWindows Credential Manager、allowlistはGit管理外の`config/notion_settings.json`に保存する。
+* allowlistで有効なpage / data sourceだけを都度取得し、本文cacheを作らない。
+* 取得本文はローカル保存しないが、回答生成のためCodexへ一時contextとして渡す。
+* 取得本文をmemory / journal / indexへ自動保存しない。
+* 権限喪失、削除、失敗時は古い内容へfallbackせず、GUIへ失敗を示す。
+* create / update / delete endpointをadapterから呼べないことをテストする。
+
+詳細は [notion_read_only_integration.md](notion_read_only_integration.md) を参照してください。
+
 ## Phase3との境界
 
 Phase3:

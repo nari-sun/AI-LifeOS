@@ -20,7 +20,7 @@ python scripts\privacy_check.py --publish
 
 AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、後から検索・要約・日記・長期メモリとして活用するための個人用AI記憶システムです。
 
-現在は Phase3.10 までの実装が入っています。Phase2.6 の live conversation、Phase2.65 の Session Save / Resume、Phase2.7 の Tauri 2 + React GUI、Phase3 の検索・読み取り専用Memory MCP・パーソナライズ管理を、OpenAI API 直叩きや `.env` 前提なしで動かす方針です。
+現在は Phase4.0 のNotion読み取り専用チャット連携まで実装が入っています。Phase2.6 の live conversation、Phase2.65 の Session Save / Resume、Phase2.7 の Tauri 2 + React GUI、Phase3 の検索・読み取り専用Memory MCP・パーソナライズ管理、Phase4.0の許可制外部参照を、OpenAI API 直叩きや `.env` 前提なしで動かす方針です。
 
 運用の中心は、ローカルの Markdown / JSONL / SQLite、Codex CLI、Git です。ChatGPT公式Webや公式デスクトップアプリのスクレイピング、外部ベクトルDB、クラウド同期はまだ扱いません。
 
@@ -39,6 +39,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - Phase2.65: `.session.json` によるセッション保存、期限なしの resume、参照用 prune を実装済み
 - Phase2.7: Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の Chat GUI MVP を実装済み
 - Phase3.0〜3.10: Markdown/SQLite検索、stale fallback、回答用memory context、読み取り専用Memory MCP、軽量ハイブリッド検索、パーソナライズ管理を実装済み
+- Phase4.0: 回答単位で明示したときだけ、Git管理外allowlist内のNotion page / data sourceを読み取り専用で一時参照するChat GUI連携を実装済み
 - 構造化メモリ: 動的カテゴリ、出典、状態、タグを持つ`memory/items/*.md`の整理時保存・検索を実装済み
 
 ## できること
@@ -57,6 +58,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - 私的な質問や好みに関係する会話では、`memory/long_term.md`、`memory/preferences.md`、`memory/projects.md` を読み取り専用コンテキストとして回答に渡す
 - 過去会話をCodexが読み取り専用Memory MCPで検索語を変えながら反復検索し、一次発言を開いて確認する
 - 長期memoryと過去チャット検索を独立してON/OFFし、全体既定値と現在セッションのproject scope・一時チャットを分けてGUIで管理する
+- Chat GUIからNotion参照を回答単位でON/OFFし、専用設定画面で接続状態、許可page / data source、表示名、用途、最終取得状態を管理する。tokenはWindows Credential Managerに置き、取得本文はローカル保存せずCodexの回答生成へ一時contextとして渡す
 - ChatGPT exportのフォルダ、zip、`conversations.json`、または分割された `conversations-*.json` をdry-run確認し、新規・更新revisionを選択してraw.mdへ取り込む。GUIでは取り込み後に検索indexも再構築する
 - `python -m unittest` で Python 側の保存・再開・GUIブリッジ処理をテストする
 
@@ -80,7 +82,8 @@ Phase3.7 : Retrieval Correctness
 Phase3.8 : Read-only Memory MCP
 Phase3.9 : Hybrid Local Retrieval
 Phase3.10: Personalization Controls
-Phase4   : External Tool Integration
+Phase4.0 : Notion Read-only Chat Integration
+Phase4   : External Tool Integration (continued)
 Phase5   : Life Improvement Agent
 Phase6   : Daily Automation
 ```
@@ -126,6 +129,7 @@ AI-LifeOS/
 │  ├─ live_session.py
 │  ├─ session_store.py
 │  ├─ chat_gui_bridge.py
+│  ├─ notion_integration.py
 │  ├─ kokoro_tts.py
 │  ├─ chat_gui_task.ps1
 │  ├─ memory_index.py
@@ -143,6 +147,7 @@ AI-LifeOS/
 │  ├─ file_attachments_mvp.md
 │  ├─ local_data_management.md
 │  ├─ chatgpt_export_import.md
+│  ├─ notion_read_only_integration.md
 │  ├─ phase4_tool_integration_design.md
 │  ├─ searchable_memory.md
 │  ├─ response_settings_ui.md
@@ -160,6 +165,7 @@ AI-LifeOS/
 │  └─ latest_codex_task.md
 └─ tests/
    ├─ test_chat_gui_bridge.py
+   ├─ test_notion_integration.py
    ├─ test_codex_conversation.py
    ├─ test_finalize_live_chat.py
    ├─ test_live_session.py

@@ -7,6 +7,7 @@ export interface ChatMessage {
   memory_context?: MemoryContextSummary | null
   memory_candidates?: MemoryContextReference[]
   memory_opened?: MemoryContextReference[]
+  notion_context?: NotionContextSummary | null
 }
 
 export interface ReadAloudResult {
@@ -66,6 +67,74 @@ export interface MemoryContextSummary {
   reference_count: number
   references: MemoryContextReference[]
   retrieval_health: RetrievalHealth
+}
+
+export interface NotionSourceReference {
+  id: string
+  object_type: "page" | "data_source"
+  title: string
+  url: string
+  allowed_target_id: string
+  allowed_target_title: string
+  fetched_at: string
+}
+
+export interface NotionContextSummary {
+  requested: boolean
+  used: boolean
+  status: "ok" | "partial" | "error"
+  fetched_at: string | null
+  sources: NotionSourceReference[]
+  error: string | null
+}
+
+export interface NotionConnectionState {
+  credential_present: boolean
+  connected: boolean
+  status: "not_checked" | "credential_ready" | "credential_missing" | "credential_error" | "connected" | "connection_error"
+  error: string | null
+  api_version: string
+}
+
+export interface NotionTargetSettings {
+  id: string
+  object_type: "page" | "data_source"
+  enabled: boolean
+  display_name: string
+  notion_title: string
+  purpose: string
+  url: string
+  available: boolean | null
+  in_trash: boolean
+  last_fetched_at: string | null
+  last_status: "never" | "ok" | "partial" | "error" | "unavailable"
+  last_error: string | null
+}
+
+export interface NotionLimits {
+  max_targets_per_request: number
+  max_database_rows: number
+  max_database_pages: number
+  max_chars_per_target: number
+  max_total_chars: number
+  max_block_depth: number
+  max_api_requests: number
+  timeout_seconds: number
+  total_timeout_seconds: number
+}
+
+export interface NotionSettingsResult {
+  ok: boolean
+  settings_file: string
+  connection: NotionConnectionState
+  targets: NotionTargetSettings[]
+  limits: NotionLimits
+  storage_policy: {
+    credential: string
+    allowlist: string
+    fetched_body: "ephemeral_only"
+    assistant_reply: "saved_in_live_conversation"
+  }
 }
 
 export interface RetrievalHealth {
@@ -205,6 +274,7 @@ export interface SendMessageResult {
   memory_context: MemoryContextSummary | null
   memory_candidates: MemoryContextReference[]
   memory_opened: MemoryContextReference[]
+  notion_context: NotionContextSummary | null
   attachments: AttachmentResult[]
   error: string | null
   cancelled: boolean

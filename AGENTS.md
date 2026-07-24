@@ -8,7 +8,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 
 ## Current Status
 
-現在は Phase3.10 まで実装済みです。次は Phase4.0 として、ローカル記憶用の読み取り専用MCPとは分けて、外部ツール連携の範囲を決めます。
+現在は Phase4.0 のNotion読み取り専用チャット連携まで実装済みです。その他の外部ツール連携は、ローカル記憶用の読み取り専用MCPとは分けて個別に範囲を決めます。
 
 実装済みの主要範囲:
 
@@ -18,6 +18,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 * Phase2.65: `.session.json` によるセッション保存、期限なしの resume、参照用 prune
 * Phase2.7: Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の Chat GUI MVP
 * Phase3: Markdown/SQLite検索、stale index fallback、回答用memory context、読み取り専用Memory MCP、軽量ハイブリッド検索、パーソナライズ管理
+* Phase4.0: 回答単位の明示ON、Git管理外allowlist、Windows Credential Managerを使うNotion読み取り専用チャット連携
 
 詳細なフェーズ履歴は [docs/phases.md](docs/phases.md) を参照してください。
 
@@ -193,6 +194,7 @@ AI-LifeOS/
 * [docs/phase4_planning_checkpoint.md](docs/phase4_planning_checkpoint.md): Phase3.6 Phase4引き継ぎ
 * [docs/memory_mcp.md](docs/memory_mcp.md): Phase3.8 Read-only Memory MCP
 * [docs/personalization.md](docs/personalization.md): Phase3.10 パーソナライズ管理
+* [docs/notion_read_only_integration.md](docs/notion_read_only_integration.md): Phase4.0 Notion読み取り専用チャット連携
 
 ## Development Style
 
