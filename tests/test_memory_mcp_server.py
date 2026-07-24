@@ -129,17 +129,85 @@ class MemoryMCPServerTests(unittest.TestCase):
         )
         return root
 
-    def test_tool_catalog_is_read_only_and_has_four_tools(self):
+    def test_tool_catalog_is_read_only_and_has_full_review_tools(self):
         names = {tool["name"] for tool in memory_mcp_server.TOOLS}
 
         self.assertEqual(
-            {"search_past_chats", "open_conversation", "get_personal_memory", "get_index_health"},
+            {
+                "search_past_chats",
+                "open_conversation",
+                "list_past_chat_sources",
+                "read_past_chat_page",
+                "get_personal_memory",
+                "get_index_health",
+            },
             names,
         )
         for tool in memory_mcp_server.TOOLS:
             self.assertTrue(tool["annotations"]["readOnlyHint"])
             self.assertFalse(tool["annotations"]["destructiveHint"])
             self.assertFalse(tool["annotations"]["openWorldHint"])
+
+    def test_full_archive_review_lists_and_reads_every_archived_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            tools = memory_mcp_server.MemoryTools(root)
+
+            sources = []
+            cursor = 0
+            while True:
+                inventory = tools.list_past_chat_sources({"cursor": cursor, "limit": 1})
+                self.assertEqual(3, inventory["total_source_count"])
+                self.assertEqual(0, inventory["unreadable_source_count"])
+                sources.extend(inventory["sources"])
+                if inventory["next_cursor"] is None:
+                    break
+                cursor = inventory["next_cursor"]
+
+            self.assertEqual(3, len(sources))
+            self.assertEqual(3, len({source["path"] for source in sources}))
+            for source in sources:
+                parts = []
+                page_cursor = 0
+                while True:
+                    page = tools.read_past_chat_page(
+                        {
+                            "reference": source["reference"],
+                            "cursor": page_cursor,
+                            "max_chars": 200,
+                        }
+                    )
+                    self.assertEqual(page_cursor, page["cursor"])
+                    parts.append(page["content"])
+                    if page["next_cursor"] is None:
+                        break
+                    page_cursor = page["next_cursor"]
+
+                combined = "".join(parts)
+                if source["document_type"] == "raw":
+                    expected = (root / Path(source["path"])).read_text(encoding="utf-8")
+                    self.assertEqual(expected, combined)
+                else:
+                    self.assertIn("ALPHA_LIVE_SEARCH_TOKEN", combined)
+
+    def test_full_archive_review_scope_is_applied_before_listing_and_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            tools = memory_mcp_server.MemoryTools(root)
+
+            inventory = tools.list_past_chat_sources({"project_scope": "Project-Alpha"})
+
+            self.assertEqual(2, inventory["total_source_count"])
+            for source in inventory["sources"]:
+                page = tools.read_past_chat_page(
+                    {
+                        "reference": source["reference"],
+                        "project_scope": "Project-Alpha",
+                        "max_chars": 200,
+                    }
+                )
+                serialized = json.dumps(page, ensure_ascii=False)
+                self.assertNotIn("Project-Beta", serialized)
 
     def test_search_filters_user_role_and_returns_openable_reference(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -640,9 +708,11 @@ class MemoryMCPServerTests(unittest.TestCase):
                     "scope": "live",
                 }
             )
+            inventory = tools.list_past_chat_sources({})
 
             self.assertEqual(0, result["result_count"])
             self.assertEqual(0, health["unorganized_live_file_count"])
+            self.assertFalse(any(source["path"].startswith("inbox/live/") for source in inventory["sources"]))
             with self.assertRaises(memory_mcp_server.ToolExecutionError):
                 tools.open_conversation(
                     {
@@ -675,6 +745,11 @@ class MemoryMCPServerTests(unittest.TestCase):
                     "max_chars": 500,
                 }
             )
+            inventory = tools.list_past_chat_sources({})
+            if inventory["sources"]:
+                tools.read_past_chat_page(
+                    {"reference": inventory["sources"][0]["reference"], "max_chars": 200}
+                )
             tools.get_personal_memory({"scope": "all", "max_chars": 1_000})
             tools.get_index_health({})
 
@@ -730,7 +805,7 @@ class MemoryMCPServerTests(unittest.TestCase):
             responses = [json.loads(line) for line in completed.stdout.splitlines()]
             self.assertEqual([1, 2, 3, 4], [response["id"] for response in responses])
             self.assertEqual(memory_mcp_server.CURRENT_PROTOCOL_VERSION, responses[0]["result"]["protocolVersion"])
-            self.assertEqual(4, len(responses[1]["result"]["tools"]))
+            self.assertEqual(6, len(responses[1]["result"]["tools"]))
             self.assertFalse(responses[2]["result"]["isError"])
             self.assertFalse(responses[3]["result"]["isError"])
             self.assertEqual("", completed.stderr)

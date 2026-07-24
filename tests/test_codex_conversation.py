@@ -466,7 +466,98 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn("search_past_chats", prompt)
         self.assertIn("zero-result first search is not proof", prompt)
         self.assertIn("open_conversation", prompt)
+        self.assertIn("Do not describe the search index as broken", prompt)
+        self.assertIn("If the reported status is fresh or ready", prompt)
         self.assertIn("Never use these tools to write", prompt)
+
+    def test_full_archive_review_prompt_requires_paged_coverage(self):
+        prompt = codex_conversation.build_codex_chat_prompt(
+            [create_live_message("user", "過去の会話を全部見てから答えて")],
+            memory_tools_enabled=True,
+            full_archive_review=True,
+        )
+
+        self.assertIn("Full archive review is explicitly required", prompt)
+        self.assertIn("list_past_chat_sources", prompt)
+        self.assertIn("read_past_chat_page", prompt)
+        self.assertIn("every listed source was fully read", prompt)
+        self.assertTrue(codex_conversation._requests_full_archive_review("過去の会話を全部見て"))
+        self.assertTrue(codex_conversation._requests_full_archive_review("review all past chats"))
+        self.assertFalse(codex_conversation._requests_full_archive_review("前の会話を一つ探して"))
+
+    def test_archive_review_status_requires_every_source_to_be_paged_to_eof(self):
+        complete = codex_conversation.MemoryMCPTrace(
+            archive_total_source_count=2,
+            archive_listed_paths=(
+                "conversations/2099/01/a/raw.md",
+                "conversations/2099/01/b/raw.md",
+            ),
+            archive_listing_complete=True,
+            archive_read_pages=(
+                ("conversations/2099/01/a/raw.md", 0, 10, 10),
+                ("conversations/2099/01/b/raw.md", 0, 4, 9),
+                ("conversations/2099/01/b/raw.md", 4, 9, 9),
+            ),
+        )
+        incomplete = codex_conversation.MemoryMCPTrace(
+            archive_total_source_count=2,
+            archive_listed_paths=complete.archive_listed_paths,
+            archive_listing_complete=True,
+            archive_read_pages=(("conversations/2099/01/a/raw.md", 0, 10, 10),),
+        )
+
+        complete_status = codex_conversation._archive_review_status(complete)
+        incomplete_status = codex_conversation._archive_review_status(incomplete)
+        self.assertTrue(complete_status.complete)
+        self.assertEqual(2, complete_status.reviewed_source_count)
+        self.assertFalse(incomplete_status.complete)
+        self.assertEqual(1, incomplete_status.reviewed_source_count)
+
+    def test_archive_review_trace_extracts_mcp_inventory_and_pages(self):
+        source_path = "conversations/2099/01/2099-01-02_030405/raw.md"
+        inventory_item = {
+            "type": "mcpToolCall",
+            "server": codex_conversation.MEMORY_MCP_SERVER_NAME,
+            "tool": "list_past_chat_sources",
+            "status": "completed",
+            "result": {
+                "structuredContent": {
+                    "total_source_count": 1,
+                    "unreadable_source_count": 0,
+                    "next_cursor": None,
+                    "sources": [{"path": source_path}],
+                }
+            },
+        }
+        page_item = {
+            "type": "mcp_tool_call",
+            "server": codex_conversation.MEMORY_MCP_SERVER_NAME,
+            "tool": "read_past_chat_page",
+            "status": "completed",
+            "result": {
+                "structured_content": {
+                    "source": {
+                        "path": source_path,
+                        "document_type": "raw",
+                        "title": "Synthetic",
+                        "date": "2099-01-02",
+                    },
+                    "cursor": 0,
+                    "total_chars": 12,
+                    "next_cursor": None,
+                    "content": "SYNTHETIC",
+                }
+            },
+        }
+
+        trace = codex_conversation._merge_memory_mcp_traces(
+            [
+                codex_conversation._memory_trace_from_mcp_item(inventory_item),
+                codex_conversation._memory_trace_from_mcp_item(page_item),
+            ]
+        )
+
+        self.assertTrue(codex_conversation._archive_review_status(trace).complete)
 
     def test_generate_assistant_reply_reads_codex_output_file(self):
         calls = []
@@ -506,12 +597,51 @@ class CodexConversationTests(unittest.TestCase):
         self.assertTrue(any("memory_mcp_server.py" in value for value in command))
         self.assertIn(
             'mcp_servers.ai_lifeos_memory.enabled_tools=["search_past_chats", "open_conversation", '
-            '"get_personal_memory", "get_index_health"]',
+            '"list_past_chat_sources", "read_past_chat_page", "get_personal_memory", "get_index_health"]',
             command,
         )
         self.assertIn("--sandbox", command)
         self.assertEqual("read-only", command[command.index("--sandbox") + 1])
         self.assertIn("User:\nHello", calls[0][1]["input"])
+
+    def test_full_archive_request_replaces_an_unverified_reply_with_incomplete_status(self):
+        self.mock_mcp_inventory_reader.return_value = (codex_conversation.MEMORY_MCP_SERVER_NAME,)
+
+        def fake_run(command, **kwargs):
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("全履歴を確認しました。", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = codex_conversation.generate_assistant_reply_with_context(
+                root=Path(temp_dir),
+                messages=[create_live_message("user", "過去の会話を全部見てから答えて")],
+                run_command=fake_run,
+            )
+
+        self.assertIn("全件確認を完了できませんでした", result.reply)
+        self.assertNotIn("全履歴を確認しました", result.reply)
+
+    def test_forced_full_archive_review_does_not_depend_on_message_wording(self):
+        self.mock_mcp_inventory_reader.return_value = (codex_conversation.MEMORY_MCP_SERVER_NAME,)
+        prompts = []
+
+        def fake_run(command, **kwargs):
+            prompts.append(kwargs["input"])
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("回答です。", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = codex_conversation.generate_assistant_reply_with_context(
+                root=Path(temp_dir),
+                messages=[create_live_message("user", "傾向を教えて")],
+                force_full_archive_review=True,
+                run_command=fake_run,
+            )
+
+        self.assertIn("Full archive review is explicitly required", prompts[0])
+        self.assertIn("全件確認を完了できませんでした", result.reply)
 
     def test_generate_assistant_reply_can_disable_memory_mcp(self):
         calls = []
@@ -812,6 +942,19 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn("mcp_servers.ai_lifeos_memory.enabled=false", commands[0])
         self.assertNotIn("mcp_servers.ai_lifeos_memory.enabled=true", commands[0])
         self.assertTrue(any(request.get("method") == "mcpServerStatus/list" for request in process.requests))
+
+    def test_streaming_full_archive_request_replaces_unverified_reply(self):
+        process = FakeAppServerProcess(mcp_inventory=memory_mcp_inventory())
+
+        result = codex_conversation.generate_assistant_reply_streaming_with_context(
+            root=ROOT,
+            messages=[create_live_message("user", "傾向を教えて")],
+            on_delta=lambda _: None,
+            force_full_archive_review=True,
+            popen=lambda *args, **kwargs: process,
+        )
+
+        self.assertIn("全件確認を完了できませんでした", result.reply)
 
     def test_streaming_starts_app_server_before_building_memory_context(self):
         process = FakeAppServerProcess(mcp_inventory=memory_mcp_inventory())

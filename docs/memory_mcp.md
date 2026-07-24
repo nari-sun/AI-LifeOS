@@ -59,10 +59,12 @@ Codex の TUI では `/mcp` で接続状態とツールを確認できます。M
 |---|---|---|
 | `search_past_chats` | 確定済み会話と未整理 live JSONL を検索する | `query`, `role`, `scope`, `path`, `project_scope`, `limit` |
 | `open_conversation` | 検索結果の一次出典を発言単位で開く | `reference`, `around_message`, `max_chars` |
+| `list_past_chat_sources` | 全件確認の対象となる確定済み raw 会話と未整理 live 会話をページング列挙する | `cursor`, `limit`, `project_scope` |
+| `read_past_chat_page` | 全件確認用に会話本文を連続ページで読む | `reference`, `cursor`, `max_chars`, `project_scope` |
 | `get_personal_memory` | 長期記憶・好み・プロジェクト・構造化項目を読む | `scope`, `project_scope`, `max_chars` |
 | `get_index_health` | SQLite index の欠損・旧形式・stale を確認する | なし |
 
-全ツールは MCP annotation で `readOnlyHint=true`、`destructiveHint=false`、`openWorldHint=false` を宣言します。同じ stdio セッションで `tools/call` を何度でも処理するため、一つの回答中に検索語を変えて再検索できます。
+全ツールは MCP annotation で `readOnlyHint=true`、`destructiveHint=false`、`openWorldHint=false` を宣言します。同じ stdio セッションで `tools/call` を何度でも処理するため、一つの回答中に検索語を変えて再検索したり、全件確認のページを最後まで読み進めたりできます。
 
 ### `search_past_chats`
 
@@ -93,6 +95,12 @@ live JSONLは、対応する`.session.json`に`personalization.project_scope`が
 `reference` に含まれる message 番号、または `around_message` を中心として、時系列を保った bounded window を返します。`max_chars` は 200〜50,000 文字です。確定済み会話は `raw.md` / `summary.md`、live は `.jsonl` だけを開けます。
 
 active project scope設定中は、検索結果を経由せずpathを直接指定してもscope検証を省略できません。session header/sidecarがscope所属なら通常のbounded windowを返します。明示的なsession所属がなく発言本文だけが一致した場合は一致発言だけを返し、別scopeの隣接発言をwindowへ混ぜません。
+
+### 明示的な全件確認
+
+ユーザーが「過去の会話を全部見て」「全件確認して」のように明示した場合、会話アシスタントは通常の上位候補検索だけで回答しません。`list_past_chat_sources` を `next_cursor` がなくなるまで呼び、返されたすべての確定済み raw 会話と対象となる未整理 live 会話を `read_past_chat_page` の `next_cursor` がなくなるまで順番に読みます。各ページは連続した文字位置を返すため、長い会話も途中で省略せず確認できます。
+
+実行後は、実際のMCP呼び出しから対象件数と本文を末尾まで読めた件数を検証します。対象すべてを読み切れなかった場合、アシスタントの通常回答は「全件確認を完了できませんでした」に置き換えられ、全履歴についての結論を述べません。全件確認には時間がかかることがあります。現在の live セッションと一時・記憶除外セッションは、従来どおり対象外です。
 
 ### `get_personal_memory`
 
@@ -141,7 +149,7 @@ python -m unittest tests.test_memory_mcp_server -v
 python scripts\memory_mcp_server.py --help
 ```
 
-テストは、role filter、live 検索、一時・記憶除外・現在回答中liveの非公開、immutable project scope、core memoryの節/行抽出、raw headerとlive sidecarによる所属、scope/roleのranking前filter、別発言の非公開、出典open、path traversal、index stale/legacy/parser version判定、個人ファイルとindexの非変更、同一stdioセッションでの反復tool callを確認します。
+テストは、role filter、live 検索、一時・記憶除外・現在回答中liveの非公開、immutable project scope、core memoryの節/行抽出、raw headerとlive sidecarによる所属、scope/roleのranking前filter、別発言の非公開、出典open、全件確認の列挙と連続ページ読込、path traversal、index stale/legacy/parser version判定、個人ファイルとindexの非変更、同一stdioセッションでの反復tool callを確認します。
 
 参考仕様:
 

@@ -172,6 +172,7 @@ function App() {
   const [pendingUserMessage, setPendingUserMessage] = useState<PendingUserMessage | null>(null)
   const [streamingAssistant, setStreamingAssistant] = useState<ChatMessage | null>(null)
   const [attachments, setAttachments] = useState<AttachmentDraft[]>([])
+  const [fullArchiveReview, setFullArchiveReview] = useState(false)
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null)
   const [finalizeJob, setFinalizeJob] = useState<FinalizeJob | null>(null)
   const [organizeSessionsJob, setOrganizeSessionsJob] = useState<OrganizeSessionsJob | null>(null)
@@ -208,6 +209,7 @@ function App() {
     personalizationRequestRef.current += 1
     sessionRef.current = next
     setSession(next)
+    setFullArchiveReview(false)
     setPersonalizationLoading(false)
     setPersonalizationSaving(false)
   }
@@ -266,6 +268,7 @@ function App() {
   const isOrganizationActive = isFinalizeActive || isOrganizeSessionsActive
   const isGenerating = busy === "generating" || busy === "stopping"
   const hasAttachmentError = attachments.some((attachment) => attachment.status === "error")
+  const canReviewFullArchive = Boolean(session?.personalization.past_chat_search_enabled)
   const canSend = input.trim().length > 0 && !isBusy && !isOrganizationActive && !hasAttachmentError
   const canStop = busy === "generating" && activeRequestId !== null
   const canRestoreInput = lastSubmittedText.trim().length > 0 && !isBusy
@@ -523,6 +526,7 @@ function App() {
     }
 
     const requestId = createRequestId()
+    const requestFullArchiveReview = fullArchiveReview && canReviewFullArchive
     const attachmentPayloads = attachments.filter((attachment) => attachment.status === "ready").map(attachmentToPayload)
     activeRequestIdRef.current = requestId
     setActiveRequestId(requestId)
@@ -548,6 +552,7 @@ function App() {
         content,
         requestId,
         attachmentPayloads,
+        requestFullArchiveReview,
         (delta) => {
           if (activeRequestIdRef.current !== requestId) {
             return
@@ -1525,6 +1530,24 @@ function App() {
             >
               <Paperclip className="h-4 w-4" />
             </Button>
+            <label
+              className={cn(
+                "flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-md border border-input bg-background px-2 text-xs",
+                !canReviewFullArchive && "cursor-not-allowed opacity-50",
+              )}
+              title={canReviewFullArchive
+                ? "この送信では、対象となる過去の会話をすべて確認してから回答します"
+                : "パーソナライズ設定で過去チャット検索をONにすると利用できます"}
+            >
+              <input
+                type="checkbox"
+                checked={fullArchiveReview && canReviewFullArchive}
+                disabled={!canReviewFullArchive || isBusy || isOrganizationActive}
+                onChange={(event) => setFullArchiveReview(event.target.checked)}
+                className="h-4 w-4 shrink-0 accent-primary"
+              />
+              <span>全参照</span>
+            </label>
             <Textarea
               value={input}
               onChange={(event) => setInput(event.target.value)}

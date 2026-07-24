@@ -118,6 +118,7 @@ npm run bundle
 * GUI中に `memory/long_term.md` や `journal` を勝手に編集しない
 * memory / journal / summary 更新は「会話を整理して保存」操作で既存finalize処理に接続する
 * memory / journal / summary 更新は `gpt-5.6-terra` / `model_reasoning_effort="medium"` を使う
+* 入力欄横の「過去の会話をすべて参照」は送信単位の指定とし、ONの送信では対象となる過去チャットを全件ページングして確認する。指定自体は会話本文やlive JSONLへ追記せず、送信完了後にOFFへ戻す
 * モデル・応答設定UIは RT-0015 として保留し、方針は `docs/response_settings_ui.md` に分ける
 * 未実装の設定をGUIに出さない
 * Git commitはGUIから自動連発しない

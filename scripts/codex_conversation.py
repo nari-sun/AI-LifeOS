@@ -48,10 +48,17 @@ MEMORY_MCP_SERVER_NAME = "ai_lifeos_memory"
 MEMORY_MCP_TOOLS = (
     "search_past_chats",
     "open_conversation",
+    "list_past_chat_sources",
+    "read_past_chat_page",
     "get_personal_memory",
     "get_index_health",
 )
 MCP_SERVER_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+FULL_ARCHIVE_REVIEW_PATTERNS = (
+    re.compile(r"(?:全部|すべて|全て|全件).{0,16}(?:見(?:て|せ)|読(?:んで|み)|参照|確認)"),
+    re.compile(r"(?:過去|以前|これまで|全履歴|履歴|会話|記録|ログ).{0,24}(?:全部|すべて|全て|全件)"),
+    re.compile(r"\b(?:review|read|check)\s+(?:all|every)\s+(?:past\s+)?(?:chat|conversation|record)s?\b", re.IGNORECASE),
+)
 MCP_LIST_TIMEOUT_SECONDS = 10
 APP_SERVER_INTERRUPT_TIMEOUT_SECONDS = 5.0
 CODEX_TOOL_ISOLATION_CONFIG = (
@@ -94,6 +101,18 @@ class MemoryMCPTrace:
 
     candidates: tuple[MemoryContextReference, ...] = ()
     opened: tuple[MemoryContextReference, ...] = ()
+    archive_total_source_count: int | None = None
+    archive_unreadable_source_count: int = 0
+    archive_listed_paths: tuple[str, ...] = ()
+    archive_listing_complete: bool = False
+    archive_read_pages: tuple[tuple[str, int, int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class ArchiveReviewStatus:
+    complete: bool
+    reviewed_source_count: int
+    total_source_count: int | None
 
 
 class AppServerStreamingUnavailable(RuntimeError):
@@ -278,6 +297,7 @@ def build_codex_chat_prompt(
     memory_tools_enabled: bool = False,
     personal_memory_tool_enabled: bool = True,
     project_scope: str | None = None,
+    full_archive_review: bool = False,
 ) -> str:
     recent_messages = messages[-max(max_context_messages, 1) :]
     transcript_lines = []
@@ -320,9 +340,26 @@ def build_codex_chat_prompt(
                     "distinctive people/character names, or another faithful query variant, then inspect promising "
                     "sources with open_conversation.",
                     "- Use get_index_health when stale or incomplete indexing may explain missing results.",
+                    "- Do not describe the search index as broken, stale, unavailable, or using a Markdown fallback "
+                    "unless get_index_health or search_past_chats explicitly reports that state. If the reported "
+                    "status is fresh or ready, do not imply an index fault; say only that the searched records did "
+                    "or did not confirm the requested detail.",
                     "- Never use these tools to write, organize, or delete stored data.",
                 ]
             )
+            if full_archive_review:
+                lines.extend(
+                    [
+                        "- Full archive review is explicitly required for this request. Do not answer from only "
+                        "ranked search results or summaries.",
+                        "- Call list_past_chat_sources from cursor=0 until next_cursor is null. Then, for every "
+                        "returned source, call read_past_chat_page from cursor=0 and continue that source until "
+                        "next_cursor is null. Use the same project_scope on every call when one is active.",
+                        "- Do not claim that all past chats were reviewed unless every listed source was fully read. "
+                        "If a source or page cannot be read, say the review is incomplete and give the exact "
+                        "completed-source count instead of drawing an archive-wide conclusion.",
+                    ]
+                )
             if personal_memory_tool_enabled:
                 lines.append("- Use get_personal_memory only for stable preferences or projects.")
             if project_scope:
@@ -464,6 +501,13 @@ def _effective_memory_mcp_enabled(include_memory_context: bool, enable_memory_mc
     return include_memory_context if enable_memory_mcp is None else bool(enable_memory_mcp)
 
 
+def _requests_full_archive_review(question: str) -> bool:
+    """Return true only for an explicit request to inspect the whole chat archive."""
+
+    normalized = " ".join(question.split())
+    return bool(normalized) and any(pattern.search(normalized) for pattern in FULL_ARCHIVE_REVIEW_PATTERNS)
+
+
 def _validate_app_server_mcp_inventory(
     result: dict,
     *,
@@ -519,6 +563,7 @@ def generate_assistant_reply(
     enable_memory_mcp: bool | None = None,
     include_core_memory: bool = True,
     include_past_chats: bool = True,
+    force_full_archive_review: bool = False,
     project_scope: str | None = None,
     exclude_live_session: Path | str | None = None,
 ) -> str:
@@ -537,6 +582,7 @@ def generate_assistant_reply(
         enable_memory_mcp=enable_memory_mcp,
         include_core_memory=include_core_memory,
         include_past_chats=include_past_chats,
+        force_full_archive_review=force_full_archive_review,
         project_scope=project_scope,
         exclude_live_session=exclude_live_session,
         run_command=run_command,
@@ -560,6 +606,7 @@ def generate_assistant_reply_with_context(
     enable_memory_mcp: bool | None = None,
     include_core_memory: bool = True,
     include_past_chats: bool = True,
+    force_full_archive_review: bool = False,
     project_scope: str | None = None,
     exclude_live_session: Path | str | None = None,
 ) -> AssistantReplyResult:
@@ -569,9 +616,14 @@ def generate_assistant_reply_with_context(
     _debug_log(root, f"assistant_reply.start messages={len(messages)} sandbox={sandbox}")
     memory_context = ""
     memory_context_result: AnswerContext | None = None
+    recent_user_messages = _recent_user_contents(messages)
+    latest_user = recent_user_messages[-1] if recent_user_messages else ""
+    full_archive_review = bool(
+        memory_mcp_enabled
+        and include_past_chats
+        and (force_full_archive_review or _requests_full_archive_review(latest_user))
+    )
     if include_memory_context:
-        recent_user_messages = _recent_user_contents(messages)
-        latest_user = recent_user_messages[-1] if recent_user_messages else ""
         memory_context_result = build_answer_context(
             root=root,
             question=latest_user,
@@ -596,6 +648,7 @@ def generate_assistant_reply_with_context(
         memory_tools_enabled=memory_mcp_enabled,
         personal_memory_tool_enabled=include_core_memory,
         project_scope=project_scope,
+        full_archive_review=full_archive_review,
     )
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -673,6 +726,15 @@ def generate_assistant_reply_with_context(
         if memory_mcp_enabled
         else MemoryMCPTrace()
     )
+    if full_archive_review:
+        archive_status = _archive_review_status(mcp_trace)
+        if archive_status.complete:
+            reply = (
+                f"{reply.rstrip()}\n\n"
+                f"（全件確認済み: {archive_status.reviewed_source_count}/{archive_status.total_source_count}件）"
+            )
+        else:
+            reply = _incomplete_archive_review_reply(archive_status)
     memory_context_result = _merge_memory_tool_references(memory_context_result, mcp_trace.opened)
     _debug_log(
         root,
@@ -706,6 +768,7 @@ def generate_assistant_reply_streaming_with_context(
     enable_memory_mcp: bool | None = None,
     include_core_memory: bool = True,
     include_past_chats: bool = True,
+    force_full_archive_review: bool = False,
     project_scope: str | None = None,
     exclude_live_session: Path | str | None = None,
 ) -> AssistantReplyResult:
@@ -818,12 +881,18 @@ def generate_assistant_reply_streaming_with_context(
         # This removes an otherwise serial wait without changing the prompt or data flow.
         memory_context = ""
         memory_context_result: AnswerContext | None = None
+        recent_user_messages = _recent_user_contents(messages)
+        latest_user = recent_user_messages[-1] if recent_user_messages else ""
+        full_archive_review = bool(
+            memory_mcp_enabled
+            and include_past_chats
+            and (force_full_archive_review or _requests_full_archive_review(latest_user))
+        )
         memory_started_at = time.perf_counter()
         if include_memory_context:
-            recent_user_messages = _recent_user_contents(messages)
             memory_context_result = build_answer_context(
                 root=root,
-                question=recent_user_messages[-1] if recent_user_messages else "",
+                question=latest_user,
                 recent_user_messages=recent_user_messages,
                 include_core_memory=include_core_memory,
                 include_past_chats=include_past_chats,
@@ -846,6 +915,7 @@ def generate_assistant_reply_streaming_with_context(
             memory_tools_enabled=memory_mcp_enabled,
             personal_memory_tool_enabled=include_core_memory,
             project_scope=project_scope,
+            full_archive_review=full_archive_review,
         )
 
         send(
@@ -907,8 +977,7 @@ def generate_assistant_reply_streaming_with_context(
             raise AppServerStreamingUnavailable("Codex app-serverがturn idを返しませんでした。")
 
         final_reply = ""
-        mcp_candidates: list[MemoryContextReference] = []
-        mcp_opened: list[MemoryContextReference] = []
+        mcp_traces: list[MemoryMCPTrace] = []
         interrupt_sent = False
         interrupt_deadline: float | None = None
         first_delta_logged = False
@@ -954,8 +1023,7 @@ def generate_assistant_reply_streaming_with_context(
                     final_reply = str(item.get("text") or "")
                 else:
                     trace = _memory_trace_from_mcp_item(item)
-                    mcp_candidates.extend(trace.candidates)
-                    mcp_opened.extend(trace.opened)
+                    mcp_traces.append(trace)
             elif method == "turn/completed":
                 turn = params.get("turn") or {}
                 status = turn.get("status")
@@ -969,11 +1037,21 @@ def generate_assistant_reply_streaming_with_context(
                             final_reply = str(item.get("text") or "")
                         else:
                             trace = _memory_trace_from_mcp_item(item)
-                            mcp_candidates.extend(trace.candidates)
-                            mcp_opened.extend(trace.opened)
+                            mcp_traces.append(trace)
                 final_reply = final_reply.strip()
                 if not final_reply:
                     raise RuntimeError("Codex app-server completed but returned an empty assistant reply.")
+                mcp_trace = _merge_memory_mcp_traces(mcp_traces)
+                if full_archive_review:
+                    archive_status = _archive_review_status(mcp_trace)
+                    if archive_status.complete:
+                        final_reply = (
+                            f"{final_reply}\n\n"
+                            f"（全件確認済み: {archive_status.reviewed_source_count}/"
+                            f"{archive_status.total_source_count}件）"
+                        )
+                    else:
+                        final_reply = _incomplete_archive_review_reply(archive_status)
                 _debug_log(
                     root,
                     "assistant_reply.streaming_success "
@@ -982,21 +1060,20 @@ def generate_assistant_reply_streaming_with_context(
                 )
                 merged_context = _merge_memory_tool_references(
                     memory_context_result,
-                    _dedupe_memory_references(mcp_opened),
+                    mcp_trace.opened,
                 )
                 return AssistantReplyResult(
                     reply=final_reply,
                     memory_context=merged_context,
-                    memory_candidates=_dedupe_memory_references(mcp_candidates),
-                    memory_opened=_dedupe_memory_references(mcp_opened),
+                    memory_candidates=mcp_trace.candidates,
+                    memory_opened=mcp_trace.opened,
                 )
     finally:
         _terminate_process(process)
 
 
 def _memory_trace_from_exec_jsonl(output: str) -> MemoryMCPTrace:
-    candidates: list[MemoryContextReference] = []
-    opened: list[MemoryContextReference] = []
+    traces: list[MemoryMCPTrace] = []
     for line in output.splitlines():
         try:
             event = json.loads(line)
@@ -1006,12 +1083,79 @@ def _memory_trace_from_exec_jsonl(output: str) -> MemoryMCPTrace:
             continue
         item = event.get("item")
         if isinstance(item, dict):
-            trace = _memory_trace_from_mcp_item(item)
-            candidates.extend(trace.candidates)
-            opened.extend(trace.opened)
+            traces.append(_memory_trace_from_mcp_item(item))
+    return _merge_memory_mcp_traces(traces)
+
+
+def _merge_memory_mcp_traces(traces: list[MemoryMCPTrace]) -> MemoryMCPTrace:
+    candidates: list[MemoryContextReference] = []
+    opened: list[MemoryContextReference] = []
+    archive_total: int | None = None
+    archive_unreadable = 0
+    archive_paths: list[str] = []
+    archive_listing_complete = False
+    archive_pages: list[tuple[str, int, int, int]] = []
+    for trace in traces:
+        candidates.extend(trace.candidates)
+        opened.extend(trace.opened)
+        if trace.archive_total_source_count is not None:
+            archive_total = max(archive_total or 0, trace.archive_total_source_count)
+        archive_unreadable = max(archive_unreadable, trace.archive_unreadable_source_count)
+        archive_paths.extend(trace.archive_listed_paths)
+        archive_listing_complete = archive_listing_complete or trace.archive_listing_complete
+        archive_pages.extend(trace.archive_read_pages)
     return MemoryMCPTrace(
         candidates=_dedupe_memory_references(candidates),
         opened=_dedupe_memory_references(opened),
+        archive_total_source_count=archive_total,
+        archive_unreadable_source_count=archive_unreadable,
+        archive_listed_paths=tuple(dict.fromkeys(archive_paths)),
+        archive_listing_complete=archive_listing_complete,
+        archive_read_pages=tuple(dict.fromkeys(archive_pages)),
+    )
+
+
+def _archive_review_status(trace: MemoryMCPTrace) -> ArchiveReviewStatus:
+    """Verify that the model read every listed source from offset zero to EOF."""
+
+    total = trace.archive_total_source_count
+    if total is None or trace.archive_unreadable_source_count:
+        return ArchiveReviewStatus(False, 0, total)
+    listed = tuple(dict.fromkeys(trace.archive_listed_paths))
+    if not trace.archive_listing_complete or len(listed) != total:
+        return ArchiveReviewStatus(False, 0, total)
+
+    pages_by_path: dict[str, list[tuple[int, int, int]]] = {path: [] for path in listed}
+    for path, start, end, source_total in trace.archive_read_pages:
+        if path in pages_by_path and 0 <= start <= end <= source_total:
+            pages_by_path[path].append((start, end, source_total))
+
+    reviewed = 0
+    for path in listed:
+        pages = sorted(pages_by_path[path])
+        if not pages:
+            continue
+        total_chars = pages[0][2]
+        if any(page_total != total_chars for _, _, page_total in pages):
+            continue
+        covered_end = 0
+        for start, end, _ in pages:
+            if start > covered_end:
+                break
+            covered_end = max(covered_end, end)
+        else:
+            if covered_end == total_chars:
+                reviewed += 1
+
+    return ArchiveReviewStatus(reviewed == total, reviewed, total)
+
+
+def _incomplete_archive_review_reply(status: ArchiveReviewStatus) -> str:
+    total = "不明" if status.total_source_count is None else str(status.total_source_count)
+    return (
+        "全件確認を完了できませんでした。"
+        f"対象 {total} 件中、本文を末尾まで確認できたのは {status.reviewed_source_count} 件です。"
+        "そのため、過去会話全体についての結論は出しません。"
     )
 
 
@@ -1041,6 +1185,11 @@ def _memory_trace_from_mcp_item(item: dict) -> MemoryMCPTrace:
 
     tool = str(item.get("tool") or "")
     references: list[MemoryContextReference] = []
+    archive_total: int | None = None
+    archive_unreadable = 0
+    archive_paths: list[str] = []
+    archive_listing_complete = False
+    archive_pages: list[tuple[str, int, int, int]] = []
     if tool == "search_past_chats":
         for value in data.get("results") or []:
             if not isinstance(value, dict):
@@ -1057,6 +1206,42 @@ def _memory_trace_from_mcp_item(item: dict) -> MemoryMCPTrace:
                 score=value.get("score"),
                 speaker_role=source.get("role"),
                 message_number=source.get("message_number"),
+            )
+            if reference:
+                references.append(reference)
+    elif tool == "list_past_chat_sources":
+        total_value = data.get("total_source_count")
+        if isinstance(total_value, int) and total_value >= 0:
+            archive_total = total_value
+        unreadable_value = data.get("unreadable_source_count")
+        if isinstance(unreadable_value, int) and unreadable_value >= 0:
+            archive_unreadable = unreadable_value
+        for source in data.get("sources") or []:
+            if isinstance(source, dict) and isinstance(source.get("path"), str):
+                archive_paths.append(source["path"].replace("\\", "/"))
+        archive_listing_complete = "next_cursor" in data and data.get("next_cursor") is None
+    elif tool == "read_past_chat_page":
+        source = data.get("source") or {}
+        path = source.get("path") if isinstance(source, dict) else None
+        start = data.get("cursor")
+        total_chars = data.get("total_chars")
+        next_cursor = data.get("next_cursor")
+        if (
+            isinstance(path, str)
+            and isinstance(start, int)
+            and isinstance(total_chars, int)
+            and total_chars >= 0
+            and (isinstance(next_cursor, int) or next_cursor is None)
+        ):
+            end = total_chars if next_cursor is None else next_cursor
+            archive_pages.append((path.replace("\\", "/"), start, end, total_chars))
+            reference = _memory_reference(
+                path=path,
+                document_type=source.get("document_type"),
+                title=source.get("title"),
+                date=source.get("date"),
+                snippet=data.get("content"),
+                score=0,
             )
             if reference:
                 references.append(reference)
@@ -1110,7 +1295,14 @@ def _memory_trace_from_mcp_item(item: dict) -> MemoryMCPTrace:
     deduped = _dedupe_memory_references(references)
     if tool == "search_past_chats":
         return MemoryMCPTrace(candidates=deduped)
-    return MemoryMCPTrace(opened=deduped)
+    return MemoryMCPTrace(
+        opened=deduped,
+        archive_total_source_count=archive_total,
+        archive_unreadable_source_count=archive_unreadable,
+        archive_listed_paths=tuple(archive_paths),
+        archive_listing_complete=archive_listing_complete,
+        archive_read_pages=tuple(archive_pages),
+    )
 
 
 def _memory_references_from_mcp_item(item: dict) -> tuple[MemoryContextReference, ...]:
