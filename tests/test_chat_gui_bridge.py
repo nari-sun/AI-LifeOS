@@ -468,10 +468,49 @@ class ChatGuiBridgeTests(unittest.TestCase):
             records = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(records[0]["content"], "first message")
 
+    def test_send_message_forwards_full_archive_review_without_changing_saved_content(self):
+        captured = {}
+
+        def fake_generate(**kwargs):
+            captured.update(kwargs)
+            return codex_conversation.AssistantReplyResult(reply="確認しました。", memory_context=None)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with mock.patch.object(chat_gui_bridge, "generate_assistant_reply_with_context", side_effect=fake_generate):
+                result = chat_gui_bridge.handle_send_message(
+                    {
+                        "root": str(root),
+                        "content": "傾向を教えて",
+                        "full_archive_review": True,
+                    }
+                )
+
+            session_path = root / result["session"]["jsonl_file"]
+            records = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(captured["force_full_archive_review"])
+            self.assertEqual("傾向を教えて", records[0]["content"])
+
+    def test_send_message_rejects_non_boolean_full_archive_review(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with self.assertRaisesRegex(ValueError, "full_archive_review"):
+                chat_gui_bridge.handle_send_message(
+                    {
+                        "root": str(root),
+                        "content": "hello",
+                        "full_archive_review": "true",
+                    }
+                )
+
+            self.assertFalse((root / "inbox" / "live").exists())
+
     def test_streaming_send_emits_deltas_and_saves_only_completed_reply(self):
         original = chat_gui_bridge.generate_assistant_reply_streaming_with_context
+        captured = {}
 
         def fake_stream(root, messages, on_delta, **kwargs):
+            captured.update(kwargs)
             on_delta("途中")
             on_delta("返答")
             return codex_conversation.AssistantReplyResult(reply="確定返答", memory_context=None)
@@ -482,7 +521,12 @@ class ChatGuiBridgeTests(unittest.TestCase):
             chat_gui_bridge.generate_assistant_reply_streaming_with_context = fake_stream
             try:
                 result = chat_gui_bridge.handle_send_message(
-                    {"root": str(root), "content": "hello", "request_id": "stream-test"},
+                    {
+                        "root": str(root),
+                        "content": "hello",
+                        "request_id": "stream-test",
+                        "full_archive_review": True,
+                    },
                     on_delta=deltas.append,
                 )
             finally:
@@ -491,6 +535,7 @@ class ChatGuiBridgeTests(unittest.TestCase):
             session_path = root / result["session"]["jsonl_file"]
             records = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(["途中", "返答"], deltas)
+            self.assertTrue(captured["force_full_archive_review"])
             self.assertEqual(["user", "assistant"], [record["role"] for record in records])
             self.assertEqual("確定返答", records[1]["content"])
 

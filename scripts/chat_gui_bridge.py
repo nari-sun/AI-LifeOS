@@ -108,6 +108,9 @@ def handle_send_message(
     content = str(payload.get("content", "")).strip()
     if not content:
         raise ValueError("送信するメッセージが空です。")
+    full_archive_review = payload.get("full_archive_review", False)
+    if not isinstance(full_archive_review, bool):
+        raise ValueError("full_archive_review は true または false で指定してください。")
 
     session_file = _resolve_or_create_session(root=root, value=payload.get("session_file"))
     request_id = _optional_request_id(payload.get("request_id"))
@@ -159,6 +162,7 @@ def handle_send_message(
                 "enable_memory_mcp": personalization.past_chat_search_enabled,
                 "include_core_memory": personalization.memory_enabled,
                 "include_past_chats": personalization.past_chat_search_enabled,
+                "force_full_archive_review": full_archive_review,
                 "project_scope": personalization.project_scope,
                 "exclude_live_session": session_file,
             }

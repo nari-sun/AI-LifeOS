@@ -36,7 +36,7 @@ from personalization_settings import (
 
 
 SERVER_NAME = "ai-lifeos-memory"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 CURRENT_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = {
     CURRENT_PROTOCOL_VERSION,
@@ -48,6 +48,8 @@ SUPPORTED_PROTOCOL_VERSIONS = {
 DEFAULT_SEARCH_LIMIT = 8
 MAX_SEARCH_LIMIT = 20
 MAX_SEARCH_CANDIDATES = 1000
+DEFAULT_ARCHIVE_PAGE_SIZE = 12
+MAX_ARCHIVE_PAGE_SIZE = 50
 DEFAULT_CONTENT_CHARS = 12_000
 MIN_CONTENT_CHARS = 200
 MAX_CONTENT_CHARS = 50_000
@@ -155,6 +157,81 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "annotations": READ_ONLY_ANNOTATIONS,
     },
     {
+        "name": "list_past_chat_sources",
+        "title": "List every archived chat for a full archive review",
+        "description": (
+            "Return a deterministic, paginated inventory of every readable finalized raw conversation and "
+            "eligible unorganized live conversation. "
+            "Use this only when the user explicitly asks to review all past chats. Continue until "
+            "next_cursor is null, then read every returned source with read_past_chat_page."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cursor": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Zero-based page offset returned by the prior call.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_ARCHIVE_PAGE_SIZE,
+                    "default": DEFAULT_ARCHIVE_PAGE_SIZE,
+                },
+                "project_scope": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_PROJECT_SCOPE_CHARS,
+                    "description": "Optional immutable project boundary, applied before pagination.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        "annotations": READ_ONLY_ANNOTATIONS,
+    },
+    {
+        "name": "read_past_chat_page",
+        "title": "Read one page of an archived chat for a full archive review",
+        "description": (
+            "Read a deterministic character page from a conversation returned by "
+            "list_past_chat_sources. Repeat with next_cursor until it is null before treating that "
+            "conversation as fully reviewed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "A conversation reference returned by list_past_chat_sources.",
+                },
+                "cursor": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Character offset returned as next_cursor by the prior page.",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": MIN_CONTENT_CHARS,
+                    "maximum": MAX_CONTENT_CHARS,
+                    "default": DEFAULT_CONTENT_CHARS,
+                },
+                "project_scope": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_PROJECT_SCOPE_CHARS,
+                    "description": "Repeat the scope used when listing the source inventory.",
+                },
+            },
+            "required": ["reference"],
+            "additionalProperties": False,
+        },
+        "annotations": READ_ONLY_ANNOTATIONS,
+    },
+    {
         "name": "get_personal_memory",
         "title": "Read personal memory",
         "description": (
@@ -211,7 +288,7 @@ class ToolExecutionError(RuntimeError):
 
 
 class MemoryTools:
-    """Read-only implementations of the four MCP tools."""
+    """Read-only implementations of the AI-LifeOS memory MCP tools."""
 
     def __init__(
         self,
@@ -242,6 +319,8 @@ class MemoryTools:
         handlers = {
             "search_past_chats": self.search_past_chats,
             "open_conversation": self.open_conversation,
+            "list_past_chat_sources": self.list_past_chat_sources,
+            "read_past_chat_page": self.read_past_chat_page,
             "get_personal_memory": self.get_personal_memory,
             "get_index_health": self.get_index_health,
         }
@@ -346,6 +425,61 @@ class MemoryTools:
             "index_status": health["status"],
             "result_count": len(deduped),
             "results": deduped,
+        }
+
+    def list_past_chat_sources(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """List every finalized raw source for a user-requested full review."""
+
+        _reject_extra_arguments(arguments, {"cursor", "limit", "project_scope"})
+        cursor = _bounded_int(arguments, "cursor", 0, 0, 1_000_000)
+        limit = _bounded_int(
+            arguments,
+            "limit",
+            DEFAULT_ARCHIVE_PAGE_SIZE,
+            1,
+            MAX_ARCHIVE_PAGE_SIZE,
+        )
+        project_scope = self._effective_project_scope(arguments)
+        sources, unreadable_count = self._archive_review_sources(project_scope)
+        page = sources[cursor : cursor + limit]
+        next_cursor = cursor + len(page)
+        return {
+            "read_only": True,
+            "project_scope": project_scope,
+            "cursor": cursor,
+            "next_cursor": next_cursor if next_cursor < len(sources) else None,
+            "total_source_count": len(sources),
+            "unreadable_source_count": unreadable_count,
+            "sources": page,
+        }
+
+    def read_past_chat_page(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Return a contiguous raw-conversation page with an auditable next cursor."""
+
+        _reject_extra_arguments(arguments, {"reference", "cursor", "max_chars", "project_scope"})
+        reference = _required_string(arguments, "reference", maximum=MAX_PATH_CHARS)
+        cursor = _bounded_int(arguments, "cursor", 0, 0, MAX_SOURCE_BYTES)
+        max_chars = _bounded_int(
+            arguments,
+            "max_chars",
+            DEFAULT_CONTENT_CHARS,
+            MIN_CONTENT_CHARS,
+            MAX_CONTENT_CHARS,
+        )
+        project_scope = self._effective_project_scope(arguments)
+        source, content = self._archive_review_content(reference, project_scope)
+        if cursor > len(content):
+            raise InvalidToolArguments("cursor is outside the conversation content.")
+        page = content[cursor : cursor + max_chars]
+        next_cursor = cursor + len(page)
+        return {
+            "read_only": True,
+            "source": source,
+            "cursor": cursor,
+            "returned_chars": len(page),
+            "total_chars": len(content),
+            "next_cursor": next_cursor if next_cursor < len(content) else None,
+            "content": page,
         }
 
     def open_conversation(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -587,6 +721,156 @@ class MemoryTools:
     def get_index_health(self, arguments: dict[str, Any]) -> dict[str, Any]:
         _reject_extra_arguments(arguments, set())
         return self._index_health()
+
+    def _archive_review_sources(
+        self,
+        project_scope: str | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Build a stable inventory of archived raw and eligible live conversations.
+
+        Summaries are deliberately not substituted here: the caller can only claim a
+        full review after paging through original conversation text. The active live
+        session and temporary/excluded sessions use the normal fail-closed exclusion.
+        """
+
+        conversations_root = (self.root / "conversations").resolve()
+        if not conversations_root.is_dir() or not _is_within(conversations_root, self.root):
+            return [], 0
+
+        sources: list[dict[str, Any]] = []
+        unreadable_count = 0
+        try:
+            candidates = sorted(conversations_root.rglob("raw.md"))
+        except OSError:
+            return [], 0
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+                if not path.is_file() or not _is_within(resolved, conversations_root):
+                    continue
+                source, content = self._archive_review_content_for_path(resolved, project_scope)
+            except (OSError, UnicodeError, ToolExecutionError):
+                unreadable_count += 1
+                continue
+            if content is None:
+                continue
+            sources.append(
+                {
+                    **source,
+                    "char_count": len(content),
+                }
+            )
+        live_root = (self.root / "inbox" / "live").resolve()
+        if live_root.is_dir() and _is_within(live_root, self.root):
+            try:
+                live_candidates = sorted(live_root.glob("*.jsonl"))
+            except OSError:
+                live_candidates = []
+            for path in live_candidates:
+                try:
+                    resolved = path.resolve()
+                    if (
+                        not path.is_file()
+                        or not _is_within(resolved, live_root)
+                        or not self._is_unorganized_live(resolved)
+                    ):
+                        continue
+                    source, content = self._archive_review_live_content_for_path(resolved, project_scope)
+                except (OSError, UnicodeError, ToolExecutionError):
+                    unreadable_count += 1
+                    continue
+                if content is not None:
+                    sources.append({**source, "char_count": len(content)})
+
+        sources.sort(key=lambda source: str(source["path"]))
+        return sources, unreadable_count
+
+    def _archive_review_content(
+        self,
+        reference: str,
+        project_scope: str | None,
+    ) -> tuple[dict[str, Any], str]:
+        path_text, fragment = _split_reference(reference)
+        if fragment is not None:
+            raise InvalidToolArguments("A full-review reference must not contain a message fragment.")
+        path, relative = self._resolve_readable_source(path_text)
+        if relative.startswith("conversations/") and path.name == "raw.md":
+            source, content = self._archive_review_content_for_path(path, project_scope)
+        elif relative.startswith("inbox/live/") and path.suffix.lower() == ".jsonl":
+            if not self._is_unorganized_live(path):
+                raise ToolExecutionError("This live conversation is not available for archive review.")
+            source, content = self._archive_review_live_content_for_path(path, project_scope)
+        else:
+            raise InvalidToolArguments("Only archived conversation sources can be read in a full review.")
+        if content is None:
+            raise ToolExecutionError("The conversation is outside the active project scope.")
+        return source, content
+
+    def _archive_review_content_for_path(
+        self,
+        path: Path,
+        project_scope: str | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        """Read one raw source and enforce scope before a full-review page is made."""
+
+        text = _read_utf8_source(path)
+        relative = _relative_path(path, self.root)
+        header = _markdown_header(text)
+        title = (
+            _field_value(header, "Session")
+            or _field_value(header, "Title")
+            or _first_heading(header)
+            or path.parent.name
+        )
+        date = _field_value(header, "Date")
+        content: str | None = text
+        if project_scope:
+            if not self._finalized_header_matches_project_scope(relative, title, text, project_scope):
+                messages = [
+                    message
+                    for message in _parse_markdown_messages(text)
+                    if _project_scope_matches(project_scope, message["text"])
+                ]
+                if not messages:
+                    content = None
+                else:
+                    content = _render_archive_messages(messages)
+        return (
+            {
+                "reference": relative,
+                "path": relative,
+                "document_type": "raw",
+                "title": title,
+                "date": date,
+            },
+            content,
+        )
+
+    def _archive_review_live_content_for_path(
+        self,
+        path: Path,
+        project_scope: str | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        records = self._read_live_records(path)
+        if project_scope:
+            scope_mode = self._live_project_scope_mode(path, project_scope)
+            if scope_mode == "none":
+                return self._archive_review_live_source(path, records), None
+            if scope_mode == "messages":
+                records = [
+                    record for record in records if _project_scope_matches(project_scope, record["text"])
+                ]
+        return self._archive_review_live_source(path, records), _render_archive_messages(records)
+
+    def _archive_review_live_source(self, path: Path, records: list[dict[str, Any]]) -> dict[str, Any]:
+        relative = _relative_path(path, self.root)
+        return {
+            "reference": relative,
+            "path": relative,
+            "document_type": "live",
+            "title": f"Live session {path.stem}",
+            "date": _first_message_date(records),
+        }
 
     def _effective_project_scope(self, arguments: dict[str, Any]) -> str | None:
         requested = _tool_project_scope(arguments)
@@ -1361,6 +1645,20 @@ def _parse_markdown_messages(content: str) -> list[dict[str, Any]]:
             }
         )
     return messages
+
+
+def _render_archive_messages(messages: list[dict[str, Any]]) -> str:
+    """Render scoped raw messages without retaining unrelated source text."""
+
+    rendered: list[str] = []
+    for message in messages:
+        role = str(message.get("role") or "assistant").title()
+        timestamp = message.get("timestamp")
+        rendered.append(f"## {role}")
+        if isinstance(timestamp, str) and timestamp:
+            rendered.append(f"Timestamp: {timestamp}")
+        rendered.extend(("", str(message.get("text") or ""), ""))
+    return "\n".join(rendered).strip()
 
 
 def _select_messages(

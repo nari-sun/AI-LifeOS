@@ -101,4 +101,4 @@ RT-0020では、合成データのみを使う長期ベンチマーク、`search
 | 未完了の候補タスクは？ | `candidate_task` | category + statusの絞り込み |
 | 自分の回答スタイルの好みは？ | `preference` | 既存preferencesとの役割を維持 |
 
-RT-0022は保留し、RT-0023ではFTS5を検索主経路にしません。現行の`SQLite-backed index + Python ranking`を維持し、FTS5採用判断はRT-0020の計測後に行います。
+RT-0022はRT-0020の計測後に再評価し、SQLite標準FTS5 tokenizerでは日本語の候補漏れが確認されたため、主経路化を採用せずクローズしました。現行の`SQLite-backed index + Python hybrid ranking`を維持し、別tokenizerや候補取得方式が代表クエリで品質非悪化と速度優位を示した場合だけ再評価します。

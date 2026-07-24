@@ -93,6 +93,7 @@ export async function sendMessage(
   content: string,
   requestId: string,
   attachments: AttachmentPayload[] = [],
+  fullArchiveReview = false,
 ) {
   return invoke<SendMessageResult>("send_message", {
     payload: {
@@ -101,6 +102,7 @@ export async function sendMessage(
       content,
       request_id: requestId,
       attachments,
+      full_archive_review: fullArchiveReview,
     },
   })
 }
@@ -110,6 +112,7 @@ export async function sendMessageStream(
   content: string,
   requestId: string,
   attachments: AttachmentPayload[] = [],
+  fullArchiveReview: boolean,
   onDelta: (delta: string) => void,
 ) {
   const onEvent = new Channel<AssistantStreamEvent>()
@@ -125,6 +128,7 @@ export async function sendMessageStream(
       content,
       request_id: requestId,
       attachments,
+      full_archive_review: fullArchiveReview,
     },
     onEvent,
   })

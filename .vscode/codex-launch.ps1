@@ -27,6 +27,8 @@ $blockedOptions = @(
     "--full-auto",
     "--sandbox",
     "-s",
+    "--ask-for-approval",
+    "-a",
     "--add-dir",
     "--cd",
     "-C",
@@ -49,5 +51,16 @@ if (-not $codexCommand) {
     throw "Codex CLI was not found on PATH. Install or update it outside this repository manually."
 }
 
-& $codexCommand.Source @CodexArgs
+# Keep the repository-only filesystem boundary from .codex/config.toml, but
+# run freely inside that boundary without interactive approval prompts.
+$fixedCodexArgs = @(
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "--config",
+    "sandbox_workspace_write.network_access=true"
+)
+
+& $codexCommand.Source @fixedCodexArgs @CodexArgs
 exit $LASTEXITCODE
