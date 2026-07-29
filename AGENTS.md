@@ -8,7 +8,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 
 ## Current Status
 
-現在は Phase4.0 のNotion読み取り専用チャット連携まで実装済みです。その他の外部ツール連携は、ローカル記憶用の読み取り専用MCPとは分けて個別に範囲を決めます。
+現在は Phase4.0 のNotion読み取り専用チャット連携まで実装済みです。公式Notion MCPはWindows上のCodex OAuth credential再読込問題を避けるため`mcp-remote`経由で接続します。その他の外部ツール連携は、ローカル記憶用の読み取り専用MCPとは分けて個別に範囲を決めます。
 
 実装済みの主要範囲:
 
@@ -18,7 +18,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 * Phase2.65: `.session.json` によるセッション保存、期限なしの resume、参照用 prune
 * Phase2.7: Tauri 2 + React + Vite + TypeScript + Tailwind CSS + shadcn/ui の Chat GUI MVP
 * Phase3: Markdown/SQLite検索、stale index fallback、回答用memory context、読み取り専用Memory MCP、軽量ハイブリッド検索、パーソナライズ管理
-* Phase4.0: 回答単位の明示ON、Git管理外allowlist、Windows Credential Managerを使うNotion読み取り専用チャット連携
+* Phase4.0: 回答単位の明示ON、`mcp-remote` OAuth bridge、公式Notion MCPの読み取りtool allowlistを使うNotionチャット連携
 
 詳細なフェーズ履歴は [docs/phases.md](docs/phases.md) を参照してください。
 
@@ -28,7 +28,7 @@ AI-LifeOS は、ChatGPT や Codex との会話をローカルPCに保存し、�
 * `.env` は前提にしない。
 * ChatGPT Plus / Codex CLI 側を使う。
 * ChatGPT公式Webや公式デスクトップアプリをスクレイピングしない。
-* APIキーや秘密情報を保存しない。
+* APIキーや秘密情報をrepository、設定ファイル、会話ログへ保存しない。Phase4.0のNotion OAuth credentialだけは、ユーザーが選択した`mcp-remote`の専用user-profile directoryへ保存する。
 * ユーザーがそのターンで明示的に許可しない限り、このリポジトリ外のファイルやディレクトリを参照・検索・編集しない。
 * 会話ログにないことを summary / journal / memory に書かない。
 * `memory/long_term.md` は長期的に重要な情報だけ扱い、既存情報を勝手に削除しない。

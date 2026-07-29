@@ -516,7 +516,7 @@ class ChatGuiBridgeTests(unittest.TestCase):
 
             self.assertFalse((root / "inbox" / "live").exists())
 
-    def test_send_message_off_does_not_call_notion_adapter(self):
+    def test_send_message_off_does_not_expose_notion_mcp(self):
         captured = {}
 
         def fake_generate(**kwargs):
@@ -524,126 +524,103 @@ class ChatGuiBridgeTests(unittest.TestCase):
             return codex_conversation.AssistantReplyResult(reply="local only", memory_context=None)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            with mock.patch.object(chat_gui_bridge, "retrieve_notion_context") as retrieve:
-                with mock.patch.object(chat_gui_bridge, "generate_assistant_reply_with_context", side_effect=fake_generate):
-                    result = chat_gui_bridge.handle_send_message(
-                        {"root": temp_dir, "content": "hello", "notion_reference": False}
-                    )
+            with mock.patch.object(chat_gui_bridge, "generate_assistant_reply_with_context", side_effect=fake_generate):
+                result = chat_gui_bridge.handle_send_message(
+                    {"root": temp_dir, "content": "hello", "notion_reference": False}
+                )
 
-            retrieve.assert_not_called()
-            self.assertEqual("", captured["notion_context"])
+            self.assertFalse(captured["notion_reference"])
             self.assertIsNone(result["notion_context"])
 
-    def test_send_message_on_passes_only_ephemeral_notion_context_and_returns_sources(self):
+    def test_send_message_on_passes_one_shot_flag_and_returns_only_source_metadata(self):
         captured = {}
         source = notion_integration.NotionSource(
             id="11111111-1111-4111-8111-111111111111",
             object_type="page",
             title="Allowed page",
             url="https://www.notion.so/allowed",
-            allowed_target_id="11111111-1111-4111-8111-111111111111",
-            allowed_target_title="Allowed page",
-            fetched_at="2026-07-24T00:00:00+00:00",
         )
         notion_result = notion_integration.NotionContextResult(
             requested=True,
             used=True,
             status="ok",
-            fetched_at=source.fetched_at,
-            sources=(source,),
-            context_text="PRIVATE_NOTION_BODY",
-        )
-
-        def fake_generate(**kwargs):
-            captured.update(kwargs)
-            return codex_conversation.AssistantReplyResult(reply="notion grounded", memory_context=None)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            with mock.patch.object(chat_gui_bridge, "retrieve_notion_context", return_value=notion_result) as retrieve:
-                with mock.patch.object(chat_gui_bridge, "generate_assistant_reply_with_context", side_effect=fake_generate):
-                    result = chat_gui_bridge.handle_send_message(
-                        {"root": str(root), "content": "仕様は？", "notion_reference": True}
-                    )
-
-            retrieve.assert_called_once()
-            self.assertEqual("PRIVATE_NOTION_BODY", captured["notion_context"])
-            self.assertTrue(result["notion_context"]["used"])
-            self.assertEqual("Allowed page", result["notion_context"]["sources"][0]["title"])
-            self.assertNotIn("context_text", result["notion_context"])
-            records = (root / result["session"]["jsonl_file"]).read_text(encoding="utf-8")
-            self.assertNotIn("PRIVATE_NOTION_BODY", records)
-            log_text = (root / "logs" / "chat_gui_bridge.log").read_text(encoding="utf-8")
-            self.assertNotIn("PRIVATE_NOTION_BODY", log_text)
-
-    def test_notion_failure_continues_local_answer_and_reports_failure_without_stale_body(self):
-        notion_result = notion_integration.NotionContextResult(
-            requested=True,
-            used=False,
-            status="error",
             fetched_at="2026-07-24T00:00:00+00:00",
-            error="Notionの権限を確認してください。",
+            sources=(source,),
         )
-        captured = {}
 
         def fake_generate(**kwargs):
             captured.update(kwargs)
-            return codex_conversation.AssistantReplyResult(reply="local fallback", memory_context=None)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with mock.patch.object(chat_gui_bridge, "retrieve_notion_context", return_value=notion_result):
-                with mock.patch.object(chat_gui_bridge, "generate_assistant_reply_with_context", side_effect=fake_generate):
-                    result = chat_gui_bridge.handle_send_message(
-                        {"root": temp_dir, "content": "hello", "notion_reference": True}
-                    )
-
-            self.assertEqual("local fallback", result["assistant"]["content"])
-            self.assertEqual("", captured["notion_context"])
-            self.assertFalse(result["notion_context"]["used"])
-            self.assertIn("権限", result["notion_context"]["error"])
-
-    def test_unexpected_notion_error_continues_local_generation_with_failure_metadata(self):
-        captured = {}
-
-        def fake_generate(**kwargs):
-            captured.update(kwargs)
-            return codex_conversation.AssistantReplyResult(reply="local fallback", memory_context=None)
+            return codex_conversation.AssistantReplyResult(
+                reply="notion grounded",
+                memory_context=None,
+                notion_context=notion_result,
+            )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            with mock.patch.object(
-                chat_gui_bridge,
-                "retrieve_notion_context",
-                side_effect=RuntimeError("PRIVATE_UNEXPECTED_NOTION_BODY"),
-            ):
-                with mock.patch.object(
-                    chat_gui_bridge,
-                    "generate_assistant_reply_with_context",
-                    side_effect=fake_generate,
-                ):
-                    result = chat_gui_bridge.handle_send_message(
-                        {"root": str(root), "content": "hello", "notion_reference": True}
-                    )
-
-            self.assertEqual("local fallback", result["assistant"]["content"])
-            self.assertEqual("", captured["notion_context"])
-            self.assertTrue(result["notion_context"]["requested"])
-            self.assertFalse(result["notion_context"]["used"])
-            self.assertEqual("error", result["notion_context"]["status"])
-            self.assertEqual([], result["notion_context"]["sources"])
-            self.assertNotIn("PRIVATE_UNEXPECTED_NOTION_BODY", result["notion_context"]["error"])
-            log_text = (root / "logs" / "chat_gui_bridge.log").read_text(encoding="utf-8")
-            self.assertNotIn("PRIVATE_UNEXPECTED_NOTION_BODY", log_text)
-
-    def test_no_ai_does_not_fetch_notion_even_when_requested(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with mock.patch.object(chat_gui_bridge, "retrieve_notion_context") as retrieve:
+            with mock.patch.object(chat_gui_bridge, "generate_assistant_reply_with_context", side_effect=fake_generate):
                 result = chat_gui_bridge.handle_send_message(
-                    {"root": temp_dir, "content": "save only", "notion_reference": True, "no_ai": True}
+                    {"root": str(root), "content": "仕様は？", "notion_reference": True}
                 )
 
-            retrieve.assert_not_called()
+            self.assertTrue(captured["notion_reference"])
+            self.assertTrue(result["notion_context"]["used"])
+            self.assertEqual("Allowed page", result["notion_context"]["sources"][0]["title"])
+            self.assertNotIn("allowed_target_id", result["notion_context"]["sources"][0])
+            records = (root / result["session"]["jsonl_file"]).read_text(encoding="utf-8")
+            self.assertNotIn("notion_context", records)
+            log_text = (root / "logs" / "chat_gui_bridge.log").read_text(encoding="utf-8")
+            self.assertNotIn("Allowed page", log_text)
+
+    def test_notion_failure_reports_error_without_stale_body_or_assistant(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(
+                chat_gui_bridge,
+                "generate_assistant_reply_with_context",
+                side_effect=RuntimeError("PRIVATE_STALE_NOTION_BODY"),
+            ):
+                result = chat_gui_bridge.handle_send_message(
+                    {"root": temp_dir, "content": "hello", "notion_reference": True}
+                )
+
+            self.assertIsNone(result["assistant"])
+            self.assertFalse(result["notion_context"]["used"])
+            self.assertTrue(result["notion_context"]["requested"])
+            self.assertEqual("error", result["notion_context"]["status"])
+            self.assertEqual([], result["notion_context"]["sources"])
+            self.assertNotIn("PRIVATE_STALE_NOTION_BODY", result["notion_context"]["error"])
+            records = (Path(temp_dir) / result["session"]["jsonl_file"]).read_text(encoding="utf-8")
+            self.assertNotIn("PRIVATE_STALE_NOTION_BODY", records)
+
+    def test_no_ai_does_not_expose_notion_even_when_requested(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = chat_gui_bridge.handle_send_message(
+                {"root": temp_dir, "content": "save only", "notion_reference": True, "no_ai": True}
+            )
+
             self.assertIsNone(result["notion_context"])
+
+    def test_notion_connection_command_has_no_target_management(self):
+        expected = {
+            "ok": True,
+            "connection": {"status": "not_checked"},
+            "server_name": "ai_lifeos_notion",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(
+                chat_gui_bridge,
+                "get_notion_connection_view",
+                return_value=expected,
+            ) as get_connection:
+                result = chat_gui_bridge.handle_get_notion_connection(
+                    {"root": temp_dir, "refresh": False}
+                )
+
+        self.assertEqual(expected, result)
+        get_connection.assert_called_once()
+        self.assertIn("get-notion-connection", chat_gui_bridge.COMMANDS)
+        self.assertNotIn("get-notion-settings", chat_gui_bridge.COMMANDS)
+        self.assertNotIn("update-notion-settings", chat_gui_bridge.COMMANDS)
 
     def test_streaming_send_emits_deltas_and_saves_only_completed_reply(self):
         original = chat_gui_bridge.generate_assistant_reply_streaming_with_context

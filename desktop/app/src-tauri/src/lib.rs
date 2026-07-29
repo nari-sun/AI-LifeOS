@@ -83,13 +83,8 @@ async fn get_memory_summary(payload: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn get_notion_settings(payload: Value) -> Result<Value, String> {
-    run_bridge("get-notion-settings", payload)
-}
-
-#[tauri::command]
-async fn update_notion_settings(payload: Value) -> Result<Value, String> {
-    run_bridge("update-notion-settings", payload)
+async fn get_notion_connection(payload: Value) -> Result<Value, String> {
+    run_bridge("get-notion-connection", payload)
 }
 
 #[tauri::command]
@@ -165,8 +160,7 @@ pub fn run() {
             get_personalization,
             update_personalization,
             get_memory_summary,
-            get_notion_settings,
-            update_notion_settings,
+            get_notion_connection,
             finalize_session,
             start_finalize_job,
             get_finalize_job,

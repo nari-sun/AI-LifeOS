@@ -48,7 +48,7 @@ Tauri 2
 
 * 過去ログ全文検索
 * ベクトル検索
-* 汎用MCP連携（Phase4.0ではNotion専用の読み取りREST adapterだけを追加）
+* 汎用MCP連携（Phase4.0では公式Notion MCPの検証済み読み取りtoolだけを追加）
 * モデル・応答設定UI
 * ChatGPT風のメッセージ編集、回答再生成、会話分岐
 * 会話中の memory / journal 自動編集
@@ -123,7 +123,7 @@ npm run bundle
 * 未実装の設定をGUIに出さない
 * Git commitはGUIから自動連発しない
 * メッセージ編集、回答再生成、会話分岐を入れる場合は、`docs/conversation_branching.md` の派生セッション方針に従い、既存JSONLを直接書き換えない
-* 投稿欄上の「Notionを参照する」は既定OFFで、ONの送信だけGit管理外allowlist内を都度取得する。取得本文は保存せず、生成されたassistant回答だけが通常のlive JSONLへ残る。管理画面、Credential Manager、取得元表示、失敗時fallbackの詳細は `docs/notion_read_only_integration.md` を参照する
+* 投稿欄上の「Notionを参照する」は既定OFFで、ONの送信だけ公式Notion MCPの読み取りtoolを公開し、送信直後にOFFへ戻す。MCP response本文は保存せず、生成されたassistant回答だけが通常のlive JSONLへ残る。OAuth、tool isolation、出典表示、失敗時の詳細は `docs/notion_read_only_integration.md` を参照する
 
 ## ログ
 
@@ -215,7 +215,7 @@ GUIはジョブIDをpollして、進捗、現在段階、完了結果、エラ�
 * 「ローカルデータ」は既存の読み取り専用データ管理画面を開く
 * 「データ整理」は、再開可能セッションのうち未整理または整理失敗のものを経過日数に関係なく古い順に1件ずつ整理する
 * 「ChatGPTインポート」は、エクスポートを読み取り専用で確認し、新規または更新された会話を初期0件から明示選択して、最終確認を経て取り込む
-* 「Notion連携」は、connection状態、共有target一覧、使用許可、表示名、用途、最終取得状態を管理する。token入力欄は持たない
+* 「Notion連携」は、`mcp-remote` OAuth bridgeの接続状態、固定endpoint、公開された読み取りtool、login/logout手順だけを表示する。target管理画面やtoken入力欄は持たない
 
 データ整理は確認後にだけ開始します。個別の失敗は記録して残りを続行し、停止した場合や失敗した場合は未処理のセッションを後で再実行できます。整理中は新規チャット、セッション切り替え、個別整理を無効化します。
 

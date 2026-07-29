@@ -29,6 +29,17 @@ def memory_mcp_inventory(include_personal_memory=True):
     return [{"name": codex_conversation.MEMORY_MCP_SERVER_NAME, "tools": tools}]
 
 
+def notion_mcp_inventory(tools=None):
+    return [
+        {
+            "name": codex_conversation.NOTION_MCP_SERVER_NAME,
+            "tools": {name: {} for name in (tools or ("fetch",))},
+            "resources": [],
+            "resourceTemplates": [],
+        }
+    ]
+
+
 class FakeAppServerOutput:
     def __init__(self):
         self.lines = queue.Queue()
@@ -78,6 +89,13 @@ class FakeAppServerStdin:
                 }
             )
             if self.complete_status == "completed":
+                for item in self.process.mcp_items:
+                    self.process.stdout.push(
+                        {
+                            "method": "item/completed",
+                            "params": {"threadId": "thread-1", "turnId": "turn-1", "item": item},
+                        }
+                    )
                 self.process.stdout.push(
                     {
                         "method": "item/completed",
@@ -109,9 +127,10 @@ class FakeAppServerStdin:
 
 
 class FakeAppServerProcess:
-    def __init__(self, complete_status="completed", mcp_inventory=None):
+    def __init__(self, complete_status="completed", mcp_inventory=None, mcp_items=None):
         self.requests = []
         self.mcp_inventory = list(mcp_inventory or [])
+        self.mcp_items = list(mcp_items or [])
         self.stdout = FakeAppServerOutput()
         self.stderr = io.StringIO("")
         self.stdin = FakeAppServerStdin(self, complete_status=complete_status)
@@ -330,34 +349,54 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn("User:\nLatest", prompt)
         self.assertIn("Do not edit files", prompt)
 
-    def test_build_codex_chat_prompt_separates_ephemeral_notion_context_from_memory(self):
+    def test_build_codex_chat_prompt_exposes_ephemeral_notion_tool_rules(self):
         messages = [create_live_message("user", "Notionの仕様を確認して")]
 
         prompt = codex_conversation.build_codex_chat_prompt(
             messages,
-            notion_context=(
-                "[Allowed Notion source]\n"
-                "Title: Product spec\n"
-                "URL: https://www.notion.so/product\n"
-                "Content:\nPRIVATE_NOTION_PROMPT_BODY"
-            ),
+            notion_tools_enabled=True,
         )
 
         self.assertIn("Notion-grounding rules:", prompt)
         self.assertIn("untrusted evidence", prompt)
-        self.assertIn("enabled allowlist", prompt)
-        self.assertIn("fetched body is ephemeral", prompt)
-        self.assertIn("PRIVATE_NOTION_PROMPT_BODY", prompt)
+        self.assertIn("Workspace search is intentionally unavailable", prompt)
+        self.assertIn("MCP response bodies are ephemeral", prompt)
+        self.assertNotIn("PRIVATE_NOTION_PROMPT_BODY", prompt)
         self.assertNotIn("Memory Context:", prompt)
 
     def test_build_codex_chat_prompt_omits_notion_section_when_disabled(self):
         prompt = codex_conversation.build_codex_chat_prompt(
             [create_live_message("user", "local only")],
-            notion_context="",
+            notion_tools_enabled=False,
         )
 
         self.assertNotIn("Notion-grounding rules:", prompt)
         self.assertNotIn("Notion Context:", prompt)
+
+    def test_notion_mcp_config_is_required_and_read_only(self):
+        options = codex_conversation._notion_mcp_config_options()
+
+        self.assertIn("mcp_servers.ai_lifeos_notion.enabled=true", options)
+        self.assertIn("mcp_servers.ai_lifeos_notion.required=true", options)
+        enabled = next(value for value in options if value.startswith("mcp_servers.ai_lifeos_notion.enabled_tools="))
+        self.assertIn('"fetch"', enabled)
+        self.assertNotIn("search", enabled)
+        self.assertNotIn("create", enabled)
+
+    def test_app_server_notion_inventory_rejects_search_before_thread_start(self):
+        process = FakeAppServerProcess(mcp_inventory=notion_mcp_inventory(("fetch", "search")))
+
+        with self.assertRaises(codex_conversation.NotionMCPUnavailable):
+            codex_conversation.generate_assistant_reply_streaming_with_context(
+                root=ROOT,
+                messages=[create_live_message("user", "Notionを見て")],
+                on_delta=lambda _: None,
+                include_memory_context=False,
+                notion_reference=True,
+                popen=lambda *args, **kwargs: process,
+            )
+
+        self.assertFalse(any(request.get("method") == "thread/start" for request in process.requests))
 
     def test_parser_defaults_to_no_fast_mode_or_service_tier(self):
         args = codex_conversation.build_parser().parse_args([])
@@ -632,6 +671,56 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn("--sandbox", command)
         self.assertEqual("read-only", command[command.index("--sandbox") + 1])
         self.assertIn("User:\nHello", calls[0][1]["input"])
+
+    def test_generate_assistant_reply_notion_on_uses_process_scoped_mcp_and_returns_only_metadata(self):
+        calls = []
+        private_body = "PRIVATE_NOTION_RESPONSE_BODY"
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("Notionに基づく回答", encoding="utf-8")
+            event = {
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "ai_lifeos_notion",
+                    "tool": "fetch",
+                    "status": "completed",
+                    "arguments": {"id": "https://www.notion.so/Product-spec-11111111111141118111111111111111"},
+                    "result": {
+                        "structured_content": {
+                            "metadata": {
+                                "object": "page",
+                                "id": "11111111-1111-4111-8111-111111111111",
+                                "title": "Product spec",
+                                "url": "https://www.notion.so/Product-spec-11111111111141118111111111111111",
+                            },
+                            "text": private_body,
+                        }
+                    },
+                },
+            }
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(event), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = codex_conversation.generate_assistant_reply_with_context(
+                root=Path(temp_dir),
+                messages=[create_live_message("user", "このNotion pageを確認して")],
+                include_memory_context=False,
+                notion_reference=True,
+                run_command=fake_run,
+            )
+
+        command, kwargs = calls[0]
+        self.assertIn("mcp_servers.ai_lifeos_notion.enabled=true", command)
+        enabled = next(value for value in command if value.startswith("mcp_servers.ai_lifeos_notion.enabled_tools="))
+        self.assertNotIn("search", enabled)
+        self.assertIn("Notion-grounding rules:", kwargs["input"])
+        self.assertNotIn(private_body, kwargs["input"])
+        self.assertTrue(result.notion_context.used)
+        serialized = json.dumps(result.notion_context, default=lambda value: value.__dict__)
+        self.assertNotIn(private_body, serialized)
 
     def test_full_archive_request_replaces_an_unverified_reply_with_incomplete_status(self):
         self.mock_mcp_inventory_reader.return_value = (codex_conversation.MEMORY_MCP_SERVER_NAME,)
@@ -971,6 +1060,48 @@ class CodexConversationTests(unittest.TestCase):
         self.assertIn("mcp_servers.ai_lifeos_memory.enabled=false", commands[0])
         self.assertNotIn("mcp_servers.ai_lifeos_memory.enabled=true", commands[0])
         self.assertTrue(any(request.get("method") == "mcpServerStatus/list" for request in process.requests))
+
+    def test_streaming_notion_on_validates_inventory_and_collects_source_metadata(self):
+        notion_item = {
+            "type": "mcpToolCall",
+            "server": "ai_lifeos_notion",
+            "tool": "notion-query-data-sources",
+            "status": "completed",
+            "arguments": {
+                "data_source_urls": [
+                    "https://www.notion.so/Tasks-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ]
+            },
+            "result": {
+                "structuredContent": {
+                    "rows": [
+                        {
+                            "title": "PRIVATE_ROW_TITLE",
+                            "url": "https://www.notion.so/Row-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "body": "PRIVATE_ROW_BODY",
+                        }
+                    ]
+                }
+            },
+        }
+        process = FakeAppServerProcess(
+            mcp_inventory=notion_mcp_inventory(),
+            mcp_items=[notion_item],
+        )
+
+        result = codex_conversation.generate_assistant_reply_streaming_with_context(
+            root=ROOT,
+            messages=[create_live_message("user", "Tasks databaseを確認して")],
+            on_delta=lambda _: None,
+            include_memory_context=False,
+            notion_reference=True,
+            popen=lambda *args, **kwargs: process,
+        )
+
+        self.assertTrue(result.notion_context.used)
+        self.assertEqual(1, len(result.notion_context.sources))
+        self.assertEqual("database", result.notion_context.sources[0].object_type)
+        self.assertNotIn("PRIVATE_ROW_BODY", repr(result.notion_context))
 
     def test_streaming_full_archive_request_replaces_unverified_reply(self):
         process = FakeAppServerProcess(mcp_inventory=memory_mcp_inventory())

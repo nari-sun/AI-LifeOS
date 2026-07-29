@@ -32,7 +32,7 @@ Phase6   : Daily Automation
 
 現在は Phase4.0 のNotion読み取り専用チャット連携まで実装済みです。
 
-Phase4.0では、Phase3のローカル記憶MCPとは分けて、回答単位で明示したときだけNotionの許可済みpage / data sourceを一時参照する外部adapterを追加しました。その他の外部MCP・外部ツール連携は引き続き個別に範囲を決めます。
+Phase4.0では、Phase3のローカル記憶MCPとは分けて、回答単位で明示したときだけ公式Notion MCPの読み取りtoolを一時公開します。その他の外部MCP・外部ツール連携は引き続き個別に範囲を決めます。
 
 ## Phase1: Local Archive
 
@@ -242,9 +242,9 @@ Phase4.0のNotion読み取り専用連携を実装済みです。その他の候
 
 ### Phase4.0: Notion Read-only Chat Integration
 
-Chat GUIの投稿欄上に既定OFFの「Notionを参照する」を追加し、ONの送信だけNotion公式APIを呼びます。管理 > Notion連携では、接続状態、共有page / data source、使用許可、表示名、用途、最終取得状態を確認・保存できます。
+Chat GUIの投稿欄上に既定OFFの「Notionを参照する」を置き、ONの送信だけ`mcp-remote` OAuth bridge経由の公式Notion MCPを有効化します。チェックは送信直後にOFFへ戻ります。管理 > Notion連携では、接続状態、固定endpoint、読み取りtool、再認証・切断手順だけを確認できます。
 
-tokenはWindows Credential Managerに置き、Git管理外allowlistにはIDと表示metadataだけを保存します。取得本文はCodexの回答生成へ渡す一時contextであり、memory、journal、SQLite index、構造化メモリ、cacheへ保存しません。create / update / delete endpointは実装せず、未許可、権限喪失、削除済みtarget、接続失敗では古い本文へfallbackしません。通常のassistant回答は従来どおりlive会話ログへ残ります。詳細は [notion_read_only_integration.md](notion_read_only_integration.md) を参照してください。
+OAuth credentialは`mcp-remote`の専用user-profile directoryで管理し、AI-LifeOSは独自tokenやtarget allowlistを保存しません。`fetch`とNotion database / data source queryだけをprocess単位で公開し、connected sourceを含み得る`search`と書き込みtoolは除外します。MCP response本文はmemory、journal、SQLite index、構造化メモリ、cache、live JSONLへ保存せず、通常のassistant回答だけを従来どおりlive会話ログへ残します。詳細は [notion_read_only_integration.md](notion_read_only_integration.md) を参照してください。
 
 目的:
 

@@ -8,8 +8,7 @@ import type {
   ListResumableResult,
   LocalDataReportResult,
   MemorySummaryResult,
-  NotionSettingsResult,
-  NotionTargetSettings,
+  NotionConnectionResult,
   OrganizeSessionsJobResult,
   PersonalizationResult,
   PersonalizationSettings,
@@ -200,23 +199,9 @@ export async function getMemorySummary() {
   return invoke<MemorySummaryResult>("get_memory_summary", { payload: defaultPayload })
 }
 
-export async function getNotionSettings(refresh = false) {
-  return invoke<NotionSettingsResult>("get_notion_settings", {
+export async function getNotionConnection(refresh = false) {
+  return invoke<NotionConnectionResult>("get_notion_connection", {
     payload: { refresh },
-  })
-}
-
-export async function updateNotionSettings(targets: NotionTargetSettings[]) {
-  return invoke<NotionSettingsResult>("update_notion_settings", {
-    payload: {
-      targets: targets.map((target) => ({
-        id: target.id,
-        object_type: target.object_type,
-        enabled: target.enabled,
-        display_name: target.display_name,
-        purpose: target.purpose,
-      })),
-    },
   })
 }
 

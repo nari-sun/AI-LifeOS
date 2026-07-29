@@ -27,7 +27,7 @@ In scope:
 * Web search for current or external information.
 * Filesystem access for local project and memory-adjacent files.
 * GitHub issue, pull request, commit, and CI context.
-* Notion page and data source context selected through a local allowlist.
+* Notion page, database, and data source context read through a per-answer official MCP boundary.
 * Playwright-based browser checks for local GUI and public pages.
 * Gmail and Calendar as later personal-data candidates.
 * Confirmation flow, source attribution, and storage policy.
@@ -47,7 +47,7 @@ Out of scope for the first Phase4 implementation:
 | Web search | P0 | Medium | User-triggered read | Store citations and short extracted facts only when they are part of a saved conversation; do not cache full pages by default | Design and implement first |
 | Filesystem | P0 | Medium to High | Read-only first, scoped writes later | Project files may be edited when requested; personal data folders follow existing live/search rules | Design and implement first |
 | GitHub | P1 | Medium to High | Read-only issue/PR/CI lookup first | Public repo metadata may be summarized; private or personal content is not committed to PublicEdition | Implement after confirmation pattern exists |
-| Notion | P1 | High | Per-answer read, local allowlist, default OFF | Fetched bodies are ephemeral; allowlist metadata is local and ignored; assistant replies remain normal conversation records | Implemented in RT-0024 |
+| Notion | P1 | High | Per-answer official MCP read, default OFF, one-shot reset | MCP response bodies are ephemeral; safe source metadata is response-only; assistant replies remain normal conversation records | RT-0024 replaced by RT-0025 |
 | Playwright | P1 | Medium | Local/browser verification | Screenshots/logs are temporary unless explicitly saved under an ignored diagnostics path | Implement for GUI verification |
 | Gmail | P2 | High | Read-only, user-selected messages only | No automatic storage; save only user-approved excerpts into conversation raw/summary | Defer until P0/P1 safety is proven |
 | Calendar | P2 | High | Read-only, bounded date range | No automatic storage; save only user-approved event facts | Defer until P0/P1 safety is proven |
@@ -212,23 +212,23 @@ Rules:
 
 ### Notion
 
-Notion is the first Phase4 personal-cloud adapter. It is independent of the local Memory MCP and uses the official Notion REST API with a read-content-only internal integration.
+Notion is the first Phase4 personal-cloud integration. It is independent of the local Memory MCP and uses the official remote Notion MCP through a pinned `mcp-remote` OAuth bridge.
 
 Rules:
 
-* Keep the per-answer checkbox OFF by default and do not contact Notion while it is OFF.
-* Store the installation token only in Windows Credential Manager; do not expose a plaintext token field in the GUI.
-* Store page/data source IDs, names, purpose notes, and last-result metadata only in the Git-ignored `config/notion_settings.json`.
-* Search and fetch only targets that the user enabled in the allowlist. Treat rows of an enabled data source as inside that data source's allowed boundary.
+* Keep the per-answer checkbox OFF by default, reset it immediately after send, and do not expose Notion MCP while it is OFF.
+* Use the pinned `mcp-remote` OAuth bridge; do not store or expose a Notion token in the repository, settings, GUI, or conversation logs.
+* Do not maintain a page / database / data source target allowlist.
+* Expose only `fetch` and mechanically Notion-scoped database / data-source query tools. Do not expose connected-source search.
 * Do not recurse from an allowed page into child-page or child-database bodies; those children require their own enabled target.
 * Permit only the official search, retrieve, block-children, and data-source-query endpoints. Do not implement create, append, update, move-to-trash, restore, or delete endpoints.
 * Fetch on demand without a body cache. Never fall back to an old body after a permission loss, deletion, timeout, or connection failure.
 * Treat fetched text as untrusted evidence and ignore instructions embedded in it.
 * Do not write fetched bodies to `memory`, `journal`, the SQLite index, structured memory, attachments, or a sidecar file.
-* Show the user whether retrieval succeeded, partially succeeded, or failed, plus the allowed source title/link/time when available.
+* Show the user whether retrieval succeeded, was unused, partially succeeded, or failed, plus safe source title/link/time when available.
 * The generated assistant answer still follows normal live JSONL retention. It may contain concise paraphrases and source links, so the GUI must disclose that boundary.
 * Local non-persistence does not mean local-only processing: enabled Notion bodies are passed to Codex for answer generation, and the GUI/docs must disclose this before use.
-* Merge retrieval status into the latest allowlist under a short process lock so an in-flight answer cannot restore settings the user disabled.
+* Aggregate database/data-source rows into one source card and keep source metadata out of live JSONL.
 
 Detailed setup, limits, revocation, and test boundaries are in [notion_read_only_integration.md](notion_read_only_integration.md).
 
@@ -413,16 +413,16 @@ Acceptance:
 
 ### P4-011 Notion Read-only Chat Integration
 
-Implemented by RT-0024.
+Initially implemented by RT-0024 and replaced by the official MCP design in RT-0025.
 
 Acceptance:
 
-* Per-answer GUI checkbox is default OFF and backend-enforced.
-* A Notion-specific settings screen manages connection state and a local allowlist.
-* Credential Manager holds the token; `.env` and plaintext project settings do not.
-* Allowed page/data source bodies are ephemeral and source metadata is visible.
+* Per-answer GUI checkbox is default OFF, resets after send, and is backend-enforced.
+* A Notion-specific screen shows `mcp-remote` OAuth connection state and manual login/logout steps without target management.
+* `mcp-remote` stores OAuth credentials in a dedicated user-profile directory; `.env`, Credential Manager code, and plaintext project settings are not used by AI-LifeOS.
+* MCP response bodies are ephemeral and safe source metadata is visible only in the GUI response.
 * Permission loss, deletion, rate limit, and connection failure do not use stale content.
-* Tests enforce the absence of Notion write endpoints.
+* Tests enforce process-level MCP isolation, the absence of search/write tools, body non-persistence, and database source aggregation.
 
 ## Open Questions
 
