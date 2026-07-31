@@ -216,13 +216,13 @@ function App() {
   const streamingTextRef = useRef("")
   const streamingFrameRef = useRef<number | null>(null)
 
-  function activateSession(next: SessionFile | null) {
+  function activateSession(next: SessionFile | null, resetNotionReference = true) {
     const sessionChanged = (sessionRef.current?.jsonl_file ?? null) !== (next?.jsonl_file ?? null)
     personalizationRequestRef.current += 1
     sessionRef.current = next
     setSession(next)
     setFullArchiveReview(false)
-    if (sessionChanged) {
+    if (sessionChanged && resetNotionReference) {
       setNotionReference(false)
     }
     setPersonalizationLoading(false)
@@ -585,7 +585,7 @@ function App() {
         return
       }
 
-      activateSession(result.session)
+      activateSession(result.session, false)
       const memoryContext = result.assistant ? result.memory_context : null
       const memoryCandidates = result.assistant ? result.memory_candidates ?? [] : []
       const memoryOpened = result.assistant ? result.memory_opened ?? [] : []
@@ -1605,7 +1605,7 @@ function App() {
           <div className="mx-auto mb-2 flex max-w-4xl justify-end">
             <label
               className="flex h-9 cursor-pointer items-center gap-2 rounded-md border border-input bg-background px-3 text-xs"
-              title="ONにした今回の送信だけ、公式Notion MCPの検証済み読み取りtoolをCodexへ公開します。送信直後にOFFへ戻ります"
+              title="ONの間は、送信ごとに公式Notion MCPのworkspace検索・fetch・database queryを読み取り専用で公開します。手動で外すかセッションを切り替えるまでONを維持します"
             >
               <input
                 type="checkbox"
@@ -2176,8 +2176,8 @@ ${result?.commands.logout ?? "python scripts\\notion_integration.py logout"}`}</
         <section className="rounded-md border border-border p-4 text-sm">
           <div className="font-semibold">回答時の境界</div>
           <div className="mt-3 grid gap-3 md:grid-cols-3">
-            <div className="rounded-md bg-muted/40 p-3"><div className="font-medium">既定OFF・one-shot</div><div className="mt-1 text-xs leading-5 text-muted-foreground">投稿欄でONにした1回答だけMCPを公開し、送信直後にOFFへ戻します。</div></div>
-            <div className="rounded-md bg-muted/40 p-3"><div className="font-medium">読み取り専用</div><div className="mt-1 text-xs leading-5 text-muted-foreground">fetchとNotion database/data source queryだけを許可します。connected source検索と書き込みtoolは公開しません。</div></div>
+            <div className="rounded-md bg-muted/40 p-3"><div className="font-medium">既定OFF・セッション内保持</div><div className="mt-1 text-xs leading-5 text-muted-foreground">ONにすると送信後も維持します。手動で外すか、新規・別セッションへ切り替えるとOFFになります。</div></div>
+            <div className="rounded-md bg-muted/40 p-3"><div className="font-medium">読み取り専用</div><div className="mt-1 text-xs leading-5 text-muted-foreground">Notion workspace内に固定した検索、fetch、database/data source queryだけを許可します。connected source検索と書き込みtoolは使いません。</div></div>
             <div className="rounded-md bg-muted/40 p-3"><div className="font-medium">本文非保存</div><div className="mt-1 text-xs leading-5 text-muted-foreground">MCP responseは回答生成中だけ利用します。保存するのは通常のassistant回答と安全な出典metadataだけです。</div></div>
           </div>
         </section>

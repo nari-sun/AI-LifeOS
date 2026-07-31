@@ -242,9 +242,9 @@ Phase4.0のNotion読み取り専用連携を実装済みです。その他の候
 
 ### Phase4.0: Notion Read-only Chat Integration
 
-Chat GUIの投稿欄上に既定OFFの「Notionを参照する」を置き、ONの送信だけ`mcp-remote` OAuth bridge経由の公式Notion MCPを有効化します。チェックは送信直後にOFFへ戻ります。管理 > Notion連携では、接続状態、固定endpoint、読み取りtool、再認証・切断手順だけを確認できます。
+Chat GUIの投稿欄上に既定OFFの「Notionを参照する」を置き、ONの送信だけ`mcp-remote` OAuth bridge経由の公式Notion MCPを有効化します。現在のセッションでは送信後もチェックを維持し、手動OFFまたは新規・別セッションへの切替時にOFFへ戻します。管理 > Notion連携では、接続状態、固定endpoint、読み取りtool、再認証・切断手順だけを確認できます。
 
-OAuth credentialは`mcp-remote`の専用user-profile directoryで管理し、AI-LifeOSは独自tokenやtarget allowlistを保存しません。`fetch`とNotion database / data source queryだけをprocess単位で公開し、connected sourceを含み得る`search`と書き込みtoolは除外します。MCP response本文はmemory、journal、SQLite index、構造化メモリ、cache、live JSONLへ保存せず、通常のassistant回答だけを従来どおりlive会話ログへ残します。詳細は [notion_read_only_integration.md](notion_read_only_integration.md) を参照してください。
+OAuth credentialは`mcp-remote`の専用user-profile directoryで管理し、AI-LifeOSは独自tokenやtarget allowlistを保存しません。`search`、`fetch`、Notion database / data source queryだけをprocess単位で公開し、書き込みtoolは除外します。自由文検索は`workspace_search`へ固定してconnected sourceを除外し、範囲をtool traceで確認できない回答は破棄します。MCP response本文はmemory、journal、SQLite index、構造化メモリ、cache、live JSONLへ保存せず、通常のassistant回答だけを従来どおりlive会話ログへ残します。詳細は [notion_read_only_integration.md](notion_read_only_integration.md) を参照してください。
 
 目的:
 

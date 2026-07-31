@@ -3,5 +3,5 @@ export function notionContextForSavedAssistant<T>(assistantSaved: boolean, conte
 }
 
 export function consumeNotionReference(value: boolean) {
-  return { requested: value, next: false } as const
+  return { requested: value, next: value } as const
 }

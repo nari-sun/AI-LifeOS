@@ -123,7 +123,7 @@ npm run bundle
 * 未実装の設定をGUIに出さない
 * Git commitはGUIから自動連発しない
 * メッセージ編集、回答再生成、会話分岐を入れる場合は、`docs/conversation_branching.md` の派生セッション方針に従い、既存JSONLを直接書き換えない
-* 投稿欄上の「Notionを参照する」は既定OFFで、ONの送信だけ公式Notion MCPの読み取りtoolを公開し、送信直後にOFFへ戻す。MCP response本文は保存せず、生成されたassistant回答だけが通常のlive JSONLへ残る。OAuth、tool isolation、出典表示、失敗時の詳細は `docs/notion_read_only_integration.md` を参照する
+* 投稿欄上の「Notionを参照する」は既定OFFで、ONの送信だけ公式Notion MCPの読み取りtoolを公開する。現在のセッションでは送信後もONを維持し、手動で外すか新規・別セッションへ切り替えたときにOFFへ戻す。MCP response本文は保存せず、生成されたassistant回答だけが通常のlive JSONLへ残る。OAuth、tool isolation、出典表示、失敗時の詳細は `docs/notion_read_only_integration.md` を参照する
 
 ## ログ
 

@@ -42,36 +42,42 @@ class NotionIntegrationTests(unittest.TestCase):
         )
         self.assertIn('"fetch"', enabled)
         self.assertIn('"notion-fetch"', enabled)
-        self.assertNotIn('"search"', enabled)
+        self.assertIn('"search"', enabled)
+        self.assertIn('"notion-search"', enabled)
         self.assertNotIn("create", enabled)
         self.assertNotIn("update", enabled)
         self.assertNotIn("comment", enabled)
 
-    def test_inventory_requires_fetch_and_rejects_search_write_tools_and_resources(self):
+    def test_inventory_requires_fetch_and_search_and_rejects_write_tools_and_resources(self):
         accepted = {
             "name": notion_integration.NOTION_MCP_SERVER_NAME,
             "tools": {
                 "fetch": {},
+                "search": {},
                 "notion-query-data-sources": {},
             },
             "resources": [],
             "resourceTemplates": [],
         }
         self.assertEqual(
-            ("fetch", "notion-query-data-sources"),
+            ("fetch", "search", "notion-query-data-sources"),
             notion_integration.validate_notion_inventory_item(accepted),
         )
         self.assertEqual(
-            ("notion-fetch",),
+            ("notion-fetch", "notion-search"),
             notion_integration.validate_notion_inventory_item(
-                {"name": notion_integration.NOTION_MCP_SERVER_NAME, "tools": {"notion-fetch": {}}}
+                {
+                    "name": notion_integration.NOTION_MCP_SERVER_NAME,
+                    "tools": {"notion-fetch": {}, "notion-search": {}},
+                }
             ),
         )
 
         for tools in (
             {"notion-query-data-sources": {}},
-            {"fetch": {}, "search": {}},
-            {"fetch": {}, "notion-create-pages": {}},
+            {"search": {}},
+            {"fetch": {}},
+            {"fetch": {}, "search": {}, "notion-create-pages": {}},
         ):
             with self.subTest(tools=tools):
                 with self.assertRaises(notion_integration.NotionIntegrationError):
@@ -83,7 +89,7 @@ class NotionIntegrationTests(unittest.TestCase):
             notion_integration.validate_notion_inventory_item(
                 {
                     "name": notion_integration.NOTION_MCP_SERVER_NAME,
-                    "tools": {"fetch": {}},
+                    "tools": {"fetch": {}, "search": {}},
                     "resources": [{"uri": "private://body"}],
                 }
             )
@@ -115,6 +121,74 @@ class NotionIntegrationTests(unittest.TestCase):
         self.assertEqual(1, trace.successful_calls)
         self.assertEqual("Product spec", trace.sources[0].title)
         self.assertNotIn(private_body, repr(trace))
+
+    def test_workspace_search_trace_keeps_only_notion_metadata_and_requires_safe_mode(self):
+        private_highlight = "PRIVATE_SEARCH_HIGHLIGHT"
+        result = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "results": [
+                                {
+                                    "type": "page",
+                                    "title": "Product spec",
+                                    "url": PAGE_URL,
+                                    "highlight": private_highlight,
+                                },
+                                {
+                                    "type": "page",
+                                    "title": "Raw id result",
+                                    "url": "22222222-2222-4222-8222-222222222222",
+                                    "highlight": "PRIVATE_RAW_ID_HIGHLIGHT",
+                                },
+                                {
+                                    "type": "slack",
+                                    "title": "External result",
+                                    "url": "https://example.slack.com/private-result",
+                                    "highlight": "PRIVATE_CONNECTED_SOURCE",
+                                },
+                            ]
+                        }
+                    ),
+                }
+            ]
+        }
+        safe = notion_integration.notion_trace_from_mcp_item(
+            {
+                "type": "mcp_tool_call",
+                "server": notion_integration.NOTION_MCP_SERVER_NAME,
+                "tool": "search",
+                "status": "completed",
+                "arguments": {
+                    "query": "product",
+                    "query_type": "internal",
+                    "content_search_mode": "workspace_search",
+                },
+                "result": result,
+            }
+        )
+        unsafe = notion_integration.notion_trace_from_mcp_item(
+            {
+                "type": "mcp_tool_call",
+                "server": notion_integration.NOTION_MCP_SERVER_NAME,
+                "tool": "notion-search",
+                "status": "completed",
+                "arguments": {"query": "product", "content_search_mode": "ai_search"},
+                "result": result,
+            }
+        )
+
+        self.assertEqual(1, safe.successful_calls)
+        self.assertEqual(2, len(safe.sources))
+        self.assertEqual(PAGE_URL, safe.sources[0].url)
+        self.assertEqual("22222222222242228222222222222222", safe.sources[1].id)
+        self.assertEqual("", safe.sources[1].url)
+        self.assertNotIn("PRIVATE_", repr(safe))
+        self.assertEqual(1, unsafe.search_scope_violations)
+        self.assertEqual(0, unsafe.successful_calls)
+        self.assertEqual((), unsafe.sources)
 
     def test_database_query_aggregates_rows_into_one_database_source(self):
         query = notion_integration.notion_trace_from_mcp_item(
@@ -220,7 +294,7 @@ class NotionIntegrationTests(unittest.TestCase):
     def test_connection_view_reports_only_fixed_endpoint_and_verified_tools(self):
         inventory = {
             "name": notion_integration.NOTION_MCP_SERVER_NAME,
-            "tools": {"fetch": {}},
+            "tools": {"fetch": {}, "search": {}},
             "resources": [],
             "resourceTemplates": [],
             "authStatus": "oauth",
@@ -232,7 +306,7 @@ class NotionIntegrationTests(unittest.TestCase):
                 result = notion_integration.get_notion_connection_view(temp_dir, refresh=True)
 
         self.assertTrue(result["connection"]["connected"])
-        self.assertEqual(["fetch"], result["connection"]["tools"])
+        self.assertEqual(["fetch", "search"], result["connection"]["tools"])
         self.assertEqual("Workspace A", result["connection"]["workspace_name"])
         self.assertEqual("User A", result["connection"]["user_name"])
         self.assertEqual("https://mcp.notion.com/mcp", result["endpoint"])

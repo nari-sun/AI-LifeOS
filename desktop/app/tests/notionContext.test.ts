@@ -15,7 +15,7 @@ test("keeps context for the assistant saved by the same request", () => {
   assert.equal(notionContextForSavedAssistant(true, context), context)
 })
 
-test("snapshots the Notion checkbox and resets the next request to OFF", () => {
-  assert.deepEqual(consumeNotionReference(true), { requested: true, next: false })
+test("snapshots the Notion checkbox and preserves it for the next request", () => {
+  assert.deepEqual(consumeNotionReference(true), { requested: true, next: true })
   assert.deepEqual(consumeNotionReference(false), { requested: false, next: false })
 })

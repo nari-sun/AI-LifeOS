@@ -58,7 +58,7 @@ Get-Content -Encoding UTF8 prompts\codex_phase2_prompt.md
 - 私的な質問や好みに関係する会話では、`memory/long_term.md`、`memory/preferences.md`、`memory/projects.md` を読み取り専用コンテキストとして回答に渡す
 - 過去会話をCodexが読み取り専用Memory MCPで検索語を変えながら反復検索し、一次発言を開いて確認する
 - 長期memoryと過去チャット検索を独立してON/OFFし、全体既定値と現在セッションのproject scope・一時チャットを分けてGUIで管理する
-- Chat GUIからNotion参照を回答単位でON/OFFし、送信後すぐOFFへ戻す。接続は`mcp-remote` OAuth bridge、回答時は公式Notion MCPの検証済み読み取りtoolだけを公開し、MCP response本文はローカル保存しない
+- Chat GUIからNotion参照をON/OFFし、現在のセッションでは手動で外すまで選択を維持する。接続は`mcp-remote` OAuth bridge、回答時はworkspace内に固定した全体検索・fetch・database queryの読み取りtoolだけを公開し、MCP response本文はローカル保存しない
 - ChatGPT exportのフォルダ、zip、`conversations.json`、または分割された `conversations-*.json` をdry-run確認し、新規・更新revisionを選択してraw.mdへ取り込む。GUIでは取り込み後に検索indexも再構築する
 - `python -m unittest` で Python 側の保存・再開・GUIブリッジ処理をテストする
 

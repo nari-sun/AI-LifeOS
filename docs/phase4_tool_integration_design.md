@@ -47,7 +47,7 @@ Out of scope for the first Phase4 implementation:
 | Web search | P0 | Medium | User-triggered read | Store citations and short extracted facts only when they are part of a saved conversation; do not cache full pages by default | Design and implement first |
 | Filesystem | P0 | Medium to High | Read-only first, scoped writes later | Project files may be edited when requested; personal data folders follow existing live/search rules | Design and implement first |
 | GitHub | P1 | Medium to High | Read-only issue/PR/CI lookup first | Public repo metadata may be summarized; private or personal content is not committed to PublicEdition | Implement after confirmation pattern exists |
-| Notion | P1 | High | Per-answer official MCP read, default OFF, one-shot reset | MCP response bodies are ephemeral; safe source metadata is response-only; assistant replies remain normal conversation records | RT-0024 replaced by RT-0025 |
+| Notion | P1 | High | Official MCP read, default OFF, retained within the current session | MCP response bodies are ephemeral; safe source metadata is response-only; assistant replies remain normal conversation records | RT-0024 replaced by RT-0025 |
 | Playwright | P1 | Medium | Local/browser verification | Screenshots/logs are temporary unless explicitly saved under an ignored diagnostics path | Implement for GUI verification |
 | Gmail | P2 | High | Read-only, user-selected messages only | No automatic storage; save only user-approved excerpts into conversation raw/summary | Defer until P0/P1 safety is proven |
 | Calendar | P2 | High | Read-only, bounded date range | No automatic storage; save only user-approved event facts | Defer until P0/P1 safety is proven |
@@ -216,10 +216,10 @@ Notion is the first Phase4 personal-cloud integration. It is independent of the 
 
 Rules:
 
-* Keep the per-answer checkbox OFF by default, reset it immediately after send, and do not expose Notion MCP while it is OFF.
+* Keep the Notion checkbox OFF by default, retain the user's selection after send within the current session, reset it when switching sessions, and do not expose Notion MCP while it is OFF.
 * Use the pinned `mcp-remote` OAuth bridge; do not store or expose a Notion token in the repository, settings, GUI, or conversation logs.
 * Do not maintain a page / database / data source target allowlist.
-* Expose only `fetch` and mechanically Notion-scoped database / data-source query tools. Do not expose connected-source search.
+* Expose `search` / `notion-search`, `fetch` / `notion-fetch`, and mechanically Notion-scoped database / data-source query tools. Require `content_search_mode="workspace_search"` for free-text search and reject answers whose completed tool trace does not preserve that boundary.
 * Do not recurse from an allowed page into child-page or child-database bodies; those children require their own enabled target.
 * Permit only the official search, retrieve, block-children, and data-source-query endpoints. Do not implement create, append, update, move-to-trash, restore, or delete endpoints.
 * Fetch on demand without a body cache. Never fall back to an old body after a permission loss, deletion, timeout, or connection failure.
@@ -417,12 +417,12 @@ Initially implemented by RT-0024 and replaced by the official MCP design in RT-0
 
 Acceptance:
 
-* Per-answer GUI checkbox is default OFF, resets after send, and is backend-enforced.
+* The GUI checkbox is default OFF, retains its value after send within the current session, resets on session changes, and is backend-enforced for every request.
 * A Notion-specific screen shows `mcp-remote` OAuth connection state and manual login/logout steps without target management.
 * `mcp-remote` stores OAuth credentials in a dedicated user-profile directory; `.env`, Credential Manager code, and plaintext project settings are not used by AI-LifeOS.
 * MCP response bodies are ephemeral and safe source metadata is visible only in the GUI response.
 * Permission loss, deletion, rate limit, and connection failure do not use stale content.
-* Tests enforce process-level MCP isolation, the absence of search/write tools, body non-persistence, and database source aggregation.
+* Tests enforce process-level MCP isolation, the presence and scope of read-only search, the absence of write tools, body non-persistence, and database source aggregation.
 
 ## Open Questions
 

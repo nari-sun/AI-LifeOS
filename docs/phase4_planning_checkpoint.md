@@ -24,10 +24,10 @@ Phase3.6 は、検索・記憶取得が一通り動いた後に、Phase4のMCP�
 
 RT-0024で追加した独自REST adapterはRT-0025で撤去し、`mcp-remote` OAuth bridge経由の公式Notion remote MCPへ置き換えました。ローカルMemory MCPとは統合せず、回答processだけで有効になる外部参照として分離しています。
 
-* 回答ごとのチェックは既定OFFで、送信直後にOFFへ戻す。OFFではNotion MCPを公開しない。
+* Notionチェックは既定OFFで、現在のセッションでは送信後も選択を維持する。手動OFFまたはセッション切替時にOFFへ戻し、OFFではNotion MCPを公開しない。
 * OAuth credentialは`mcp-remote`の専用user-profile directoryで管理し、独自tokenとtarget allowlistを持たない。
-* ONの回答だけ`fetch`とNotion database / data source queryを公開し、書き込みtoolを除外する。
-* connected sourceを含み得る`search`は公開しない。
+* ONの回答だけ`search`、`fetch`、Notion database / data source queryを公開し、書き込みtoolを除外する。
+* `search`は`workspace_search`へ固定し、connected sourceを対象にする`ai_search`は使わない。範囲をtool traceで確認できない回答は破棄する。
 * MCP response本文は回答process内だけで利用し、本文cacheを作らない。
 * 取得本文をmemory / journal / indexへ自動保存しない。
 * 権限喪失、削除、失敗時は古い内容へfallbackせず、GUIへ失敗を示す。

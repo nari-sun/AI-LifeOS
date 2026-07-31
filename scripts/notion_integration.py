@@ -18,13 +18,14 @@ NOTION_MCP_SERVER_NAME = "ai_lifeos_notion"
 NOTION_MCP_URL = "https://mcp.notion.com/mcp"
 NOTION_MCP_REMOTE_PACKAGE = "mcp-remote@0.1.38"
 NOTION_MCP_AUTH_DIR_NAME = "ai-lifeos-notion"
+NOTION_MCP_SEARCH_TOOLS = ("search", "notion-search")
+NOTION_MCP_FETCH_TOOLS = ("fetch", "notion-fetch")
 NOTION_MCP_READ_TOOLS = (
-    "fetch",
-    "notion-fetch",
+    *NOTION_MCP_SEARCH_TOOLS,
+    *NOTION_MCP_FETCH_TOOLS,
     "notion-query-data-sources",
     "notion-query-database-view",
 )
-NOTION_MCP_FETCH_TOOLS = ("fetch", "notion-fetch")
 MCP_SERVER_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 MCP_LIST_TIMEOUT_SECONDS = 10
 MCP_PROBE_TIMEOUT_SECONDS = 30.0
@@ -62,6 +63,7 @@ class NotionMCPTrace:
     attempted: bool = False
     successful_calls: int = 0
     failed_calls: int = 0
+    search_scope_violations: int = 0
     sources: tuple[NotionSource, ...] = ()
     row_urls: tuple[str, ...] = ()
 
@@ -105,6 +107,8 @@ def validate_notion_inventory_item(item: dict[str, Any]) -> tuple[str, ...]:
     names = tuple(tools)
     if not set(NOTION_MCP_FETCH_TOOLS).intersection(names):
         raise NotionIntegrationError("Notion MCP did not expose the required fetch tool.")
+    if not set(NOTION_MCP_SEARCH_TOOLS).intersection(names):
+        raise NotionIntegrationError("Notion MCP did not expose the required workspace search tool.")
     unexpected = set(names).difference(NOTION_MCP_READ_TOOLS)
     if unexpected:
         raise NotionIntegrationError("Notion MCP exposed a tool outside the read-only allowlist.")
@@ -118,6 +122,11 @@ def validate_notion_inventory_item(item: dict[str, Any]) -> tuple[str, ...]:
 def notion_context_from_exec_jsonl(output: str, *, requested: bool) -> NotionContextResult | None:
     if not requested:
         return None
+    trace = notion_trace_from_exec_jsonl(output)
+    return notion_context_from_traces((trace,), requested=True)
+
+
+def notion_trace_from_exec_jsonl(output: str) -> NotionMCPTrace:
     traces: list[NotionMCPTrace] = []
     for line in output.splitlines():
         try:
@@ -129,7 +138,7 @@ def notion_context_from_exec_jsonl(output: str, *, requested: bool) -> NotionCon
         item = event.get("item")
         if isinstance(item, dict):
             traces.append(notion_trace_from_mcp_item(item))
-    return notion_context_from_traces(traces, requested=True)
+    return merge_notion_traces(traces)
 
 
 def notion_context_from_traces(
@@ -203,7 +212,16 @@ def notion_trace_from_mcp_item(item: dict[str, Any]) -> NotionMCPTrace:
 
     arguments = _tool_arguments(item)
     result = item.get("result")
-    if tool in {"notion-query-data-sources", "notion-query-database-view"}:
+    if tool in NOTION_MCP_SEARCH_TOOLS:
+        if not _is_workspace_search(arguments):
+            return NotionMCPTrace(
+                attempted=True,
+                failed_calls=1,
+                search_scope_violations=1,
+            )
+        sources = _search_sources(result)
+        row_urls = ()
+    elif tool in {"notion-query-data-sources", "notion-query-database-view"}:
         sources = _query_sources(arguments, result)
         row_urls = _result_row_urls(result)
     else:
@@ -222,6 +240,7 @@ def merge_notion_traces(traces: Iterable[NotionMCPTrace]) -> NotionMCPTrace:
     attempted = any(trace.attempted for trace in values)
     successful_calls = sum(trace.successful_calls for trace in values)
     failed_calls = sum(trace.failed_calls for trace in values)
+    search_scope_violations = sum(trace.search_scope_violations for trace in values)
     row_urls = {_normalize_url(url) for trace in values for url in trace.row_urls if _normalize_url(url)}
     all_sources = [source for trace in values for source in trace.sources]
 
@@ -237,6 +256,7 @@ def merge_notion_traces(traces: Iterable[NotionMCPTrace]) -> NotionMCPTrace:
         attempted=attempted,
         successful_calls=successful_calls,
         failed_calls=failed_calls,
+        search_scope_violations=search_scope_violations,
         sources=sources,
         row_urls=tuple(sorted(row_urls)),
     )
@@ -592,6 +612,35 @@ def _query_sources(arguments: dict[str, Any], result: Any) -> tuple[NotionSource
     return _dedupe_sources(sources)
 
 
+def _is_workspace_search(arguments: dict[str, Any]) -> bool:
+    return (
+        arguments.get("content_search_mode") == "workspace_search"
+        and arguments.get("query_type") == "internal"
+    )
+
+
+def _search_sources(result: Any) -> tuple[NotionSource, ...]:
+    sources: list[NotionSource] = []
+    for value in _safe_metadata_objects(result):
+        raw_url = str(value.get("url", value.get("href", "")) or "").strip()
+        if not raw_url:
+            continue
+        if raw_url.startswith("https://"):
+            if not _is_safe_notion_url(raw_url):
+                continue
+        elif not raw_url.startswith("collection://") and not _NOTION_ID_PATTERN.fullmatch(raw_url):
+            continue
+        object_type = _object_type(value) or (
+            "data_source" if raw_url.startswith("collection://") else "page"
+        )
+        if object_type not in {"page", "database", "data_source"}:
+            continue
+        source = _source_from_mapping(value, default_type=object_type)
+        if source:
+            sources.append(source)
+    return _dedupe_sources(sources)
+
+
 def _fetch_sources(arguments: dict[str, Any], result: Any) -> tuple[NotionSource, ...]:
     metadata = _safe_metadata_objects(result)
     sources: list[NotionSource] = []
@@ -623,13 +672,35 @@ def _safe_metadata_objects(result: Any) -> tuple[dict[str, Any], ...]:
     values: list[dict[str, Any]] = []
 
     def visit(value: Any, depth: int = 0) -> None:
-        if depth > 5:
+        if depth > 8:
+            return
+        if isinstance(value, str):
+            stripped = value.strip()
+            if len(stripped) <= 250_000 and stripped[:1] in {"{", "["}:
+                try:
+                    visit(json.loads(stripped), depth + 1)
+                except json.JSONDecodeError:
+                    pass
             return
         if isinstance(value, dict):
             keys = set(value)
             if keys.intersection({"url", "href"}) and keys.intersection({"type", "object", "object_type", "title", "name", "id"}):
                 values.append(value)
-            for key in ("structured_content", "structuredContent", "metadata", "source", "sources", "database", "data_source", "parent"):
+            for key in (
+                "structured_content",
+                "structuredContent",
+                "content",
+                "text",
+                "metadata",
+                "source",
+                "sources",
+                "results",
+                "items",
+                "pages",
+                "database",
+                "data_source",
+                "parent",
+            ):
                 if key in value:
                     visit(value[key], depth + 1)
         elif isinstance(value, list):
@@ -644,7 +715,7 @@ def _source_from_mapping(value: dict[str, Any], *, default_type: str) -> NotionS
     raw_url = str(value.get("url", value.get("href", "")) or "").strip()
     url = raw_url if _is_safe_notion_url(raw_url) else ""
     raw_id = value.get("id", value.get("page_id", value.get("database_id", value.get("data_source_id", ""))))
-    source_id = _id_from_value(raw_id or url)
+    source_id = _id_from_value(raw_id or raw_url)
     if not source_id and not url:
         return None
     title = str(value.get("title", value.get("name", "")) or "").strip()
